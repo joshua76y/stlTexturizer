@@ -19,6 +19,7 @@ let currentBounds     = null;   // bounds of the original geometry
 let activeMapEntry    = null;   // { name, texture, imageData, width, height }
 let previewMaterial   = null;
 let isExporting       = false;
+let previewDebounce   = null;
 
 // ── Exclusion state ───────────────────────────────────────────────────────────
 let excludedFaces      = new Set();   // triangle indices in currentGeometry
@@ -634,6 +635,19 @@ async function handleExport() {
           (p) => setProgress(0.71 + p * 0.25, `Decimating mesh…`)
         )
       );
+    }
+
+    // Flat-bottom clamp: when bottom faces are masked (bottomAngleLimit > 0),
+    // any vertex that ended up below the original model's bottom layer gets
+    // snapped back up to that Z. Only the Z-value is changed.
+    if (settings.bottomAngleLimit > 0) {
+      const bottomZ = currentBounds.min.z;
+      const posArr  = finalGeometry.attributes.position.array;
+      for (let i = 2; i < posArr.length; i += 3) {
+        if (posArr[i] < bottomZ) posArr[i] = bottomZ;
+      }
+      finalGeometry.attributes.position.needsUpdate = true;
+      finalGeometry.computeVertexNormals();
     }
 
     setProgress(0.97, 'Writing STL…');
