@@ -1,62 +1,63 @@
 /**
  * Edge-based adaptive mesh subdivision.
  *
+ * Subdivides until every edge is ≤ maxEdgeLength.  A hard safety cap of
+ * SAFETY_CAP triangles prevents OOM on very fine settings; the caller
+ * (export pipeline) hands the result to the QEM decimator which then trims
+ * it to the user-requested budget.
+ *
  * @param {THREE.BufferGeometry} geometry   – non-indexed input from STLLoader
  * @param {number} maxEdgeLength            – maximum allowed edge length (same unit as STL)
- * @param {number} maxTriangles             – hard cap on output triangle count
  * @param {function} [onProgress]           – optional callback(fraction 0–1)
- * @returns {{ geometry: THREE.BufferGeometry, limitReached: boolean }}
+ * @returns {{ geometry: THREE.BufferGeometry, safetyCapHit: boolean }}
  */
 
 import * as THREE from 'three';
 
-const QUANTISE = 1e4;
+const QUANTISE   = 1e4;
+const SAFETY_CAP = 5_000_000; // absolute OOM guard
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-export function subdivide(geometry, maxEdgeLength, maxTriangles, onProgress) {
+export function subdivide(geometry, maxEdgeLength, onProgress) {
   const { positions, normals, indices } = toIndexed(geometry);
 
   const maxIterations = 12;
   let currentIndices = indices;
-  let limitReached = false;
+  let safetyCapHit = false;
 
   for (let iter = 0; iter < maxIterations; iter++) {
     const triCount = currentIndices.length / 3;
-    if (triCount >= maxTriangles) {
-      limitReached = true;
+    if (triCount >= SAFETY_CAP) {
+      safetyCapHit = true;
       break;
     }
 
     const { newIndices, changed } = subdividePass(
-      positions, normals, currentIndices, maxEdgeLength, maxTriangles
+      positions, normals, currentIndices, maxEdgeLength, SAFETY_CAP
     );
     currentIndices = newIndices;
 
-    // Check if the pass itself hit the limit
-    if (newIndices.length / 3 >= maxTriangles) {
-      limitReached = true;
-    }
+    if (newIndices.length / 3 >= SAFETY_CAP) safetyCapHit = true;
 
     if (onProgress) onProgress(Math.min(0.95, (iter + 1) / maxIterations));
-    if (!changed || limitReached) break;
+    if (!changed || safetyCapHit) break;
   }
 
-  return { geometry: toNonIndexed(positions, normals, currentIndices), limitReached };
+  return { geometry: toNonIndexed(positions, normals, currentIndices), safetyCapHit };
 }
 
 // ── One subdivision pass ──────────────────────────────────────────────────────
 
-function subdividePass(positions, normals, indices, maxEdgeLength, maxTriangles) {
+function subdividePass(positions, normals, indices, maxEdgeLength, safetyCap) {
   const maxSq = maxEdgeLength * maxEdgeLength;
   const midCache = new Map();
   const nextIndices = [];
   let changed = false;
 
   for (let t = 0; t < indices.length; t += 3) {
-    // Hard stop: don't add more triangles once the cap is reached
-    if (nextIndices.length / 3 >= maxTriangles) {
-      // Push remaining unsplit triangles as-is
+    // Safety cap: stop splitting, carry remaining triangles as-is
+    if (nextIndices.length / 3 >= safetyCap) {
       for (let r = t; r < indices.length; r++) nextIndices.push(indices[r]);
       break;
     }

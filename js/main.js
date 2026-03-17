@@ -4,6 +4,7 @@ import { PRESETS, loadCustomTexture }  from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
 import { subdivide }          from './subdivision.js';
 import { applyDisplacement }  from './displacement.js';
+import { decimate }           from './decimation.js';
 import { exportSTL }          from './exporter.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -311,17 +312,13 @@ async function handleExport() {
   try {
     setProgress(0.02, 'Subdividing mesh…');
 
-    // Run subdivision synchronously (may take a few seconds on large meshes)
-    // Wrap in a small yielding loop to allow the browser to repaint the progress bar.
-    const { geometry: subdivided, limitReached } = await runAsync(() =>
-      subdivide(currentGeometry, settings.refineLength, settings.maxTriangles,
-                (p) => setProgress(p * 0.6, 'Subdividing mesh…'))
+    const { geometry: subdivided, safetyCapHit } = await runAsync(() =>
+      subdivide(currentGeometry, settings.refineLength,
+                (p) => setProgress(0.02 + p * 0.35, 'Subdividing mesh…'))
     );
 
-    triLimitWarning.classList.toggle('hidden', !limitReached);
-
     const subTriCount = subdivided.attributes.position.count / 3;
-    setProgress(0.62, `Applying displacement to ${subTriCount.toLocaleString()} triangles…`);
+    setProgress(0.38, `Applying displacement to ${subTriCount.toLocaleString()} triangles…`);
 
     const displaced = await runAsync(() =>
       applyDisplacement(
@@ -331,15 +328,30 @@ async function handleExport() {
         activeMapEntry.height,
         settings,
         currentBounds,
-        (p) => setProgress(0.62 + p * 0.35, `Displacing vertices…`)
+        (p) => setProgress(0.38 + p * 0.32, `Displacing vertices…`)
       )
     );
 
-    setProgress(0.98, 'Writing STL…');
+    const dispTriCount = displaced.attributes.position.count / 3;
+    const needsDecimation = dispTriCount > settings.maxTriangles;
+    triLimitWarning.classList.toggle('hidden', !safetyCapHit);
+
+    let finalGeometry = displaced;
+    if (needsDecimation) {
+      setProgress(0.71, `Decimating ${dispTriCount.toLocaleString()} → ${settings.maxTriangles.toLocaleString()} triangles…`);
+      finalGeometry = await runAsync(() =>
+        decimate(
+          displaced,
+          settings.maxTriangles,
+          (p) => setProgress(0.71 + p * 0.25, `Decimating mesh…`)
+        )
+      );
+    }
+
+    setProgress(0.97, 'Writing STL…');
     await yieldFrame();
 
-    const baseName = 'textured';
-    exportSTL(displaced, `${baseName}.stl`);
+    exportSTL(finalGeometry, 'textured.stl');
 
     setProgress(1.0, 'Done!');
     setTimeout(() => {

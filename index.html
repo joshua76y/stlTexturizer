@@ -141,15 +141,15 @@
           <span class="val" id="refine-length-val">1.0 mm</span>
         </div>
         <div class="form-row slider-row">
-          <label for="max-triangles" title="Subdivision stops when this triangle count is reached">Max Triangles</label>
+          <label for="max-triangles" title="Mesh is fully subdivided first, then decimated down to this count">Output Triangles</label>
           <input type="range" id="max-triangles" min="100000" max="5000000" step="100000" value="1000000" />
           <span class="val" id="max-triangles-val">1.0 M</span>
         </div>
         <div id="tri-limit-warning" class="tri-limit-warning hidden">
-          ⚠ Triangle limit reached — some edges were not subdivided further.
+          ⚠ 5M-triangle safety cap hit during subdivision — result may still be coarser than requested edge length.
         </div>
         <p class="hint">
-          Smaller edge length = finer geometry. Does not affect preview.
+          Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.
         </p>
         <div id="export-progress" class="export-progress hidden">
           <div id="export-progress-bar" class="export-progress-bar"></div>
