@@ -31,6 +31,7 @@ let brushIsRadius      = false;
 let brushRadius        = 5.0;
 let bucketThreshold    = 30;
 let isPainting         = false;
+let selectionMode      = false;       // false = exclude painted faces; true = include only painted faces
 let _lastHoverTriIdx   = -1;          // last triangle index used for hover preview
 const _raycaster       = new THREE.Raycaster();
 
@@ -103,6 +104,10 @@ const exclThresholdSlider = document.getElementById('excl-threshold-slider');
 const exclThresholdVal    = document.getElementById('excl-threshold-val');
 const exclCount           = document.getElementById('excl-count');
 const exclClearBtn        = document.getElementById('excl-clear-btn');
+const exclModeExcludeBtn  = document.getElementById('excl-mode-exclude');
+const exclModeIncludeBtn  = document.getElementById('excl-mode-include');
+const exclSectionHeading  = document.getElementById('excl-section-heading');
+const exclHint            = document.getElementById('excl-hint');
 
 // ── Scale slider log helpers ──────────────────────────────────────────────────
 // Slider stores 0–1000; actual scale spans 0.1–10 on a log axis.
@@ -299,6 +304,9 @@ function wireEvents() {
     refreshExclusionOverlay();
   });
 
+  exclModeExcludeBtn.addEventListener('click', () => setSelectionMode(false));
+  exclModeIncludeBtn.addEventListener('click', () => setSelectionMode(true));
+
   // ── Canvas mouse events for exclusion painting ────────────────────────────
   canvas.addEventListener('mousedown', (e) => {
     if (!currentGeometry || !exclusionTool || e.button !== 0) return;
@@ -354,6 +362,22 @@ function wireEvents() {
 }
 
 // ── Exclusion helpers ─────────────────────────────────────────────────────────
+
+function setSelectionMode(include) {
+  if (selectionMode === include) return;
+  selectionMode = include;
+  exclModeExcludeBtn.classList.toggle('active', !selectionMode);
+  exclModeIncludeBtn.classList.toggle('active', selectionMode);
+  exclModeExcludeBtn.setAttribute('aria-pressed', String(!selectionMode));
+  exclModeIncludeBtn.setAttribute('aria-pressed', String(selectionMode));
+  exclSectionHeading.textContent = selectionMode ? 'Surface Selection' : 'Surface Exclusions';
+  exclHint.textContent = selectionMode
+    ? 'Selected surfaces appear green and will be the only ones to receive displacement during export.'
+    : 'Excluded surfaces appear orange and will not receive displacement during export.';
+  // Clear the painted set — faces had opposite semantics in the previous mode
+  excludedFaces = new Set();
+  refreshExclusionOverlay();
+}
 
 function setExclusionTool(tool) {
   // Clicking the active tool toggles it off; passing null always deactivates
@@ -423,9 +447,18 @@ function paintAt(e) {
 
 function refreshExclusionOverlay() {
   if (!currentGeometry) return;
-  setExclusionOverlay(buildExclusionOverlayGeo(currentGeometry, excludedFaces));
+  if (selectionMode) {
+    // Include Only mode: grey out the complement (non-selected faces) so only the
+    // selected faces show the texture preview beneath.
+    const maskGeo = buildExclusionOverlayGeo(currentGeometry, excludedFaces, true);
+    setExclusionOverlay(maskGeo, 0x222222, 0.88);
+  } else {
+    setExclusionOverlay(buildExclusionOverlayGeo(currentGeometry, excludedFaces), 0xff6600);
+  }
   const n = excludedFaces.size;
-  exclCount.textContent = `${n.toLocaleString()} face${n === 1 ? '' : 's'} excluded`;
+  exclCount.textContent = selectionMode
+    ? `${n.toLocaleString()} face${n === 1 ? '' : 's'} selected`
+    : `${n.toLocaleString()} face${n === 1 ? '' : 's'} excluded`;
 }
 
 function updateBucketHover(e) {
@@ -584,6 +617,48 @@ function updatePreview() {
 
 // ── Export pipeline ───────────────────────────────────────────────────────────
 
+/**
+ * Builds per-non-indexed-vertex weights (1.0 = excluded from subdivision/displacement)
+ * that combine the user-painted exclusion set AND the top/bottom angle mask.
+ */
+function buildCombinedFaceWeights(geometry, excludedFaces, invert, settings) {
+  const weights = buildFaceWeights(geometry, excludedFaces, invert);
+
+  const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
+  if (!hasAngleMask) return weights;
+
+  const posAttr = geometry.attributes.position;
+  const triCount = posAttr.count / 3;
+  const vA = new THREE.Vector3();
+  const vB = new THREE.Vector3();
+  const vC = new THREE.Vector3();
+  const edge1 = new THREE.Vector3();
+  const edge2 = new THREE.Vector3();
+  const faceNrm = new THREE.Vector3();
+
+  for (let t = 0; t < triCount; t++) {
+    if (weights[t * 3] > 0.99) continue; // already excluded
+    vA.fromBufferAttribute(posAttr, t * 3);
+    vB.fromBufferAttribute(posAttr, t * 3 + 1);
+    vC.fromBufferAttribute(posAttr, t * 3 + 2);
+    edge1.subVectors(vB, vA);
+    edge2.subVectors(vC, vA);
+    faceNrm.crossVectors(edge1, edge2);
+    const faceArea  = faceNrm.length();
+    const faceNzNorm = faceArea > 1e-12 ? faceNrm.z / faceArea : 0;
+    const faceAngle  = Math.acos(Math.abs(faceNzNorm)) * (180 / Math.PI);
+    const angleMasked = faceNzNorm < 0
+      ? (settings.bottomAngleLimit > 0 && faceAngle <= settings.bottomAngleLimit)
+      : (settings.topAngleLimit    > 0 && faceAngle <= settings.topAngleLimit);
+    if (angleMasked) {
+      weights[t * 3]     = 1.0;
+      weights[t * 3 + 1] = 1.0;
+      weights[t * 3 + 2] = 1.0;
+    }
+  }
+  return weights;
+}
+
 async function handleExport() {
   if (!currentGeometry || !activeMapEntry || isExporting) return;
   isExporting = true;
@@ -593,11 +668,13 @@ async function handleExport() {
   try {
     setProgress(0.02, 'Subdividing mesh…');
 
-    // Build per-vertex exclusion weights if any faces are excluded.
-    // subdivision.js interpolates these through edge splits so the exclusion
-    // propagates correctly to all new vertices inside the excluded region.
-    const faceWeights = excludedFaces.size > 0
-      ? buildFaceWeights(currentGeometry, excludedFaces)
+    // Build per-vertex exclusion weights combining user-painted exclusion + angle masking.
+    // Faces masked by top/bottom angle limits are treated the same as user-excluded faces
+    // so subdivision skips their interior edges too, saving triangles where no
+    // displacement will be applied.
+    const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
+    const faceWeights = (excludedFaces.size > 0 || selectionMode || hasAngleMask)
+      ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
       : null;
 
     const { geometry: subdivided, safetyCapHit } = await runAsync(() =>

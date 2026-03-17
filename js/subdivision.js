@@ -20,10 +20,24 @@ const SAFETY_CAP = 5_000_000; // absolute OOM guard
 // ── Public entry point ───────────────────────────────────────────────────────
 
 export function subdivide(geometry, maxEdgeLength, onProgress, faceWeights = null) {
+  // Derive per-face exclusion BEFORE toIndexed so we use the untouched
+  // non-indexed weights (toIndexed uses MAX-merge which can push boundary
+  // vertices to weight 1.0 even on included triangles).
+  let initialFaceExcluded = null;
+  if (faceWeights) {
+    const triCount = faceWeights.length / 3;
+    initialFaceExcluded = new Uint8Array(triCount);
+    for (let i = 0; i < triCount; i++) {
+      // Non-indexed vertex i*3 belongs to face i; weight > 0.99 → excluded
+      if (faceWeights[i * 3] > 0.99) initialFaceExcluded[i] = 1;
+    }
+  }
+
   const { positions, normals, weights, indices } = toIndexed(geometry, faceWeights);
 
   const maxIterations = 12;
   let currentIndices = indices;
+  let currentFaceExcluded = initialFaceExcluded;
   let safetyCapHit = false;
 
   for (let iter = 0; iter < maxIterations; iter++) {
@@ -33,10 +47,11 @@ export function subdivide(geometry, maxEdgeLength, onProgress, faceWeights = nul
       break;
     }
 
-    const { newIndices, changed } = subdividePass(
-      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP
+    const { newIndices, newFaceExcluded, changed } = subdividePass(
+      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded
     );
     currentIndices = newIndices;
+    if (newFaceExcluded) currentFaceExcluded = newFaceExcluded;
 
     if (newIndices.length / 3 >= SAFETY_CAP) safetyCapHit = true;
 
@@ -68,32 +83,44 @@ export function subdivide(geometry, maxEdgeLength, onProgress, faceWeights = nul
 // long edge still produce chains of thin children (unavoidable without moving
 // vertices off the surface), but the mesh is now crack-free in all cases.
 
-function subdividePass(positions, normals, weights, indices, maxEdgeLength, safetyCap) {
+function subdividePass(positions, normals, weights, indices, maxEdgeLength, safetyCap, faceExcluded = null) {
   const maxSq = maxEdgeLength * maxEdgeLength;
   const midCache = new Map();
 
   // ── Step 1: globally mark edges that need splitting ─────────────────────
+  // Excluded triangles do NOT proactively mark their own edges – their
+  // interior edges will never be split, saving triangles on untextured
+  // regions.  Boundary edges are still marked by the included neighbour, so
+  // excluded triangles respond to those splits and T-junctions are avoided.
   const splitEdges = new Set();
   for (let t = 0; t < indices.length; t += 3) {
+    if (faceExcluded && faceExcluded[t / 3]) continue; // skip excluded faces
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
     if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(edgeKey(a, b));
     if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(edgeKey(b, c));
     if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(edgeKey(c, a));
   }
 
-  if (splitEdges.size === 0) return { newIndices: indices, changed: false };
+  if (splitEdges.size === 0) return { newIndices: indices, newFaceExcluded: faceExcluded, changed: false };
 
   // ── Step 2: rebuild index list ───────────────────────────────────────────
   const nextIndices = [];
+  const nextFaceExcluded = faceExcluded ? [] : null;
 
   for (let t = 0; t < indices.length; t += 3) {
     // Safety cap: stop splitting, carry remaining triangles as-is
     if (nextIndices.length / 3 >= safetyCap) {
       for (let r = t; r < indices.length; r++) nextIndices.push(indices[r]);
+      // Carry remaining face-exclusion flags as-is
+      if (nextFaceExcluded && faceExcluded) {
+        for (let r = t / 3; r < indices.length / 3; r++) nextFaceExcluded.push(faceExcluded[r]);
+      }
       break;
     }
 
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
+    const fIdx = t / 3;
+    const excl = faceExcluded ? faceExcluded[fIdx] : 0;
     const sAB = splitEdges.has(edgeKey(a, b));
     const sBC = splitEdges.has(edgeKey(b, c));
     const sCA = splitEdges.has(edgeKey(c, a));
@@ -102,6 +129,7 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
     if (n === 0) {
       // ── 0-split: keep triangle ─────────────────────────────────────────
       nextIndices.push(a, b, c);
+      if (nextFaceExcluded) nextFaceExcluded.push(excl);
 
     } else if (n === 3) {
       // ── 3-split: 1→4 regular midpoint subdivision ──────────────────────
@@ -121,18 +149,22 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
         mCA, mBC, c,
         mAB, mBC, mCA,
       );
+      if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl, excl);
 
     } else if (n === 1) {
       // ── 1-split: bisect the one marked edge → 2 sub-triangles ──────────
       if (sAB) {
         const m = getMidpoint(positions, normals, weights, midCache, a, b);
         nextIndices.push(a, m, c,  m, b, c);
+        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
       } else if (sBC) {
         const m = getMidpoint(positions, normals, weights, midCache, b, c);
         nextIndices.push(a, b, m,  a, m, c);
+        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
       } else {                           // sCA
         const m = getMidpoint(positions, normals, weights, midCache, c, a);
         nextIndices.push(a, b, m,  m, b, c);
+        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
       }
 
     } else {
@@ -151,6 +183,7 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
           a,   mBC, mCA,
           c,   mCA, mBC,
         );
+        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
       } else if (!sBC) {                 // sAB + sCA: fan from A
         const mAB = getMidpoint(positions, normals, weights, midCache, a, b);
         const mCA = getMidpoint(positions, normals, weights, midCache, c, a);
@@ -159,6 +192,7 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
           mAB, b,   c,
           mAB, c,   mCA,
         );
+        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
       } else {                           // sAB + sBC: fan from B
         const mAB = getMidpoint(positions, normals, weights, midCache, a, b);
         const mBC = getMidpoint(positions, normals, weights, midCache, b, c);
@@ -167,11 +201,12 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
           a,   mAB, mBC,
           a,   mBC, c,
         );
+        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
       }
     }
   }
 
-  return { newIndices: nextIndices, changed: true };
+  return { newIndices: nextIndices, newFaceExcluded: nextFaceExcluded, changed: true };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

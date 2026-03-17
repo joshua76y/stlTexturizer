@@ -262,7 +262,7 @@ export function getCurrentMesh() { return currentMesh; }
  *
  * @param {THREE.BufferGeometry|null} overlayGeo
  */
-export function setExclusionOverlay(overlayGeo) {
+export function setExclusionOverlay(overlayGeo, color = 0xff6600, opacity = 1.0) {
   if (exclusionMesh) {
     scene.remove(exclusionMesh);
     exclusionMesh.geometry.dispose();
@@ -272,9 +272,11 @@ export function setExclusionOverlay(overlayGeo) {
   if (!overlayGeo || overlayGeo.attributes.position.count === 0) return;
   exclusionMesh = new THREE.Mesh(
     overlayGeo,
-    new THREE.MeshBasicMaterial({
-      color: 0xff6600,
+    new THREE.MeshLambertMaterial({
+      color,
       side: THREE.DoubleSide,
+      transparent: opacity < 1.0,
+      opacity,
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,

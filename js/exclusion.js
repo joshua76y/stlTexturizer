@@ -136,23 +136,40 @@ export function bucketFill(seedTriIdx, adjacency, thresholdDeg) {
 // ── Overlay geometry ──────────────────────────────────────────────────────────
 
 /**
- * Build a compact non-indexed BufferGeometry containing only the excluded
- * triangles' positions.  Used to drive the orange overlay mesh in the viewer.
+ * Build a compact non-indexed BufferGeometry for an overlay.
  *
  * @param {THREE.BufferGeometry} geometry   – non-indexed source geometry
- * @param {Set<number>}          excludedFaces
+ * @param {Set<number>}          faceSet
+ * @param {boolean}              [invert=false]  when true, include faces NOT in faceSet
  * @returns {THREE.BufferGeometry}
  */
-export function buildExclusionOverlayGeo(geometry, excludedFaces) {
-  const srcPos = geometry.attributes.position.array;
-  const outPos = new Float32Array(excludedFaces.size * 9); // 3 verts × 3 floats
+export function buildExclusionOverlayGeo(geometry, faceSet, invert = false) {
+  const srcPos   = geometry.attributes.position.array;
+  const srcNrm   = geometry.attributes.normal ? geometry.attributes.normal.array : null;
+  const total    = srcPos.length / 9; // total triangle count
+  const count    = invert ? total - faceSet.size : faceSet.size;
+  const outPos   = new Float32Array(count * 9);
+  const outNrm   = srcNrm ? new Float32Array(count * 9) : null;
   let dst = 0;
-  for (const t of excludedFaces) {
-    const src = t * 9;
-    for (let i = 0; i < 9; i++) outPos[dst++] = srcPos[src + i];
+  if (invert) {
+    for (let t = 0; t < total; t++) {
+      if (faceSet.has(t)) continue;
+      const src = t * 9;
+      for (let i = 0; i < 9; i++) outPos[dst + i] = srcPos[src + i];
+      if (outNrm) for (let i = 0; i < 9; i++) outNrm[dst + i] = srcNrm[src + i];
+      dst += 9;
+    }
+  } else {
+    for (const t of faceSet) {
+      const src = t * 9;
+      for (let i = 0; i < 9; i++) outPos[dst + i] = srcPos[src + i];
+      if (outNrm) for (let i = 0; i < 9; i++) outNrm[dst + i] = srcNrm[src + i];
+      dst += 9;
+    }
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+  if (outNrm) geo.setAttribute('normal', new THREE.BufferAttribute(outNrm, 3));
   return geo;
 }
 
@@ -169,13 +186,23 @@ export function buildExclusionOverlayGeo(geometry, excludedFaces) {
  * @param {Set<number>}          excludedFaces
  * @returns {Float32Array}  length = geometry.attributes.position.count
  */
-export function buildFaceWeights(geometry, excludedFaces) {
+export function buildFaceWeights(geometry, excludedFaces, invert = false) {
   const count   = geometry.attributes.position.count;
-  const weights = new Float32Array(count); // default 0 (included)
-  for (const t of excludedFaces) {
-    weights[t * 3]     = 1.0;
-    weights[t * 3 + 1] = 1.0;
-    weights[t * 3 + 2] = 1.0;
+  const weights = new Float32Array(count); // default 0.0 (included)
+  if (invert) {
+    // Include-only mode: all faces start excluded (1.0); painted faces are included (0.0)
+    weights.fill(1.0);
+    for (const t of excludedFaces) {
+      weights[t * 3]     = 0.0;
+      weights[t * 3 + 1] = 0.0;
+      weights[t * 3 + 2] = 0.0;
+    }
+  } else {
+    for (const t of excludedFaces) {
+      weights[t * 3]     = 1.0;
+      weights[t * 3 + 1] = 1.0;
+      weights[t * 3 + 2] = 1.0;
+    }
   }
   return weights;
 }

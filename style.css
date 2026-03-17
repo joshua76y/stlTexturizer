@@ -454,6 +454,13 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   margin-bottom: 10px;
 }
 
+.excl-mode-row {
+  margin-bottom: 10px;
+}
+.excl-mode-row .excl-seg {
+  width: 100%;
+}
+
 .excl-tool-btn {
   flex: 1;
   display: flex;
@@ -512,6 +519,13 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   background: color-mix(in srgb, var(--accent) 18%, var(--surface2));
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* Green active state for the Include Only mode button */
+#excl-mode-include.active {
+  background: color-mix(in srgb, #00cc66 18%, var(--surface2));
+  border-color: #00cc66;
+  color: #00cc66;
 }
 
 .excl-seg-btn:hover:not(.active) {

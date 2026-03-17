@@ -163,7 +163,17 @@
 
       <!-- Surface Exclusions -->
       <section class="panel-section">
-        <h2>Surface Exclusions</h2>
+        <h2 id="excl-section-heading">Surface Exclusions</h2>
+
+        <!-- Mode toggle: Exclude / Include Only -->
+        <div class="excl-mode-row">
+          <div class="excl-seg">
+            <button id="excl-mode-exclude" class="excl-seg-btn active" aria-pressed="true"
+              title="Exclude mode: painted surfaces will not receive texture displacement">Exclude</button>
+            <button id="excl-mode-include" class="excl-seg-btn" aria-pressed="false"
+              title="Include Only mode: only painted surfaces will receive texture displacement">Include Only</button>
+          </div>
+        </div>
 
         <!-- Tool buttons -->
         <div class="excl-tools">
@@ -219,7 +229,7 @@
           <span id="excl-count" class="excl-count">0 faces excluded</span>
           <button id="excl-clear-btn" class="excl-clear-btn">Clear All</button>
         </div>
-        <p class="hint">Excluded surfaces appear orange and will not receive displacement during export.</p>
+        <p id="excl-hint" class="hint">Excluded surfaces appear orange and will not receive displacement during export.</p>
       </section>
 
       <!-- Export -->
