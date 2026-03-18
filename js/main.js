@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { initViewer, loadGeometry, setMeshMaterial, setWireframe,
          getControls, getCamera, getCurrentMesh,
-         setExclusionOverlay, setHoverPreview } from './viewer.js';
+         setExclusionOverlay, setHoverPreview, setViewerTheme } from './viewer.js';
 import { loadSTLFile, computeBounds, getTriangleCount }  from './stlLoader.js';
 import { loadPresets, loadCustomTexture }  from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
@@ -128,6 +128,18 @@ const posToScale = p => parseFloat(Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - 
 let PRESETS = [];
 
 initViewer(canvas);
+
+// Apply saved theme to 3D viewport on startup
+setViewerTheme(document.documentElement.getAttribute('data-theme') === 'light');
+
+// Theme toggle
+document.getElementById('theme-toggle').addEventListener('click', () => {
+  const isLight = document.documentElement.getAttribute('data-theme') !== 'light';
+  document.documentElement.setAttribute('data-theme', isLight ? 'light' : 'dark');
+  localStorage.setItem('stlt-theme', isLight ? 'light' : 'dark');
+  setViewerTheme(isLight);
+});
+
 wireEvents();
 // Sync scale number inputs with the slider's initial position
 scaleUVal.value = posToScale(parseFloat(scaleUSlider.value));
@@ -136,6 +148,11 @@ scaleVVal.value = posToScale(parseFloat(scaleVSlider.value));
 loadPresets().then(presets => {
   PRESETS = presets;
   buildPresetGrid();
+  // Select Noise as the default preset
+  const noiseIdx = PRESETS.findIndex(p => p.name === 'Noise');
+  const defaultIdx = noiseIdx !== -1 ? noiseIdx : 0;
+  const swatches = presetGrid.querySelectorAll('.preset-swatch');
+  if (swatches[defaultIdx]) selectPreset(defaultIdx, swatches[defaultIdx]);
 }).catch(err => console.error('Failed to load preset textures:', err));
 
 // ── Preset grid ───────────────────────────────────────────────────────────────
@@ -261,7 +278,28 @@ function wireEvents() {
   linkSlider(topAngleLimitSlider,    topAngleLimitVal,    v => { settings.topAngleLimit    = v; return v; });
 
   // ── Export ──
-  exportBtn.addEventListener('click', handleExport);
+  exportBtn.addEventListener('click', () => {
+    if (localStorage.getItem('stlt-no-sponsor') === '1') {
+      handleExport();
+      return;
+    }
+    const overlay = document.getElementById('sponsor-overlay');
+    const closeBtn = document.getElementById('sponsor-close');
+    const storeLink = overlay.querySelector('.sponsor-link');
+    overlay.classList.remove('hidden');
+
+    const dismiss = () => {
+      if (document.getElementById('sponsor-dont-show').checked) {
+        localStorage.setItem('stlt-no-sponsor', '1');
+      }
+      overlay.classList.add('hidden');
+      handleExport();
+    };
+
+    closeBtn.onclick = dismiss;
+    // Also start processing when the user clicks through to the store
+    storeLink.onclick = () => setTimeout(dismiss, 150);
+  });
 
   // ── Wireframe ──
   wireframeToggle.addEventListener('change', () => setWireframe(wireframeToggle.checked));

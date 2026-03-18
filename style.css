@@ -17,6 +17,48 @@
   --header-h:     48px;
 }
 
+[data-theme="light"] {
+  --bg:           #f0f0f5;
+  --surface:      #ffffff;
+  --surface2:     #eaeaf2;
+  --border:       #d0d0df;
+  --accent:       #6355e0;
+  --accent-hover: #7c6aff;
+  --text:         #1a1a2e;
+  --text-muted:   #66667a;
+  --danger:       #d93025;
+  --success:      #1a7f3c;
+}
+
+/* ── Theme toggle button ─────────────────────────────────────────────── */
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.theme-toggle .icon-moon { display: block; }
+.theme-toggle .icon-sun  { display: none; }
+[data-theme="light"] .theme-toggle .icon-moon { display: none; }
+[data-theme="light"] .theme-toggle .icon-sun  { display: block; }
+
 html, body {
   height: 100%;
   font-family: 'Segoe UI', system-ui, sans-serif;
@@ -153,7 +195,7 @@ main {
 .viewport-controls-hint {
   margin-left: auto;
   font-size: 11px;
-  color: #555566;
+  color: var(--text-muted);
 }
 
 .wireframe-toggle {
@@ -198,8 +240,8 @@ main {
 /* ── Preset grid ─────────────────────────────────────────────────────── */
 .preset-grid {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 4px;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 3px;
   margin-bottom: 10px;
 }
 
@@ -407,6 +449,12 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   pointer-events: none;
 }
 
+[data-theme="light"] .export-progress-pct {
+  mix-blend-mode: normal;
+  color: #fff;
+  text-shadow: 0 0 4px rgba(0,0,0,0.5);
+}
+
 /* ── Export button ───────────────────────────────────────────────────── */
 .export-btn {
   width: 100%;
@@ -598,3 +646,91 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 
 /* Hide utility (used by JS to show/hide exclusion sub-rows) */
 .form-row.hidden { display: none; }
+
+/* ── Sponsor / popup overlay ─────────────────────────────────────────── */
+.sponsor-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  backdrop-filter: blur(3px);
+}
+
+.sponsor-overlay.hidden { display: none; }
+
+.sponsor-modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px 32px;
+  max-width: 420px;
+  width: calc(100% - 40px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+
+.sponsor-modal h2 {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  margin: 0;
+}
+
+.sponsor-modal p {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin: 0;
+}
+
+.sponsor-link {
+  display: block;
+  text-align: center;
+  padding: 10px 16px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 0.15s;
+}
+
+.sponsor-link:hover { background: var(--accent-hover); }
+
+.sponsor-no-show {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.sponsor-no-show input { cursor: pointer; accent-color: var(--accent); }
+
+.sponsor-close-btn {
+  padding: 8px 16px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  align-self: flex-end;
+}
+
+.sponsor-close-btn:hover {
+  background: var(--border);
+  border-color: var(--accent);
+}

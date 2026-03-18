@@ -253,6 +253,28 @@ export function getScene()     { return scene; }
 export function getControls()  { return controls; }
 export function getCurrentMesh() { return currentMesh; }
 
+export function setSceneBackground(hexColor) {
+  if (scene) scene.background = new THREE.Color(hexColor);
+}
+
+export function setViewerTheme(isLight) {
+  if (!scene) return;
+  scene.background = new THREE.Color(isLight ? 0xf0f0f5 : 0x111114);
+  if (grid) {
+    scene.remove(grid);
+    grid.geometry.dispose();
+    grid.material.dispose();
+  }
+  grid = new THREE.GridHelper(
+    200, 40,
+    isLight ? 0xb0b0c8 : 0x222228,
+    isLight ? 0xd0d0e0 : 0x1e1e24
+  );
+  grid.rotation.x = Math.PI / 2;
+  grid.position.z = 0;
+  scene.add(grid);
+}
+
 /**
  * Replace (or clear) the flat orange exclusion overlay mesh.
  * overlayGeo must be a non-indexed BufferGeometry with a 'position' attribute,

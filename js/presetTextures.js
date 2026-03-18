@@ -24,6 +24,7 @@ const IMAGE_PRESETS = [
   { name: 'Leather 2', url: 'leather2.jpg' },
   { name: 'Weave',    url: 'weave.jpg'    },
   { name: 'Wood',     url: 'wood.jpg'     },
+  { name: 'Noise',    url: 'noise.jpg'    },
 ];
 
 function loadImagePreset({ name, url }) {

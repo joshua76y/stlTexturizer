@@ -3,8 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>STL Texturizer</title>
+  <title>CNC Kitchen STL Texturizer</title>
   <link rel="stylesheet" href="style.css" />
+  <script>
+    // Apply saved theme before first paint to avoid flash
+    (function() {
+      const t = localStorage.getItem('stlt-theme');
+      if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    })();
+  </script>
   <script type="importmap">
   {
     "imports": {
@@ -22,9 +29,12 @@
         <path d="M2 17L12 22L22 17" stroke="#7c6aff" stroke-width="1.5" stroke-linejoin="round"/>
         <path d="M2 12L12 17L22 12" stroke="#a08cff" stroke-width="1.5" stroke-linejoin="round"/>
       </svg>
-      <span>STL Texturizer</span>
+      <span>CNC Kitchen STL Texturizer</span>
     </div>
-    <div class="header-note">Units assumed to be <strong>mm</strong></div>
+    <button id="theme-toggle" class="theme-toggle" title="Toggle light / dark mode" aria-label="Toggle light/dark mode" style="margin-left:auto">
+      <span class="icon-moon">Dark</span>
+      <span class="icon-sun">Light</span>
+    </button>
   </header>
 
   <main>
@@ -153,7 +163,7 @@
 
       <!-- Surface Mask -->
       <section class="panel-section">
-        <h2>Surface Mask</h2>
+        <h2 title="0° = no masking. Surfaces within this angle of horizontal will not be textured.">Surface Mask ⓘ</h2>
         <div class="form-row slider-row">
           <label for="bottom-angle-limit" title="Suppress texture on downward-facing surfaces within this angle of horizontal">Bottom faces</label>
           <input type="range" id="bottom-angle-limit" min="0" max="90" step="1" value="5" />
@@ -164,12 +174,11 @@
           <input type="range" id="top-angle-limit" min="0" max="90" step="1" value="0" />
           <input type="number" class="val" id="top-angle-limit-val" value="0" min="0" max="90" step="1" />
         </div>
-        <p class="hint">0° = no masking. Surfaces within this angle of horizontal will not be textured.</p>
       </section>
 
       <!-- Surface Exclusions -->
       <section class="panel-section">
-        <h2 id="excl-section-heading">Surface Exclusions</h2>
+        <h2 id="excl-section-heading" title="Excluded surfaces appear orange and will not receive displacement during export.">Surface Exclusions ⓘ</h2>
 
         <!-- Mode toggle: Exclude / Include Only -->
         <div class="excl-mode-row">
@@ -235,12 +244,11 @@
           <span id="excl-count" class="excl-count">0 faces excluded</span>
           <button id="excl-clear-btn" class="excl-clear-btn">Clear All</button>
         </div>
-        <p id="excl-hint" class="hint">Excluded surfaces appear orange and will not receive displacement during export.</p>
       </section>
 
       <!-- Export -->
       <section class="panel-section">
-        <h2>Export</h2>
+        <h2 title="Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.">Export ⓘ</h2>
         <div class="form-row slider-row">
           <label for="refine-length" title="Edges longer than this value will be split during export">Max Edge Length</label>
           <input type="range" id="refine-length" min="0.1" max="5" step="0.1" value="1" />
@@ -254,9 +262,7 @@
         <div id="tri-limit-warning" class="tri-limit-warning hidden">
           ⚠ 5M-triangle safety cap hit during subdivision — result may still be coarser than requested edge length.
         </div>
-        <p class="hint">
-          Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.
-        </p>
+
         <div id="export-progress" class="export-progress hidden">
           <div class="export-progress-track">
             <div id="export-progress-bar" class="export-progress-bar"></div>
@@ -269,6 +275,23 @@
 
     </aside>
   </main>
+
+  <!-- Sponsor popup -->
+  <div id="sponsor-overlay" class="sponsor-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="sponsor-title">
+    <div class="sponsor-modal">
+      <h2 id="sponsor-title">Thanks for using CNC Kitchen STL Texturizer!</h2>
+      <p>This tool is provided <strong>completely free</strong> by CNC Kitchen.<br>
+      While your STL is being processed, why not check out the store that helps us keep making cool stuff for you?</p>
+      <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer" class="sponsor-link">
+        🛒 Visit CNCKitchen.STORE
+      </a>
+      <label class="sponsor-no-show">
+        <input type="checkbox" id="sponsor-dont-show" />
+        Don't show this again
+      </label>
+      <button id="sponsor-close" class="sponsor-close-btn">Close &amp; Continue</button>
+    </div>
+  </div>
 
   <script type="module" src="js/main.js"></script>
 </body>
