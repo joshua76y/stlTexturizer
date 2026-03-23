@@ -250,6 +250,14 @@ main {
   background: var(--accent-hover);
   transform: translateY(-1px);
 }
+#store-cta a {
+  color: #fff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+#store-cta a:hover {
+  opacity: 0.85;
+}
 .store-cta-hidden {
   display: none !important;
 }

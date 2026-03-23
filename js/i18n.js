@@ -132,9 +132,9 @@ export const TRANSLATIONS = {
     'license.title':  'License & Terms',
     'license.item1':  'Free to use for any purpose, including <strong>commercial work</strong> (e.g., texturing STLs for clients or products).',
     'license.item2':  'Attribution is <strong>appreciated</strong> but <strong>not required</strong> when using this tool as-is.',
-    'license.item3':  'Want to support this tool and our work? Check out our <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">online store</a>!',
+    'license.item3':  'Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">CNCKitchen.STORE</a> or donate on <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener">PayPal</a>.',
     'license.item4':  'This tool is provided <strong>as-is</strong> with <strong>no warranty</strong> of any kind. Use at your own risk.',
-    'license.item5':  '<strong>No support</strong> is provided. The author is under no obligation to fix bugs, answer questions, or update this tool.',
+    'license.item5':  '<strong>No support</strong> is provided. The author is under no obligation to fix bugs, answer questions, or update this tool. That said, bug reports and feature requests are always welcome at <a href="mailto:texturizer@cnckitchen.com">texturizer@cnckitchen.com</a>.',
     'license.item6':  'The author shall not be held <strong>liable</strong> for any damages, data loss, or issues arising from the use of this tool.',
 
     // Sponsor modal
@@ -145,7 +145,7 @@ export const TRANSLATIONS = {
     'sponsor.closeAndContinue':'Close &amp; Continue',
 
     // Store CTA
-    'cta.store':         '\uD83D\uDED2 Enjoying this free tool? Support us & shop at CNCKitchen.STORE!',
+    'cta.store':         'Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer">CNCKitchen.STORE</a> or donate on <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer">PayPal</a>',
     'cta.storeDismiss':  'Dismiss',
 
     // Alerts
@@ -283,9 +283,9 @@ export const TRANSLATIONS = {
     'license.title':  'Lizenz & Nutzungsbedingungen',
     'license.item1':  'Kostenlos nutzbar f\u00fcr jeden Zweck, auch f\u00fcr <strong>kommerzielle Arbeit</strong> (z.B. Texturierung von STLs f\u00fcr Kunden oder Produkte).',
     'license.item2':  'Namensnennung wird <strong>gesch\u00e4tzt</strong>, ist aber bei der Nutzung dieses Tools <strong>nicht erforderlich</strong>.',
-    'license.item3':  'M\u00f6chtest du dieses Tool und unsere Arbeit unterst\u00fctzen? Schau in unserem <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">Online-Shop</a> vorbei!',
+    'license.item3':  'Dieses Tool unterst\u00fctzen? Shoppe bei <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">CNCKitchen.STORE</a> oder spende via <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener">PayPal</a>.',
     'license.item4':  'Dieses Tool wird <strong>ohne jegliche Gew\u00e4hrleistung</strong> bereitgestellt. Nutzung auf <strong>eigene Gefahr</strong>.',
-    'license.item5':  'Es wird <strong>kein Support</strong> geleistet. Der Autor ist nicht verpflichtet, Fehler zu beheben, Fragen zu beantworten oder das Tool zu aktualisieren.',
+    'license.item5':  'Es wird <strong>kein Support</strong> geleistet. Der Autor ist nicht verpflichtet, Fehler zu beheben, Fragen zu beantworten oder das Tool zu aktualisieren. Fehlerberichte und Funktionswünsche sind aber jederzeit willkommen unter <a href="mailto:texturizer@cnckitchen.com">texturizer@cnckitchen.com</a>.',
     'license.item6':  'Der Autor haftet nicht f\u00fcr <strong>Sch\u00e4den</strong>, Datenverlust oder Probleme, die durch die Nutzung dieses Tools entstehen.',
 
     // Sponsor modal
@@ -296,7 +296,7 @@ export const TRANSLATIONS = {
     'sponsor.closeAndContinue':'Schlie\u00dfen &amp; Weiter',
 
     // Store CTA
-    'cta.store':            '\uD83D\uDED2 Dieses Tool ist kostenlos - schau deshalb mal bei CNCKitchen.STORE vorbei!',
+    'cta.store':            'Dieses Tool unterst\u00fctzen? Shoppe bei <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer">CNCKitchen.STORE</a> oder spende via <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer">PayPal</a>',
     'cta.storeDismiss':    'Ausblenden',
 
     // Alerts
