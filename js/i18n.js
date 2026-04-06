@@ -487,6 +487,10 @@ export const TRANSLATIONS = {
     'precision.refining': 'Raffinamento\u2026',
     'precision.warningBody': 'Stima ~{n} triangoli. Ciò potrebbe rallentare il browser. Continuare?',
 
+    // Boundary falloff
+    'labels.boundaryFalloff':          'Sfumatura bordo \u24d8',
+    'tooltips.boundaryFalloff':        'Riduce gradualmente la deformazione a zero vicino ai bordi mascherati, impedendo sovrapposizioni di triangoli tra zone con e senza texture.',
+
     // Symmetric displacement
     'labels.symmetricDisplacement': 'Deformazione simmetrica \u24d8',
     'tooltips.symmetricDisplacement': 'Quando è attivo, il grigio al 50% = nessuna deformazione; il bianco spinge verso l\'esterno, il nero spinge verso l\'interno. Mantiene il volume della parte approssimativamente costante.',
