@@ -209,6 +209,7 @@ const vertexShader = /* glsl */`
   varying vec3  vModelNormal; // model-space face normal       → stable UV blending
   varying vec3  vViewPos;     // view-space position (possibly displaced) → TBN & specular
   varying vec3  vNormal;      // view-space normal → lighting
+  varying vec3  vSmoothNormal; // view-space smooth normal → smooth shading on masked faces
   varying float vFaceMask;    // combined mask (angle + user exclusion + boundary falloff)
   varying float vUserMask;    // raw user-exclusion mask (0 = user-excluded, 1 = included)
   varying float vMaskType;    // boundary mask type (0 = user mask, 1 = angle mask)
@@ -249,6 +250,8 @@ const vertexShader = /* glsl */`
     vec4 mvPos   = modelViewMatrix * vec4(pos, 1.0);
     vViewPos     = mvPos.xyz;
     vNormal      = normalize(normalMatrix * fN);
+    vec3 sN = length(smoothNormal) > 1e-6 ? normalize(smoothNormal) : safeN;
+    vSmoothNormal = normalize(normalMatrix * sN);
     gl_Position  = projectionMatrix * mvPos;
   }
 `;
@@ -266,6 +269,7 @@ const fragmentShader = /* glsl */`
   varying vec3  vModelNormal;
   varying vec3  vViewPos;
   varying vec3  vNormal;
+  varying vec3  vSmoothNormal;
   varying float vFaceMask;
   varying float vUserMask;
   varying float vMaskType;
@@ -340,20 +344,20 @@ const fragmentShader = /* glsl */`
     vec3 bumpVec = N - bumpStr * (dhx * T + dhy * B);
     vec3 bumpN = length(bumpVec) > 1e-6 ? normalize(bumpVec) : N;
 
-    // ── Shading ───────────────────────────────────────────────────────────
-    // Use consistent teal base for all areas so lighting looks uniform.
-    // Mask type determines the tint colour for masked/falloff regions:
-    //   user mask (vMaskType ≈ 0) → warm red-orange
-    //   angle mask (vMaskType ≈ 1) → neutral grey
-    vec3 tealBase     = vec3(0.22, 0.68, 0.68);
-    vec3 userMaskTint = vec3(0.55, 0.22, 0.12);
-    vec3 angleMaskTint = vec3(0.45, 0.48, 0.50);
+    // On fully masked faces the bump derivatives are zero, so bumpN falls
+    // back to the flat face normal → faceted/static look.  Blend toward
+    // the smooth interpolated normal so masked areas get smooth shading.
+    vec3 smoothN = normalize(vSmoothNormal) * (gl_FrontFacing ? 1.0 : -1.0);
+    bumpN = mix(smoothN, bumpN, maskBlend);
 
-    float maskEffect = 1.0 - maskBlend; // 0 = fully textured, 1 = fully masked
-    // On user-excluded faces (vUserMask ≈ 0) force user tint regardless of vMaskType
-    float effectiveMaskType = mix(vMaskType, 0.0, step(0.5, 1.0 - vUserMask));
-    vec3 maskTint = mix(userMaskTint, angleMaskTint, effectiveMaskType);
-    vec3 baseColor = mix(tealBase, maskTint, maskEffect * 0.6);
+    // ── Shading ───────────────────────────────────────────────────────────
+    // Compute lighting identically for ALL surfaces using the teal base so
+    // that specular highlights, diffuse response, and view-dependent shading
+    // are perfectly consistent everywhere.  Mask tinting is applied AFTER
+    // lighting as a colour blend so masked areas keep the same glossy look.
+    vec3 tealBase      = vec3(0.22, 0.68, 0.68);
+    vec3 userMaskColor = vec3(0.85, 0.40, 0.15);
+    vec3 angleMaskColor = vec3(0.45, 0.48, 0.50);
 
     vec3 L1 = normalize(vec3( 0.5,  0.8,  1.0));
     vec3 L2 = normalize(vec3(-0.5, -0.2, -0.6));
@@ -365,10 +369,23 @@ const fragmentShader = /* glsl */`
     vec3 H1   = normalize(L1 + V);
     float spec = pow(max(dot(bumpN, H1), 0.0), 64.0) * 0.60;
 
-    vec3 color = baseColor * 0.55                                        // ambient
-               + baseColor * diff1 * vec3(1.00, 0.96, 0.88) * 0.55      // key light
-               + baseColor * diff2 * vec3(0.80, 0.60, 0.50) * 0.15      // warm fill
-               + vec3(spec);                                             // specular
+    // Lit teal (identical for textured and masked surfaces)
+    vec3 litTeal = tealBase * 0.55
+                 + tealBase * diff1 * vec3(1.00, 0.96, 0.88) * 0.55
+                 + tealBase * diff2 * vec3(0.80, 0.60, 0.50) * 0.15
+                 + vec3(spec);
+
+    // Mask tint: pick colour by mask type, compute same lighting with that base
+    float maskEffect = 1.0 - maskBlend; // 0 = fully textured, 1 = fully masked
+    float effectiveMaskType = mix(vMaskType, 0.0, step(0.5, 1.0 - vUserMask));
+    vec3 maskBase = mix(userMaskColor, angleMaskColor, effectiveMaskType);
+    vec3 litMask = maskBase * 0.55
+                 + maskBase * diff1 * vec3(1.00, 0.96, 0.88) * 0.55
+                 + maskBase * diff2 * vec3(0.80, 0.60, 0.50) * 0.15
+                 + vec3(spec);
+
+    // Blend: 100% mask colour at the boundary, fading to 0% at falloff distance
+    vec3 color = mix(litTeal, litMask, maskEffect);
 
     gl_FragColor = vec4(color, 1.0);
   }

@@ -1104,12 +1104,10 @@ function refreshExclusionOverlay() {
   const overlayFaceSet = usePrecision ? precisionExcludedFaces : excludedFaces;
 
   _falloffDirty = true;
-  if (selectionMode) {
-    const maskGeo = buildExclusionOverlayGeo(overlayGeo, overlayFaceSet, true);
-    setExclusionOverlay(maskGeo, 0x8ab4d4, 0.96);
-  } else {
-    setExclusionOverlay(buildExclusionOverlayGeo(overlayGeo, overlayFaceSet), 0xff6600);
-  }
+
+  // Never show the flat-coloured MeshLambertMaterial overlay — the custom
+  // shader handles mask visualisation with smooth, view-dependent shading.
+  setExclusionOverlay(null);
   const n = usePrecision ? precisionExcludedFaces.size : excludedFaces.size;
   exclCount.textContent = selectionMode
     ? t(n === 1 ? 'excl.faceSelected' : 'excl.facesSelected', { n: n.toLocaleString() })
