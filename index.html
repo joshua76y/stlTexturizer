@@ -27,6 +27,7 @@
       }
     })();
   </script>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
   <script type="importmap">
   {
     "imports": {
@@ -74,7 +75,7 @@
           <p data-i18n-html="dropHint.text">Drop an <strong>.stl</strong>, <strong>.obj</strong> or <strong>.3mf</strong> file here<br/>or <label for="stl-file-input" class="link-label">click to browse</label></p>
           <input type="file" id="stl-file-input" accept=".stl,.obj,.3mf" hidden />
         </div>
-        <canvas id="viewport"></canvas>
+        <canvas id="viewport" role="img" aria-label="3D model preview"></canvas>
         <div id="brush-cursor"></div>
         <div id="store-cta-wrapper">
           <span id="store-cta">
