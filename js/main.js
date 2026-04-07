@@ -479,6 +479,7 @@ function wireEvents() {
   scaleUSlider.addEventListener('input', () => applyScaleU(posToScale(parseFloat(scaleUSlider.value))));
   scaleUSlider.addEventListener('dblclick', () => applyScaleU(posToScale(parseFloat(scaleUSlider.defaultValue))));
   scaleUVal.addEventListener('change', () => applyScaleU(parseFloat(scaleUVal.value)));
+  addFineWheelSupport(scaleUVal, applyScaleU);
 
   // Scale V — when lock is on, mirror to U
   const applyScaleV = (v) => {
@@ -492,6 +493,7 @@ function wireEvents() {
   scaleVSlider.addEventListener('input', () => applyScaleV(posToScale(parseFloat(scaleVSlider.value))));
   scaleVSlider.addEventListener('dblclick', () => applyScaleV(posToScale(parseFloat(scaleVSlider.defaultValue))));
   scaleVVal.addEventListener('change', () => applyScaleV(parseFloat(scaleVVal.value)));
+  addFineWheelSupport(scaleVVal, applyScaleV);
 
   // Lock toggle
   lockScaleBtn.addEventListener('click', () => {
@@ -635,6 +637,13 @@ function wireEvents() {
     exclBrushRadiusVal.value = diam;
     checkPrecisionOutdated();
   });
+  addFineWheelSupport(exclBrushRadiusVal, (v) => {
+    const diam = Math.max(0.2, Math.min(100, v));
+    brushRadius = diam / 2;
+    exclBrushRadiusSlider.value = diam;
+    exclBrushRadiusVal.value = diam;
+    checkPrecisionOutdated();
+  });
 
   exclThresholdSlider.addEventListener('input', () => {
     bucketThreshold = parseFloat(exclThresholdSlider.value);
@@ -649,6 +658,12 @@ function wireEvents() {
   });
   exclThresholdVal.addEventListener('change', () => {
     bucketThreshold = Math.max(0, Math.min(180, parseFloat(exclThresholdVal.value) || 20));
+    exclThresholdSlider.value = bucketThreshold;
+    exclThresholdVal.value = bucketThreshold;
+    _lastHoverTriIdx = -1;
+  });
+  addFineWheelSupport(exclThresholdVal, (v) => {
+    bucketThreshold = Math.max(0, Math.min(180, v));
     exclThresholdSlider.value = bucketThreshold;
     exclThresholdVal.value = bucketThreshold;
     _lastHoverTriIdx = -1;
@@ -1426,8 +1441,69 @@ function updateBucketHover(e) {
 
 // ── Slider helper ─────────────────────────────────────────────────────────────
 
+const INPUT_WHEEL_DECIMALS = 3;
+
+function getInputPrecision(input) {
+  const configured = parseInt(input.dataset.wheelDecimals, 10);
+  if (!isNaN(configured) && configured >= 0) return configured;
+  const step = input.step;
+  if (step === 'any') return INPUT_WHEEL_DECIMALS;
+  const stepNum = parseFloat(step);
+  if (isNaN(stepNum)) return INPUT_WHEEL_DECIMALS;
+  if (Number.isInteger(stepNum)) return 0;
+  const frac = step.includes('.') ? step.split('.')[1].replace(/0+$/, '').length : 0;
+  return Math.max(INPUT_WHEEL_DECIMALS, frac);
+}
+
+function roundToPrecision(value, precision) {
+  if (precision <= 0) return Math.round(value);
+  const factor = 10 ** precision;
+  return Math.round(value * factor) / factor;
+}
+
+function clampToInputBounds(input, value) {
+  const min = parseFloat(input.min);
+  const max = parseFloat(input.max);
+  let clamped = value;
+  if (!isNaN(min)) clamped = Math.max(min, clamped);
+  if (!isNaN(max)) clamped = Math.min(max, clamped);
+  return clamped;
+}
+
+function formatInputValue(input, value) {
+  const precision = getInputPrecision(input);
+  if (precision <= 0) return String(Math.round(value));
+  return value.toFixed(precision).replace(/\.?0+$/, '');
+}
+
+function addFineWheelSupport(input, applyFn) {
+  input.addEventListener('wheel', (e) => {
+    if (input.disabled || input.readOnly) return;
+    e.preventDefault();
+    input.focus({ preventScroll: true });
+    const precision = getInputPrecision(input);
+    const step = precision <= 0 ? 1 : 1 / (10 ** precision);
+    const current = parseFloat(input.value);
+    const fallback = parseFloat(input.defaultValue || input.min || '0');
+    const base = isNaN(current) ? (isNaN(fallback) ? 0 : fallback) : current;
+    const direction = e.deltaY < 0 ? 1 : -1;
+    const next = clampToInputBounds(input, roundToPrecision(base + direction * step, precision));
+    applyFn(next);
+  }, { passive: false });
+}
+
 function linkSlider(slider, valInput, onChangeFn, livePreview = true) {
   const isSpan = valInput.tagName === 'SPAN';
+  const applyLinkedValue = (raw) => {
+    const clamped = clampToInputBounds(valInput, raw);
+    slider.value = Math.max(parseFloat(slider.min), Math.min(parseFloat(slider.max), clamped));
+    onChangeFn(clamped);
+    valInput.value = formatInputValue(valInput, clamped);
+    if (livePreview) {
+      clearTimeout(previewDebounce);
+      previewDebounce = setTimeout(updatePreview, 80);
+    }
+  };
   slider.addEventListener('input', () => {
     const v = parseFloat(slider.value);
     const display = onChangeFn(v);
@@ -1451,27 +1527,16 @@ function linkSlider(slider, valInput, onChangeFn, livePreview = true) {
   if (!isSpan) {
     valInput.addEventListener('change', () => {
       const raw = parseFloat(valInput.value);
-      if (isNaN(raw)) { valInput.value = slider.value; return; }
-      // Clamp to the input's own min/max (may be wider than the slider range)
-      const inMin = parseFloat(valInput.min);
-      const inMax = parseFloat(valInput.max);
-      const clamped = (!isNaN(inMin) && !isNaN(inMax))
-        ? Math.max(inMin, Math.min(inMax, raw))
-        : raw;
-      // Move slider thumb to nearest valid position (saturates at slider edges)
-      slider.value = Math.max(parseFloat(slider.min), Math.min(parseFloat(slider.max), clamped));
-      valInput.value = onChangeFn(clamped);
-      if (livePreview) {
-        clearTimeout(previewDebounce);
-        previewDebounce = setTimeout(updatePreview, 80);
-      }
+      if (isNaN(raw)) { valInput.value = formatInputValue(valInput, parseFloat(slider.value)); return; }
+      applyLinkedValue(raw);
     });
+    addFineWheelSupport(valInput, applyLinkedValue);
   }
 }
 
 function formatM(n) {
-  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)} M`
-       : n >= 1_000    ? `${(n / 1_000).toFixed(0)} k`
+  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')} M`
+       : n >= 1_000    ? `${(n / 1_000).toFixed(1).replace(/\.0$/, '')} k`
        : String(n);
 }
 

@@ -122,7 +122,7 @@
         <div class="form-row slider-row">
           <label for="texture-smoothing" data-i18n="labels.textureSmoothing" data-i18n-title="tooltips.textureSmoothing" title="Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.">Texture Smoothing ⓘ</label>
           <input type="range" id="texture-smoothing" min="0" max="20" step="any" value="0" />
-          <input type="number" class="val" id="texture-smoothing-val" value="0" min="0" max="20" step="any" />
+          <input type="number" class="val" id="texture-smoothing-val" value="0" min="0" max="20" step="any" data-wheel-decimals="1" />
         </div>
       </section>
 
@@ -149,7 +149,7 @@
         <div class="form-row slider-row">
           <label for="seam-band-width" data-i18n="labels.transitionSmoothing" data-i18n-title="tooltips.transitionSmoothing" title="Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.">Transition Smoothing ⓘ</label>
           <input type="range" id="seam-band-width" min="0" max="1" step="0.01" value="0.5" />
-          <input type="number" class="val" id="seam-band-width-val" value="0.5" min="0" max="1" step="0.01" />
+          <input type="number" class="val" id="seam-band-width-val" value="0.5" min="0" max="1" step="0.01" data-wheel-decimals="2" />
         </div>
         <div class="form-row slider-row" id="cap-angle-row" style="display:none">
           <label for="cap-angle" data-i18n="labels.capAngle" data-i18n-title="tooltips.capAngle" title="Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.">Cap Angle ⓘ</label>
@@ -164,11 +164,12 @@
         <div class="form-row slider-row">
           <label for="amplitude" data-i18n="labels.amplitude">Amplitude</label>
           <input type="range" id="amplitude" min="-2" max="2" step="0.01" value="0.5" />
-          <input type="number" class="val" id="amplitude-val" value="0.5" min="-100" max="100" step="0.01" />
+          <input type="number" class="val" id="amplitude-val" value="0.5" min="-100" max="100" step="0.01" data-wheel-decimals="2" />
         </div>
         <div id="amplitude-warning" class="amplitude-warning hidden" data-i18n="warnings.amplitudeOverlap">
           ⚠ Amplitude exceeds 10% of the smallest model dimension — geometry overlaps may occur in the exported STL.
         </div>
+
         <div class="form-row">
           <label class="checkbox-label" for="symmetric-displacement"
             data-i18n-title="tooltips.symmetricDisplacement"
@@ -237,7 +238,7 @@
         <div class="form-row slider-row">
           <label for="boundary-falloff" data-i18n="labels.boundaryFalloff" data-i18n-title="tooltips.boundaryFalloff" title="Gradually reduces displacement to zero near masked boundaries, preventing triangle overlap where textured and non-textured regions meet.">Smooth Mask ⓘ</label>
           <input type="range" id="boundary-falloff" min="0" max="10" step="0.1" value="0" />
-          <input type="number" class="val" id="boundary-falloff-val" value="0" min="0" max="10" step="0.1" />
+          <input type="number" class="val" id="boundary-falloff-val" value="0" min="0" max="10" step="0.1" data-wheel-decimals="2" />
         </div>
 
         <!-- By Angle -->
@@ -320,7 +321,7 @@
         <div id="excl-radius-row" class="form-row slider-row hidden">
           <label for="excl-brush-radius-slider" data-i18n="labels.size">Size</label>
           <input type="range" id="excl-brush-radius-slider" min="0.2" max="100" step="0.2" value="10" />
-          <input type="number" class="val" id="excl-brush-radius-val" value="10" min="0.2" max="100" step="0.2" />
+          <input type="number" class="val" id="excl-brush-radius-val" value="10" min="0.2" max="100" step="0.2" data-wheel-decimals="1" />
         </div>
 
         <!-- Bucket threshold (shown when Fill is active) -->
@@ -344,7 +345,7 @@
         <div class="form-row slider-row">
           <label for="refine-length" data-i18n="labels.resolution" data-i18n-title="tooltips.resolution" title="Edges longer than this value will be split during export">Resolution</label>
           <input type="range" id="refine-length" min="0.01" max="5" step="0.01" value="1" />
-          <input type="number" class="val" id="refine-length-val" value="1" min="0.01" max="100" step="0.01" />
+          <input type="number" class="val" id="refine-length-val" value="1" min="0.01" max="100" step="0.01" data-wheel-decimals="2" />
         </div>
         <div class="form-row slider-row">
           <label for="max-triangles" data-i18n="labels.outputTriangles" data-i18n-title="tooltips.outputTriangles" title="Mesh is fully subdivided first, then decimated down to this count">Output Triangles</label>
