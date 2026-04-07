@@ -2,6 +2,7 @@
 
 **Live:** https://bumpmesh.com  
 **GitHub:** https://github.com/CNCKitchen/stlTexturizer
+**Author:** Stefan Hermann
 
 A browser-based tool for applying surface displacement textures to 3D meshes — no installation required.
 
@@ -148,4 +149,4 @@ Loaded via CDN — no build step needed:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU GPL v3.0 — see [LICENSE](LICENSE).
