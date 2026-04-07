@@ -2260,10 +2260,12 @@ function updatePreview() {
     return;
   }
 
-  // Choose geometry: subdivided preview (with smoothNormal attribute) or original
-  const activeGeo = (settings.useDisplacement && dispPreviewGeometry)
-    ? dispPreviewGeometry
-    : currentGeometry;
+  // Choose geometry: precision mode → subdivided preview → original
+  const activeGeo = (precisionMaskingEnabled && precisionGeometry)
+    ? precisionGeometry
+    : (settings.useDisplacement && dispPreviewGeometry)
+      ? dispPreviewGeometry
+      : currentGeometry;
 
   // Ensure faceMask attribute is current before rendering
   updateFaceMask(activeGeo);
