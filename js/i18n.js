@@ -16,18 +16,24 @@ export const TRANSLATIONS = {
 let _currentLang = 'en';
 const _cache = {};
 
+/**
+ * Load a language file into the cache.
+ * Returns true on success, false on failure.
+ * Marks failed languages with an empty object so we don't retry on every call.
+ */
 async function _loadLang(lang) {
   if (_cache[lang]) {
-    return;
+    return true;
   }
 
   try {
     const { default: strings } = await import(`./i18n/${lang}.js`);
     _cache[lang] = strings;
+    return true;
   } catch (err) {
     console.error(`[i18n] Failed to load language "${lang}":`, err);
-    // Mark as empty so we don't retry on every call; t() will fall back to English.
     _cache[lang] = {};
+    return false;
   }
 }
 
@@ -53,12 +59,23 @@ export function getLang() {
   return _currentLang;
 }
 
+/**
+ * Switch the active language.
+ * Returns true if the requested language loaded successfully, false if it fell
+ * back to English due to a network/parse error.
+ */
 export async function setLang(lang) {
   if (!TRANSLATIONS[lang]) {
-    return;
+    return false;
   }
 
-  await Promise.all([_loadLang('en'), _loadLang(lang)]);
+  const [, langOk] = await Promise.all([_loadLang('en'), _loadLang(lang)]);
+
+  // If the requested lang failed, stay on current language rather than
+  // switching to a blank/partial UI.
+  if (!langOk) {
+    return false;
+  }
 
   _currentLang = lang;
   localStorage.setItem('stlt-lang', lang);
@@ -66,6 +83,7 @@ export async function setLang(lang) {
   document.documentElement.setAttribute('lang', lang);
 
   applyTranslations();
+  return true;
 }
 
 /**
@@ -101,6 +119,10 @@ export function applyTranslations() {
 /**
  * Detect language from localStorage or the browser, load translation files,
  * and apply. Call once at startup.
+ *
+ * Returns { enFailed: boolean } — true when even the English base file could
+ * not be loaded. The UI will still render but show raw translation keys instead
+ * of text. The caller should surface a visible warning in this case.
  */
 export async function initLang() {
   const saved   = localStorage.getItem('stlt-lang');
@@ -118,7 +140,15 @@ export async function initLang() {
   document.documentElement.setAttribute('data-lang', _currentLang);
   document.documentElement.setAttribute('lang', _currentLang);
 
-  await Promise.all([_loadLang('en'), _loadLang(_currentLang)]);
+  const [enOk] = await Promise.all([_loadLang('en'), _loadLang(_currentLang)]);
+
+  // If the selected language failed but English loaded, silently fall back.
+  if (_currentLang !== 'en' && Object.keys(_cache[_currentLang] ?? {}).length === 0) {
+    console.warn(`[i18n] Falling back to English — "${_currentLang}" failed to load`);
+    _currentLang = 'en';
+    document.documentElement.setAttribute('data-lang', 'en');
+    document.documentElement.setAttribute('lang', 'en');
+  }
 
   // Dev-time sanity check: warn about keys present in English but missing in
   // the active language so translators spot drift early.
@@ -132,4 +162,5 @@ export async function initLang() {
   }
 
   applyTranslations();
+  return { enFailed: !enOk };
 }

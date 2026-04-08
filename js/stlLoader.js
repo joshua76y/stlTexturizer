@@ -24,9 +24,9 @@ export function loadSTLFile(file) {
     reader.onload = (e) => {
       try {
         const geometry = stlLoader.parse(e.target.result);
-        setupGeometry(geometry);
+        const { nanCount, degenerateCount } = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds });
+        resolve({ geometry, bounds, nanCount, degenerateCount });
       } catch (err) {
         reject(err);
       }
@@ -37,9 +37,76 @@ export function loadSTLFile(file) {
 }
 
 /**
- * Ensure vertex normals exist, then centre the geometry on its bounding-box centroid.
+ * Scan a non-indexed geometry's position array and remove:
+ *   - triangles with any non-finite (NaN / ±Infinity) coordinate
+ *   - degenerate triangles whose area is below 1e-12 mm²
+ *
+ * Operates in-place by compacting the Float32Array and replacing the
+ * BufferAttribute. Any existing normal attribute is deleted so that
+ * setupGeometry will recompute it on the clean data.
+ *
+ * Returns { nanCount, degenerateCount } so callers can warn the user.
+ */
+function validateAndCleanGeometry(geometry) {
+  const pos  = geometry.attributes.position;
+  const src  = pos.array;           // Float32Array, 9 floats per triangle
+  const triCount = src.length / 9;
+
+  let writeIdx = 0;
+  let nanCount = 0;
+  let degenerateCount = 0;
+
+  for (let t = 0; t < triCount; t++) {
+    const b  = t * 9;
+    const ax = src[b],   ay = src[b+1], az = src[b+2];
+    const bx = src[b+3], by = src[b+4], bz = src[b+5];
+    const cx = src[b+6], cy = src[b+7], cz = src[b+8];
+
+    if (!isFinite(ax) || !isFinite(ay) || !isFinite(az) ||
+        !isFinite(bx) || !isFinite(by) || !isFinite(bz) ||
+        !isFinite(cx) || !isFinite(cy) || !isFinite(cz)) {
+      nanCount++;
+      continue;
+    }
+
+    // Cross product of (B−A) × (C−A); skip if area² < 1e-24 (area < 1e-12)
+    const ux = bx-ax, uy = by-ay, uz = bz-az;
+    const vx = cx-ax, vy = cy-ay, vz = cz-az;
+    const area2 = (uy*vz-uz*vy)**2 + (uz*vx-ux*vz)**2 + (ux*vy-uy*vx)**2;
+    if (area2 < 1e-24) {
+      degenerateCount++;
+      continue;
+    }
+
+    if (writeIdx !== b) {
+      src[writeIdx]   = ax; src[writeIdx+1] = ay; src[writeIdx+2] = az;
+      src[writeIdx+3] = bx; src[writeIdx+4] = by; src[writeIdx+5] = bz;
+      src[writeIdx+6] = cx; src[writeIdx+7] = cy; src[writeIdx+8] = cz;
+    }
+    writeIdx += 9;
+  }
+
+  const removed = nanCount + degenerateCount;
+  if (removed > 0) {
+    geometry.setAttribute('position', new THREE.BufferAttribute(src.slice(0, writeIdx), 3));
+    geometry.deleteAttribute('normal'); // stale — recomputed below
+  }
+
+  if (writeIdx === 0) {
+    throw new Error(
+      `All ${triCount} triangles in the mesh are invalid (${nanCount} NaN, ${degenerateCount} degenerate). Cannot load file.`
+    );
+  }
+
+  return { nanCount, degenerateCount };
+}
+
+/**
+ * Validate, centre, and compute normals for a freshly parsed geometry.
+ * Returns { nanCount, degenerateCount } removed-triangle counts for caller warnings.
  */
 function setupGeometry(geometry) {
+  const { nanCount, degenerateCount } = validateAndCleanGeometry(geometry);
   geometry.computeBoundingBox();
   const box = geometry.boundingBox;
   const centre = new THREE.Vector3();
@@ -47,6 +114,7 @@ function setupGeometry(geometry) {
   geometry.translate(-centre.x, -centre.y, -centre.z);
   geometry.computeBoundingBox();
   if (!geometry.attributes.normal) geometry.computeVertexNormals();
+  return { nanCount, degenerateCount };
 }
 
 /**
@@ -91,9 +159,9 @@ export function loadOBJFile(file) {
       try {
         const group = objLoader.parse(e.target.result);
         const geometry = mergeGroupGeometries(group);
-        setupGeometry(geometry);
+        const { nanCount, degenerateCount } = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds });
+        resolve({ geometry, bounds, nanCount, degenerateCount });
       } catch (err) {
         reject(err);
       }
@@ -121,9 +189,9 @@ export function load3MFFile(file) {
     reader.onload = (e) => {
       try {
         const geometry = parse3MF(new Uint8Array(e.target.result));
-        setupGeometry(geometry);
+        const { nanCount, degenerateCount } = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds });
+        resolve({ geometry, bounds, nanCount, degenerateCount });
       } catch (err) {
         reject(err);
       }
@@ -132,6 +200,9 @@ export function load3MFFile(file) {
     reader.readAsArrayBuffer(file);
   });
 }
+
+const MAX_3MF_TRIANGLES = 10_000_000;
+const MAX_3MF_DEPTH     = 32;
 
 // ── Custom 3MF parser ────────────────────────────────────────────────────────
 
@@ -151,10 +222,6 @@ function parse3MF(data) {
   // Namespace-aware element queries
   const NS_CORE = 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02';
   const NS_PROD = 'http://schemas.microsoft.com/3dmanufacturing/production/2015/06';
-
-  function getAttr(el, ns, name) {
-    return el.getAttributeNS(ns, name) || el.getAttribute(ns.split('/').pop() + ':' + name);
-  }
 
   // Parse all model files and collect objects by (filePath, id)
   // objectMap: "path#id" → { vertices: Float32Array, triangles: Uint32Array }
@@ -207,7 +274,6 @@ function parse3MF(data) {
   const rootPath = modelPaths.find(p => /^3D\/3dmodel\.model$/i.test(p.replace(/^\//, '')))
                 || modelPaths[0];
   const rootDoc  = readXML(rootPath);
-  const rootNorm = rootPath.replace(/^\//, '').replace(/\\/g, '/');
 
   // Collect final mesh instances: { meshKey, matrix }
   const instances = [];
@@ -227,9 +293,18 @@ function parse3MF(data) {
     return new THREE.Matrix4();
   }
 
-  function resolveObject(filePath, objectId, parentMatrix) {
+  function resolveObject(filePath, objectId, parentMatrix, visiting = new Set(), depth = 0) {
+    if (depth > MAX_3MF_DEPTH) {
+      throw new Error('3MF component hierarchy too deep — possible cyclic reference');
+    }
+
     const normFile = filePath.replace(/^\//, '').replace(/\\/g, '/');
     const key = normFile + '#' + objectId;
+
+    if (visiting.has(key)) {
+      throw new Error(`Cyclic component reference detected in 3MF file (${key})`);
+    }
+    visiting.add(key);
 
     // If this object has a mesh, emit an instance
     if (objectMap.has(key)) {
@@ -239,7 +314,7 @@ function parse3MF(data) {
     // Also check for components (the object may have both mesh + components,
     // or only components referencing other objects)
     const doc = readXML(filePath);
-    if (!doc) return;
+    if (!doc) { visiting.delete(key); return; }
     const objects = doc.getElementsByTagNameNS(NS_CORE, 'object');
     for (const obj of objects) {
       if (obj.getAttribute('id') !== objectId) continue;
@@ -255,9 +330,11 @@ function parse3MF(data) {
         }
         const compTransform = parseTransform(comp.getAttribute('transform'));
         const combined = parentMatrix.clone().multiply(compTransform);
-        resolveObject(compPath, compObjId, combined);
+        resolveObject(compPath, compObjId, combined, visiting, depth + 1);
       }
     }
+
+    visiting.delete(key);
   }
 
   // Start from <build> items in root model
@@ -287,6 +364,12 @@ function parse3MF(data) {
   for (const inst of instances) {
     const mesh = objectMap.get(inst.meshKey);
     if (mesh) totalTris += mesh.triangles.length / 3;
+  }
+
+  if (totalTris > MAX_3MF_TRIANGLES) {
+    throw new Error(
+      `3MF file contains ${totalTris.toLocaleString()} triangles, exceeding the ${MAX_3MF_TRIANGLES.toLocaleString()} limit`
+    );
   }
 
   const positions = new Float32Array(totalTris * 9);

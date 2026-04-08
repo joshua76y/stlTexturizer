@@ -146,5 +146,6 @@ export default {
   "cta.storeDismiss": "Dismiss",
   "alerts.loadFailed": "Could not load model: {msg}",
   "alerts.exportFailed": "Export failed: {msg}",
-  "alerts.fileTooLarge": "File too large ({size} MB). Maximum: {max} MB."
+  "alerts.fileTooLarge": "File too large ({size} MB). Maximum: {max} MB.",
+  "alerts.degenerateTrianglesRemoved": "{n} invalid triangle(s) (NaN coordinates or zero area) were removed from the mesh at load time. The model will still work correctly."
 };

@@ -160,6 +160,14 @@ let dispPreviewGeometry  = null;   // subdivided geometry with smoothNormal attr
 let dispPreviewBusy      = false;  // true while async subdivision is running
 let dispPreviewParentMap = null;   // Int32Array: subdivided face → original face index
 
+// ── Operation tokens (stale-result guards) ────────────────────────────────────
+// Each async operation captures the current token at start and checks it after
+// every await. When a new model loads all tokens are incremented, causing any
+// in-flight operation to silently abort rather than apply results to new state.
+let precisionToken   = 0;
+let dispPreviewToken = 0;
+let exportToken      = 0;
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
 const canvas         = document.getElementById('viewport');
@@ -303,7 +311,13 @@ function populateLanguageSelector() {
   }
 
   select.addEventListener('change', async (e) => {
-    await setLang(e.target.value);
+    const ok = await setLang(e.target.value);
+    if (!ok) {
+      // Revert the dropdown to the language that is actually active
+      select.value = getLang();
+      alert('Could not load the selected language. Please check your connection and try again.');
+      return;
+    }
 
     // Re-translate <option> elements (innerHTML won't reach these)
     document.querySelectorAll('#mapping-mode option[data-i18n-opt]').forEach(opt => {
@@ -321,7 +335,18 @@ function populateLanguageSelector() {
 populateLanguageSelector();
 
 // Initialise language (reads localStorage / browser preference, applies translations)
-await initLang();
+{
+  const { enFailed } = await initLang();
+  if (enFailed) {
+    // English base strings failed — the UI will show raw keys. Surface a plain
+    // English message since t() won't work reliably at this point.
+    console.error('[i18n] English language file failed to load — UI text will be missing');
+    const banner = document.createElement('div');
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#c0392b;color:#fff;padding:10px 16px;font-family:sans-serif;font-size:14px;text-align:center';
+    banner.textContent = 'Warning: language files could not be loaded. The interface may show missing text. Check your network connection and reload the page.';
+    document.body.prepend(banner);
+  }
+}
 
 // Sync lang dropdown to current language
 (function() {
@@ -1489,13 +1514,28 @@ function addFineWheelSupport(input, applyFn) {
     if (input.disabled || input.readOnly) return;
     e.preventDefault();
     input.focus({ preventScroll: true });
+
     const precision = getInputPrecision(input);
-    const step = precision <= 0 ? 1 : 1 / (10 ** precision);
+
+    let step = precision <= 0 ? 1 : 1 / (10 ** precision);
+
+   
+    if (e.shiftKey) {
+      step *= 10;        // faster
+    } else if (e.ctrlKey || e.metaKey) {
+      step *= 0.1;       // ultra fine 
+    }
+
     const current = parseFloat(input.value);
     const fallback = parseFloat(input.defaultValue || input.min || '0');
     const base = isNaN(current) ? (isNaN(fallback) ? 0 : fallback) : current;
+
     const direction = e.deltaY < 0 ? 1 : -1;
-    const next = clampToInputBounds(input, roundToPrecision(base + direction * step, precision));
+    const next = clampToInputBounds(
+      input,
+      roundToPrecision(base + direction * step, precision + 2) 
+    );
+
     applyFn(next);
   }, { passive: false });
 }
@@ -1543,8 +1583,8 @@ function linkSlider(slider, valInput, onChangeFn, livePreview = true) {
 }
 
 function formatM(n) {
-  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')} M`
-       : n >= 1_000    ? `${(n / 1_000).toFixed(1).replace(/\.0$/, '')} k`
+  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)} M`
+       : n >= 1_000    ? `${(n / 1_000).toFixed(0)} k`
        : String(n);
 }
 
@@ -1556,6 +1596,11 @@ function loadDefaultCube() {
   const geo = new THREE.BoxGeometry(50, 50, 50).toNonIndexed();
   geo.computeBoundingBox();
   geo.computeVertexNormals();
+
+  // Invalidate any in-flight async operations tied to the previous model
+  precisionToken++;
+  dispPreviewToken++;
+  exportToken++;
 
   currentGeometry = geo;
   currentBounds   = computeBounds(geo);
@@ -1619,11 +1664,24 @@ function loadDefaultCube() {
 
 async function handleModelFile(file) {
   try {
-    const { geometry, bounds } = await loadModelFile(file);
+    const { geometry, bounds, nanCount, degenerateCount } = await loadModelFile(file);
+
+    // Invalidate any in-flight async operations tied to the previous model
+    precisionToken++;
+    dispPreviewToken++;
+    exportToken++;
+
     currentGeometry = geometry;
     currentBounds   = bounds;
     currentStlName  = file.name.replace(/\.(stl|obj|3mf)$/i, '');
     checkAmplitudeWarning();
+
+    // Warn the user if bad triangles were silently removed during load
+    const removedCount = (nanCount ?? 0) + (degenerateCount ?? 0);
+    if (removedCount > 0) {
+      console.warn(`Removed ${nanCount} NaN and ${degenerateCount} degenerate triangles at load time`);
+      alert(t('alerts.degenerateTrianglesRemoved', { n: removedCount }));
+    }
 
     // Dispose old preview material and reset state for the new mesh
     if (previewMaterial) {
@@ -2585,6 +2643,7 @@ async function refreshPrecisionMesh() {
     if (!confirm(msg)) return;
   }
 
+  const myToken = ++precisionToken;
   precisionBusy = true;
   precisionStatus.textContent = t('precision.refining');
   precisionOutdated.classList.add('hidden');
@@ -2593,10 +2652,12 @@ async function refreshPrecisionMesh() {
 
   try {
     await yieldFrame();
+    if (precisionToken !== myToken) return;
 
     const { geometry: subdivided, safetyCapHit, faceParentId } = await subdivide(
       currentGeometry, targetEdge, null, null, { fast: true }
     );
+    if (precisionToken !== myToken) { subdivided.dispose(); return; }
 
     // Dispose previous precision geometry if any
     if (precisionGeometry) precisionGeometry.dispose();
@@ -2748,6 +2809,7 @@ async function toggleDisplacementPreview(enable) {
   }
 
   if (dispPreviewBusy) return;
+  const myToken = ++dispPreviewToken;
   dispPreviewBusy = true;
 
   try {
@@ -2757,10 +2819,12 @@ async function toggleDisplacementPreview(enable) {
     const previewEdge = Math.max(0.1, maxDim / 80);
 
     await yieldFrame();
+    if (dispPreviewToken !== myToken) return;
 
     const { geometry: subdivided, faceParentId } = await subdivide(
       currentGeometry, previewEdge, null, null, { fast: true }
     );
+    if (dispPreviewToken !== myToken) { subdivided.dispose(); return; }
 
     addSmoothNormals(subdivided);
     addFaceNormals(subdivided);
@@ -2839,6 +2903,7 @@ function buildCombinedFaceWeights(geometry, excludedFaces, invert, settings) {
 
 async function handleExport(format = 'stl') {
   if (!currentGeometry || !activeMapEntry || isExporting) return;
+  const myToken = ++exportToken;
   isExporting = true;
   exportBtn.classList.add('busy');
   export3mfBtn.classList.add('busy');
@@ -2849,9 +2914,16 @@ async function handleExport(format = 'stl') {
     deactivatePrecisionMasking();
   }
 
+  // Hoist intermediate geometries so the finally block can always dispose them
+  let subdivided      = null;
+  let displaced       = null;
+  let finalGeometry   = null;
+  let exportSucceeded = false; // set true only after exportSTL so finally can clean up on abort/error
+
   try {
     setProgress(0.02, t('progress.subdividing'));
     await yieldFrame();
+    if (exportToken !== myToken) return;
 
     // Build per-vertex exclusion weights combining user-painted exclusion + angle masking.
     // Faces masked by top/bottom angle limits are treated the same as user-excluded faces
@@ -2862,7 +2934,8 @@ async function handleExport(format = 'stl') {
       ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
       : null;
 
-    const { geometry: subdivided, safetyCapHit } = await subdivide(
+    let safetyCapHit;
+    ({ geometry: subdivided, safetyCapHit } = await subdivide(
       currentGeometry, settings.refineLength,
       (p, triCount, longestEdge) => {
         const label = triCount != null
@@ -2871,13 +2944,14 @@ async function handleExport(format = 'stl') {
         setProgress(0.02 + p * 0.35, label);
       },
       faceWeights
-    );
+    ));
+    if (exportToken !== myToken) return;
 
     const subTriCount = subdivided.attributes.position.count / 3;
     setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
 
     const exportEntry = getEffectiveMapEntry();
-    const displaced = await runAsync(() =>
+    displaced = await runAsync(() =>
       applyDisplacement(
         subdivided,
         exportEntry.imageData,
@@ -2888,6 +2962,7 @@ async function handleExport(format = 'stl') {
         (p) => setProgress(0.38 + p * 0.32, t('progress.displacingVertices'))
       )
     );
+    if (exportToken !== myToken) return;
 
     // Free subdivided geometry — displacement created a separate copy
     subdivided.dispose();
@@ -2895,10 +2970,9 @@ async function handleExport(format = 'stl') {
     const dispTriCount = displaced.attributes.position.count / 3;
     const needsDecimation = dispTriCount > settings.maxTriangles;
     triLimitWarning.classList.toggle('hidden', !safetyCapHit);
-    // Re-apply translated warning text in case language changed since last export
     triLimitWarning.textContent = t('warnings.safetyCapHit');
 
-    let finalGeometry = displaced;
+    finalGeometry = displaced;
     if (needsDecimation) {
       setProgress(0.71, t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
       finalGeometry = await runAsync(() =>
@@ -2916,6 +2990,7 @@ async function handleExport(format = 'stl') {
       );
       // Free pre-decimation geometry — decimate created a separate copy
       displaced.dispose();
+	  if (exportToken !== myToken) return;
     }
 
     // Flat-bottom clamp: when bottom faces are masked (bottomAngleLimit > 0),
@@ -2955,12 +3030,15 @@ async function handleExport(format = 'stl') {
     if (format === '3mf') {
       setProgress(0.97, t('progress.writing3mf'));
       await yieldFrame();
+      if (exportToken !== myToken) return;
       export3MF(finalGeometry, `${baseName}.3mf`);
     } else {
       setProgress(0.97, t('progress.writingStl'));
       await yieldFrame();
+      if (exportToken !== myToken) return;
       exportSTL(finalGeometry, `${baseName}.stl`);
     }
+    exportSucceeded = true;
 
     setProgress(1.0, t('progress.done'));
     setTimeout(() => {
@@ -2970,8 +3048,14 @@ async function handleExport(format = 'stl') {
   } catch (err) {
     console.error('Export failed:', err);
     alert(t('alerts.exportFailed', { msg: err.message }));
-    exportProgress.classList.add('hidden');
   } finally {
+    // Dispose all intermediate geometries regardless of success, failure, or abort.
+    // finalGeometry may alias displaced (no decimation) — avoid double-dispose.
+    if (subdivided) subdivided.dispose();
+    if (displaced && displaced !== subdivided) displaced.dispose();
+    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) finalGeometry.dispose();
+    // Hide progress immediately on error or stale abort; success hides it after 1500 ms.
+    if (!exportSucceeded) exportProgress.classList.add('hidden');
     isExporting = false;
     exportBtn.classList.remove('busy');
     export3mfBtn.classList.remove('busy');
@@ -2985,16 +3069,20 @@ function setProgress(fraction, label) {
   exportProgLbl.textContent = label;
 }
 
-/** Yield to the browser event loop for one frame, then run fn. */
+/**
+ * Yield to the browser event loop, then run fn.
+ * Uses setTimeout instead of rAF so it fires even in background tabs.
+ */
 function runAsync(fn) {
   return new Promise((resolve, reject) => {
-    requestAnimationFrame(() => {
+    setTimeout(() => {
       try { resolve(fn()); }
       catch (e) { reject(e); }
-    });
+    }, 0);
   });
 }
 
+/** Yield to the browser event loop (for progress bar paints etc.). */
 function yieldFrame() {
-  return new Promise(r => requestAnimationFrame(r));
+  return new Promise(r => setTimeout(r, 0));
 }
