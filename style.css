@@ -446,6 +446,59 @@ main {
   margin: 14px 0 8px;
 }
 
+/* ── Advanced / Beta Features (collapsible) ──────────────────────────── */
+.advanced-toggle {
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 0 !important;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.advanced-chevron {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.advanced-section:not(.collapsed) .advanced-chevron {
+  transform: rotate(90deg);
+}
+
+.advanced-section:not(.collapsed) .advanced-toggle {
+  margin-bottom: 10px !important;
+}
+
+.advanced-section.collapsed .advanced-content {
+  display: none;
+}
+
+.advanced-blurb {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+  line-height: 1.4;
+}
+
+.advanced-section .panel-subsection-heading:first-of-type {
+  margin-top: 6px;
+}
+
+.bake-mask-row {
+  margin-bottom: 10px;
+}
+
+.bake-mask-row .checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+
 /* ── Preset grid ─────────────────────────────────────────────────────── */
 .preset-grid {
   display: grid;

@@ -4,6 +4,25 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BumpMesh by CNC Kitchen</title>
+  <meta name="description" content="BumpMesh by CNC Kitchen is a browser-based tool for adding displacement textures to STL, OBJ, and 3MF models locally, then exporting printable textured meshes." />
+  <link rel="canonical" href="https://bumpmesh.com/" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="BumpMesh" />
+  <meta property="og:title" content="BumpMesh by CNC Kitchen" />
+  <meta property="og:description" content="Add displacement textures to STL, OBJ, and 3MF models directly in your browser. Preview, mask, bake, and export printable textured meshes locally." />
+  <meta property="og:url" content="https://bumpmesh.com/" />
+  <meta property="og:image" content="https://bumpmesh.com/assets/preview.jpg" />
+  <meta property="og:image:secure_url" content="https://bumpmesh.com/assets/preview.jpg" />
+  <meta property="og:image:type" content="image/jpeg" />
+  <meta property="og:image:width" content="2078" />
+  <meta property="og:image:height" content="1091" />
+  <meta property="og:image:alt" content="BumpMesh interface for previewing and exporting textured 3D models" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="BumpMesh by CNC Kitchen" />
+  <meta name="twitter:description" content="Add displacement textures to STL, OBJ, and 3MF models directly in your browser. Preview, mask, bake, and export printable textured meshes locally." />
+  <meta name="twitter:image" content="https://bumpmesh.com/assets/preview.jpg" />
+  <meta name="twitter:image:alt" content="BumpMesh interface for previewing and exporting textured 3D models" />
   <link rel="icon" type="image/png" href="logo.png" />
   <link rel="stylesheet" href="style.css" />
   <script>
@@ -448,6 +467,51 @@
         </div>
       </section>
 
+      <!-- Advanced / Beta Features (collapsible) -->
+      <section class="panel-section advanced-section collapsed" id="advanced-section">
+        <h2 class="advanced-toggle" id="advanced-toggle"
+            data-i18n="sections.advancedFeatures"
+            data-i18n-title="tooltips.advancedFeatures"
+            title="Experimental tools — behavior may change between releases.">
+          <span class="advanced-chevron" aria-hidden="true">▸</span>
+          Advanced / Beta Features ⓘ
+        </h2>
+        <div class="advanced-content" id="advanced-content">
+          <p class="advanced-blurb" data-i18n="ui.advancedBlurb">Experimental tools. Behavior may change between releases.</p>
+
+          <h3 class="panel-subsection-heading" data-i18n="ui.noDownwardZHeading">Overhang Protection</h3>
+          <p class="advanced-blurb" data-i18n="ui.noDownwardZDesc">Some textures push surface vertices downward, creating new overhangs. When enabled, vertices are never moved in the −Z direction during texturing. X and Y movement is unaffected.</p>
+          <div class="form-row">
+            <label class="checkbox-label" for="no-downward-z-chk">
+              <input type="checkbox" id="no-downward-z-chk" />
+              <span data-i18n="ui.noDownwardZ">Prevent downward (−Z) vertex displacement</span>
+            </label>
+          </div>
+
+          <h3 class="panel-subsection-heading" data-i18n="ui.bakeTexturesHeading">Bake Textures</h3>
+          <p class="advanced-blurb" data-i18n="ui.bakeTexturesDesc">Apply the current texture to the mesh and reload the result as the working model so you can keep editing.</p>
+          <div class="form-row bake-mask-row">
+            <label class="checkbox-label" for="bake-mask-chk">
+              <input type="checkbox" id="bake-mask-chk" checked />
+              <span data-i18n="ui.bakeMaskNewFaces">Mask just-baked faces from further texturing</span>
+            </label>
+          </div>
+          <div id="bake-progress" class="export-progress hidden">
+            <div class="export-progress-track">
+              <div id="bake-progress-bar" class="export-progress-bar"></div>
+              <span id="bake-progress-pct" class="export-progress-pct"></span>
+            </div>
+            <span id="bake-progress-label" data-i18n="progress.processing">Processing…</span>
+          </div>
+          <div class="export-buttons">
+            <button id="bake-btn" class="export-btn" disabled
+                    data-i18n="ui.bakeTextures"
+                    data-i18n-title="tooltips.bakeTextures"
+                    title="Apply the current texture to the mesh and reload the result as the working model.">Bake Textures</button>
+          </div>
+        </div>
+      </section>
+
       <!-- Export -->
       <section class="panel-section">
         <h2 data-i18n="sections.export" data-i18n-title="tooltips.export" title="Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.">Export ⓘ</h2>
@@ -569,6 +633,9 @@
 
       <h3 class="welcome-heading">New in this release <span class="welcome-date">&mdash; Apr 2026</span></h3>
       <ul class="welcome-changelog">
+        <li><strong>Bake Textures (beta)</strong> &mdash; apply the current texture and continue editing on the textured mesh. Find it under <em>Advanced / Beta Features</em>.</li>
+        <li><strong>Significantly improved cylindrical mapping workflow</strong></li>
+        <li><strong>Part rotation gizmo</strong></li>
         <li><strong>Mesh Check</strong></li>
         <li><strong>Undo / redo</strong> with full keyboard shortcuts.</li>
         <li><strong>Save &amp; load projects</strong> as <code>.bumpmesh</code> files.</li>

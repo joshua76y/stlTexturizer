@@ -28,6 +28,7 @@ let activeMapEntry    = null;   // { name, texture, imageData, width, height, is
 let _lastCustomMap    = null;   // most recent uploaded/imported custom-map entry, kept across preset switches so the thumbnail can re-activate it
 let previewMaterial   = null;
 let isExporting       = false;
+let isBaking          = false;
 let previewDebounce   = null;
 
 // Boundary edge data texture for per-fragment falloff in bump-only preview
@@ -81,6 +82,7 @@ const settings = {
   capAngle:         20,
   boundaryFalloff:  0,
   symmetricDisplacement: false,
+  noDownwardZ: false,
   useDisplacement: false,
   // Cylindrical-mode controls.
   // null/undefined → derive from bounds (preserves legacy / non-cylindrical behavior).
@@ -211,6 +213,14 @@ const exportProgBar    = document.getElementById('export-progress-bar');
 const exportProgPct    = document.getElementById('export-progress-pct');
 const exportProgLbl    = document.getElementById('export-progress-label');
 const triLimitWarning  = document.getElementById('tri-limit-warning');
+const bakeBtn          = document.getElementById('bake-btn');
+const bakeMaskChk      = document.getElementById('bake-mask-chk');
+const bakeProgress     = document.getElementById('bake-progress');
+const bakeProgBar      = document.getElementById('bake-progress-bar');
+const bakeProgPct      = document.getElementById('bake-progress-pct');
+const bakeProgLbl      = document.getElementById('bake-progress-label');
+const advancedSection  = document.getElementById('advanced-section');
+const advancedToggle   = document.getElementById('advanced-toggle');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
@@ -270,6 +280,7 @@ const boundaryFalloffSlider    = document.getElementById('boundary-falloff');
 const boundaryFalloffVal       = document.getElementById('boundary-falloff-val');
 const symmetricDispToggle    = document.getElementById('symmetric-displacement');
 const dispPreviewToggle      = document.getElementById('displacement-preview');
+const noDownwardZChk         = document.getElementById('no-downward-z-chk');
 
 // ── Exclusion panel DOM refs ──────────────────────────────────────────────────
 const exclBrushBtn        = document.getElementById('excl-brush-btn');
@@ -317,7 +328,7 @@ const imprintClose   = document.getElementById('imprint-close');
 // ── Welcome / What's New popup ───────────────────────────────────────────────
 // Bump this date whenever the "What's New" bullets in index.html change to
 // re-show the popup to all returning visitors who previously dismissed it.
-const WELCOME_LAST_UPDATED = '2026-04-25';
+const WELCOME_LAST_UPDATED = '2026-04-28';
 const WELCOME_STORAGE_KEY  = 'stlt-welcome-seen';
 const welcomeLink     = document.getElementById('welcome-link');
 const welcomeOverlay  = document.getElementById('welcome-overlay');
@@ -1351,6 +1362,10 @@ function wireEvents() {
     settings.symmetricDisplacement = symmetricDispToggle.checked;
     updatePreview();
   });
+  noDownwardZChk.addEventListener('change', () => {
+    settings.noDownwardZ = noDownwardZChk.checked;
+    updatePreview();
+  });
 
   dispPreviewToggle.addEventListener('change', () => {
     toggleDisplacementPreview(dispPreviewToggle.checked);
@@ -1450,6 +1465,12 @@ function wireEvents() {
   };
   exportBtn.addEventListener('click', () => startExport('stl'));
   export3mfBtn.addEventListener('click', () => startExport('3mf'));
+
+  // ── Advanced / Beta Features panel: collapse toggle + bake action ──
+  advancedToggle.addEventListener('click', () => {
+    advancedSection.classList.toggle('collapsed');
+  });
+  bakeBtn.addEventListener('click', bakeTextures);
 
   // ── Wireframe ──
   wireframeToggle.addEventListener('change', () => setWireframe(wireframeToggle.checked));
@@ -2190,6 +2211,7 @@ function handlePlaceOnFaceClick(e) {
 
   exportBtn.disabled = (activeMapEntry === null);
   export3mfBtn.disabled = (activeMapEntry === null);
+  bakeBtn.disabled = (activeMapEntry === null);
   updatePreview();
 
   // Rebuild exclusion overlay with new vertex positions (face indices unchanged)
@@ -2687,6 +2709,7 @@ function loadDefaultCube() {
 
   exportBtn.disabled = (activeMapEntry === null);
   export3mfBtn.disabled = (activeMapEntry === null);
+  bakeBtn.disabled = (activeMapEntry === null);
   updatePreview();
 }
 
@@ -3620,6 +3643,7 @@ function updatePreview() {
     }
     exportBtn.disabled = true;
     export3mfBtn.disabled = true;
+    bakeBtn.disabled = true;
     return;
   }
 
@@ -3645,6 +3669,7 @@ function updatePreview() {
   syncBoundaryEdgeUniforms();
   exportBtn.disabled = false;
   export3mfBtn.disabled = false;
+  bakeBtn.disabled = isBaking;
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
@@ -4104,7 +4129,7 @@ function buildCombinedFaceWeights(geometry, excludedFaces, invert, settings) {
 }
 
 async function handleExport(format = 'stl') {
-  if (!currentGeometry || !activeMapEntry || isExporting) return;
+  if (!currentGeometry || !activeMapEntry || isExporting || isBaking) return;
   const myToken = ++exportToken;
   isExporting = true;
   exportBtn.classList.add('busy');
@@ -4275,6 +4300,284 @@ function setProgress(fraction, label) {
   exportProgLbl.textContent = label;
 }
 
+function setBakeProgress(fraction, label) {
+  const pct = Math.round(fraction * 100);
+  bakeProgBar.style.width = `${pct}%`;
+  bakeProgPct.textContent = `${pct}%`;
+  bakeProgLbl.textContent = label;
+}
+
+// ── Bake Textures (beta) ─────────────────────────────────────────────────────
+// Apply the current displacement texture to currentGeometry and adopt the
+// result as the working model so the user can keep editing on the textured
+// mesh. By default, masks the just-baked faces in the new exclusion set.
+//
+// Pipeline: subdivide → applyDisplacement → (optional) flat-bottom clamp.
+// Decimation is intentionally skipped — decimate() drops the per-face parent
+// mapping needed to translate "which input faces were textured" into the new
+// mesh's triangle indices. Final decimation still happens on Export.
+async function bakeTextures() {
+  if (!currentGeometry || !activeMapEntry || isBaking || isExporting) return;
+  isBaking = true;
+  bakeBtn.classList.add('busy');
+  bakeBtn.disabled = true;
+  bakeProgress.classList.remove('hidden');
+
+  if (precisionMaskingEnabled) deactivatePrecisionMasking();
+
+  let subdivided = null;
+  let displaced  = null;
+  let succeeded  = false;
+
+  try {
+    setBakeProgress(0.02, t('progress.subdividing'));
+    await yieldFrame();
+
+    // Mirror handleExport's pre-flight: combine user mask + angle masking
+    // into per-vertex weights for subdivision.
+    const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
+    const faceWeights = (excludedFaces.size > 0 || selectionMode || hasAngleMask)
+      ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
+      : null;
+
+    let faceParentId;
+    ({ geometry: subdivided, faceParentId } = await subdivide(
+      currentGeometry, settings.refineLength,
+      (p, triCount, longestEdge) => {
+        const label = triCount != null
+          ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+          : t('progress.subdividing');
+        setBakeProgress(0.02 + p * 0.45, label);
+      },
+      faceWeights
+    ));
+
+    const subTriCount = subdivided.attributes.position.count / 3;
+    setBakeProgress(0.47, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
+
+    const exportEntry = getEffectiveMapEntry();
+    displaced = await runAsync(() =>
+      applyDisplacement(
+        subdivided,
+        exportEntry.imageData,
+        exportEntry.width,
+        exportEntry.height,
+        settings,
+        currentBounds,
+        (p) => setBakeProgress(0.47 + p * 0.40, t('progress.displacingVertices'))
+      )
+    );
+
+    // Free pre-displacement subdivision — applyDisplacement returns a separate copy.
+    subdivided.dispose();
+    subdivided = null;
+
+    // Mirror the export-side flat-bottom clamp.
+    if (settings.bottomAngleLimit > 0) {
+      const bottomZ = currentBounds.min.z;
+      const pa = displaced.attributes.position.array;
+      const na = displaced.attributes.normal ? displaced.attributes.normal.array : new Float32Array(pa.length);
+
+      for (let i = 0; i < pa.length; i += 9) {
+        let dirty = false;
+        if (pa[i+2] < bottomZ) { pa[i+2] = bottomZ; dirty = true; }
+        if (pa[i+5] < bottomZ) { pa[i+5] = bottomZ; dirty = true; }
+        if (pa[i+8] < bottomZ) { pa[i+8] = bottomZ; dirty = true; }
+
+        if (dirty) {
+          const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
+          const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
+          const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+          const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
+          na[i]   = na[i+3] = na[i+6] = nx/len;
+          na[i+1] = na[i+4] = na[i+7] = ny/len;
+          na[i+2] = na[i+5] = na[i+8] = nz/len;
+        }
+      }
+
+      displaced.attributes.position.needsUpdate = true;
+      if (!displaced.attributes.normal) displaced.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
+      else displaced.attributes.normal.needsUpdate = true;
+    }
+
+    setBakeProgress(0.90, t('progress.finalizing'));
+    await yieldFrame();
+
+    // Build the new exclusion set: every output triangle whose parent face
+    // was NOT excluded (by user paint, selectionMode, or angle masking) got
+    // textured this round → mask it on the new mesh so a follow-up texture
+    // pass won't double-up. faceWeights[parentIdx*3] > 0.99 captures all
+    // three exclusion paths in a single check (it's the same predicate
+    // subdivide uses to skip subdividing those faces).
+    let preExcluded = null;
+    if (bakeMaskChk.checked) {
+      preExcluded = [];
+      const wasParentExcluded = faceWeights
+        ? (parentIdx) => faceWeights[parentIdx * 3] > 0.99
+        : () => false; // no exclusions at all → every face was textured
+      for (let i = 0; i < faceParentId.length; i++) {
+        if (!wasParentExcluded(faceParentId[i])) preExcluded.push(i);
+      }
+    }
+
+    // Compute new bounds from the displaced geometry. Do NOT re-center —
+    // the displaced mesh is approximately at the same location, and
+    // re-centering would shift the user's frame of reference.
+    displaced.computeBoundingBox();
+    const bb = displaced.boundingBox;
+    const newBounds = {
+      min:    bb.min.clone(),
+      max:    bb.max.clone(),
+      size:   new THREE.Vector3().subVectors(bb.max, bb.min),
+      center: new THREE.Vector3().addVectors(bb.min, bb.max).multiplyScalar(0.5),
+    };
+
+    adoptBakedGeometry(displaced, newBounds, { preExcludedFaces: preExcluded });
+    displaced = null; // ownership transferred to currentGeometry
+
+    succeeded = true;
+    setBakeProgress(1.0, t('progress.done'));
+    setTimeout(() => { bakeProgress.classList.add('hidden'); setBakeProgress(0, ''); }, 1200);
+  } catch (err) {
+    console.error('Bake failed:', err);
+    if (/maximum size|out of memory|alloc/i.test(err.message)) {
+      alert(t('alerts.exportOOM'));
+    } else {
+      alert(t('alerts.bakeFailed', { msg: err.message }));
+    }
+  } finally {
+    if (subdivided) subdivided.dispose();
+    if (displaced)  displaced.dispose();
+    if (!succeeded) bakeProgress.classList.add('hidden');
+    isBaking = false;
+    bakeBtn.classList.remove('busy');
+    bakeBtn.disabled = (activeMapEntry === null);
+  }
+}
+
+// Replace currentGeometry with `geometry` and reset per-model state without
+// touching the user's texture/settings. Mirrors the relevant subset of
+// handleModelFile but keeps activeMapEntry, settings, and refineLength as-is,
+// and seeds excludedFaces from opts.preExcludedFaces.
+function adoptBakedGeometry(geometry, bounds, opts = {}) {
+  // Invalidate any in-flight async operations tied to the previous mesh.
+  precisionToken++;
+  dispPreviewToken++;
+  exportToken++;
+  diagToken++;
+
+  // Dispose the previous working geometry so we don't leak GPU buffers. Note
+  // that it's still referenced by previewMaterial/loadGeometry until we swap
+  // those — but loadGeometry below replaces the visible mesh, and Three's
+  // BufferGeometry.dispose() only frees GPU resources (CPU arrays remain
+  // valid for any code that still holds the reference).
+  if (currentGeometry && currentGeometry !== geometry) currentGeometry.dispose();
+
+  currentGeometry = geometry;
+  currentBounds   = bounds;
+  currentStlName  = `${currentStlName}_baked`;
+  checkAmplitudeWarning();
+
+  // Dispose preview material so updatePreview rebuilds it on the new mesh.
+  if (previewMaterial) {
+    previewMaterial.dispose();
+    previewMaterial = null;
+  }
+
+  // Replace the visible mesh in the viewer.
+  loadGeometry(geometry);
+
+  // Reset displacement preview — its geometry referenced the pre-bake mesh.
+  if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
+  settings.useDisplacement = false;
+  dispPreviewToggle.checked = false;
+
+  // Reset precision masking — its mesh referenced the pre-bake mesh.
+  if (precisionGeometry) { precisionGeometry.dispose(); precisionGeometry = null; }
+  precisionParentMap  = null;
+  precisionEdgeLength = null;
+  precisionCentroids  = null;
+  precisionFaceNormals = null;
+  precisionAdjacency  = null;
+  precisionMaskingEnabled = false;
+  precisionMaskingToggle.checked = false;
+  precisionStatus.textContent = '';
+  precisionOutdated.classList.add('hidden');
+  precisionRefreshBtn.classList.add('hidden');
+  precisionWarning.classList.add('hidden');
+  precisionMaskingRow.classList.add('hidden');
+
+  // Reset mesh diagnostics — they referenced the pre-bake mesh.
+  meshDiagnostics.classList.add('hidden');
+  meshDiagAdvanced.classList.add('hidden');
+  lastFastDiag = null;
+  lastAdvancedDiag = null;
+  clearDiagHighlight();
+
+  // The seeded mask carries exclude-mode semantics ("don't re-texture these
+  // faces"). If the user was in include-only mode pre-bake, that mode would
+  // invert the meaning to "only texture these faces" — exactly backwards. So
+  // force exclude mode before seeding. setSelectionMode also clears
+  // excludedFaces as a side effect, which is fine — we re-seed below.
+  if (selectionMode) setSelectionMode(false);
+
+  // Seed exclusion mask, exit any active painting/place/rotate modes.
+  excludedFaces = new Set(opts.preExcludedFaces || []);
+  precisionExcludedFaces = new Set();
+  exclusionTool = null;
+  eraseMode     = false;
+  isPainting    = false;
+  if (placeOnFaceActive) togglePlaceOnFace(false);
+  if (rotateActive) toggleRotateMode(false);
+  rotateAngles = { x: 0, y: 0, z: 0 };
+  rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
+  exclBrushBtn.classList.remove('active');
+  exclBucketBtn.classList.remove('active');
+  exclBrushTypeRow.classList.add('hidden');
+  exclRadiusRow.classList.add('hidden');
+  exclThresholdRow.classList.add('hidden');
+  canvas.style.cursor = '';
+  setHoverPreview(null);
+  _lastHoverTriIdx = -1;
+
+  // Build adjacency for the new geometry (needed by brush/bucket tools and
+  // by the exclusion overlay).
+  const adjData = buildAdjacency(geometry);
+  triangleAdjacency = adjData.adjacency;
+  triangleCentroids = adjData.centroids;
+  triangleFaceNormals = adjData.faceNormals;
+  updateMeshDiagnostics(adjData, geometry.attributes.position.count / 3);
+
+  // Refresh exclusion overlay using the new geometry + new mask.
+  if (excludedFaces.size > 0) refreshExclusionOverlay();
+  else setExclusionOverlay(null);
+  const maskCount = excludedFaces.size;
+  exclCount.textContent = maskCount === 0
+    ? t('excl.initExcluded')
+    : (maskCount === 1
+      ? (selectionMode ? t('excl.faceSelected', { n: 1 }) : t('excl.faceExcluded', { n: 1 }))
+      : (selectionMode ? t('excl.facesSelected', { n: maskCount }) : t('excl.facesExcluded', { n: maskCount })));
+
+  // Update mesh info display.
+  triLimitWarning.classList.add('hidden');
+  const triCount = getTriangleCount(geometry);
+  const mb = ((geometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
+  const sx = bounds.size.x.toFixed(2);
+  const sy = bounds.size.y.toFixed(2);
+  const sz = bounds.size.z.toFixed(2);
+  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+
+  exportBtn.disabled = (activeMapEntry === null);
+  export3mfBtn.disabled = (activeMapEntry === null);
+  bakeBtn.disabled = (activeMapEntry === null);
+
+  updatePreview();
+
+  // Bake is a destructive transform — undo history references the pre-bake
+  // triangle set, so it's no longer meaningful.
+  _clearUndoStacks();
+}
+
 /**
  * Yield to the browser event loop, then run fn.
  * Uses setTimeout instead of rAF so it fires even in background tabs.
@@ -4310,7 +4613,7 @@ const PERSISTED_KEYS = [
   'mappingMode', 'scaleU', 'scaleV', 'lockScale',
   'offsetU', 'offsetV', 'rotation',
   'amplitude', 'textureHeight', 'invertDisplacement',
-  'symmetricDisplacement', 'textureSmoothing',
+  'symmetricDisplacement', 'noDownwardZ', 'textureSmoothing',
   'mappingBlend', 'seamBandWidth', 'capAngle', 'boundaryFalloff',
   'bottomAngleLimit', 'topAngleLimit',
   'refineLength', 'maxTriangles',
@@ -4401,6 +4704,10 @@ function applySettingsSnapshot(snap) {
     symmetricDispToggle.checked = snap.symmetricDisplacement;
     symmetricDispToggle.dispatchEvent(new Event('change', { bubbles: true }));
   }
+  if (snap.noDownwardZ != null) {
+    noDownwardZChk.checked = snap.noDownwardZ;
+    noDownwardZChk.dispatchEvent(new Event('change', { bubbles: true }));
+  }
 
   // Cylindrical-mode state. cylinderCenterX/Y/radius pass through unchanged
   // (null is meaningful — falls back to AABB defaults during projection).
@@ -4480,7 +4787,7 @@ const DEFAULT_SETTINGS_SNAPSHOT = Object.freeze({
   mappingMode: 5, scaleU: 0.5, scaleV: 0.5, lockScale: true,
   offsetU: 0, offsetV: 0, rotation: 0,
   amplitude: 0.5, textureHeight: 0.5, invertDisplacement: false,
-  symmetricDisplacement: false, textureSmoothing: 0,
+  symmetricDisplacement: false, noDownwardZ: false, textureSmoothing: 0,
   mappingBlend: 1, seamBandWidth: 0.5, capAngle: 20, boundaryFalloff: 0,
   bottomAngleLimit: 5, topAngleLimit: 0,
   refineLength: 1, maxTriangles: 750000,

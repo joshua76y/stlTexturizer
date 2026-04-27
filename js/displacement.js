@@ -419,6 +419,11 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
       if (settings.topAngleLimit    > 0 && newZ > tmpPos.z) newZ = tmpPos.z;
     }
 
+    // Overhang protection: never move a vertex below its original Z. X/Y
+    // displacement is preserved so surface texture detail still appears,
+    // it just gets pushed sideways instead of creating a new overhang.
+    if (settings.noDownwardZ && newZ < tmpPos.z) newZ = tmpPos.z;
+
     newPos[i*3]   = newX;
     newPos[i*3+1] = newY;
     newPos[i*3+2] = newZ;
