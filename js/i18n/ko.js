@@ -110,6 +110,7 @@ export default {
   "ui.noDownwardZHeading": "오버행 보호",
   "ui.noDownwardZDesc": "일부 텍스처는 표면 정점을 아래로 밀어내어 새로운 오버행을 만듭니다. 활성화하면 텍스처링 중에 정점이 −Z 방향으로 이동하지 않습니다. X와 Y 방향 이동에는 영향이 없습니다.",
   "ui.noDownwardZ": "정점의 하향 (−Z) 변위 방지",
+  "ui.enableMeshRegularization": "메쉬 정규화 활성화",
   "alerts.bakeFailed": "굽기 실패: {msg}",
   "progress.finalizing": "마무리 중…",
   "sections.export": "내보내기 ⓘ",

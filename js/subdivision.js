@@ -64,7 +64,20 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
       break;
     }
 
-    // Find longest edge for progress reporting
+    const { newIndices, newFaceExcluded, newFaceParentId, changed } = subdividePass(
+      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded,
+      canonIdx, posCanonMap, currentFaceParentId
+    );
+    currentIndices = newIndices;
+    if (newFaceExcluded) currentFaceExcluded = newFaceExcluded;
+    if (newFaceParentId) currentFaceParentId = newFaceParentId;
+
+    if (newIndices.length / 3 >= SAFETY_CAP) safetyCapHit = true;
+
+    // Report POST-pass state — the longest edge now is what the pass left
+    // behind, not what it just refined away.  This way the user sees the
+    // edge length actually decrease across iterations instead of seeing
+    // each value one step delayed.
     let maxEdgeLenSq = 0;
     for (let t = 0; t < currentIndices.length; t += 3) {
       const a = currentIndices[t], b = currentIndices[t + 1], c = currentIndices[t + 2];
@@ -76,16 +89,6 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
       if (ca > maxEdgeLenSq) maxEdgeLenSq = ca;
     }
     const longestEdge = Math.sqrt(maxEdgeLenSq);
-
-    const { newIndices, newFaceExcluded, newFaceParentId, changed } = subdividePass(
-      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded,
-      canonIdx, posCanonMap, currentFaceParentId
-    );
-    currentIndices = newIndices;
-    if (newFaceExcluded) currentFaceExcluded = newFaceExcluded;
-    if (newFaceParentId) currentFaceParentId = newFaceParentId;
-
-    if (newIndices.length / 3 >= SAFETY_CAP) safetyCapHit = true;
 
     const newTriCount = newIndices.length / 3;
     if (onProgress) onProgress(Math.min(0.95, (iter + 1) / maxIterations), newTriCount, longestEdge);

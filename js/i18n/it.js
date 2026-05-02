@@ -110,6 +110,7 @@ export default {
   "ui.noDownwardZHeading": "Protezione contro gli sbalzi",
   "ui.noDownwardZDesc": "Alcune texture spingono i vertici della superficie verso il basso, creando nuovi sbalzi. Se attivato, i vertici non vengono mai spostati nella direzione −Z durante la texturizzazione. Il movimento in X e Y rimane invariato.",
   "ui.noDownwardZ": "Impedisci lo spostamento dei vertici verso il basso (−Z)",
+  "ui.enableMeshRegularization": "Abilita regolarizzazione della mesh",
   "alerts.bakeFailed": "Cottura fallita: {msg}",
   "progress.finalizing": "Finalizzazione…",
   "sections.export": "Esporta ⓘ",

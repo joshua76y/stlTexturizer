@@ -505,16 +505,10 @@
           <div class="form-row">
             <label class="checkbox-label" for="regularize-enabled-chk">
               <input type="checkbox" id="regularize-enabled-chk" checked />
-              <span>Enable mesh regularization</span>
+              <span data-i18n="ui.enableMeshRegularization">Enable mesh regularization</span>
             </label>
           </div>
           <div id="regularize-debug-rows" class="regularize-debug-rows">
-            <div class="form-row">
-              <label class="checkbox-label" for="reg-clean-input-chk" title="Run regularize on the freshly-loaded mesh (and after Bake) so CAD-tessellation slivers in the input are collapsed before any other operation. Modifies the imported geometry.">
-                <input type="checkbox" id="reg-clean-input-chk" />
-                <span>Auto-clean input mesh on load / bake</span>
-              </label>
-            </div>
             <div class="form-row slider-row">
               <label for="reg-aspect-threshold" title="Triangles with thinness (longest edge / shortest altitude) above this become collapse candidates. Lower = more aggressive sliver detection.">Sliver threshold</label>
               <input type="number" id="reg-aspect-threshold" class="val" min="1" max="50" step="0.1" value="5" />
@@ -541,7 +535,7 @@
             </div>
             <div class="form-row slider-row">
               <label for="reg-second-pass-mul" title="Cap for the post-regularize subdivide = refineLength × this. Higher = fewer triangles but uneven sampling near sliver-cleared regions.">Re-subdivide cap (× target)</label>
-              <input type="number" id="reg-second-pass-mul" class="val" min="1" max="8" step="0.1" value="1.5" />
+              <input type="number" id="reg-second-pass-mul" class="val" min="1" max="8" step="0.1" value="1.1" />
             </div>
           </div>
 
@@ -688,8 +682,9 @@
         <li>Export as STL or 3MF.</li>
       </ol>
 
-      <h3 class="welcome-heading">New in this release <span class="welcome-date">&mdash; Apr 2026</span></h3>
+      <h3 class="welcome-heading">New in this release <span class="welcome-date">&mdash; May 2026</span></h3>
       <ul class="welcome-changelog">
+        <li><strong>Mesh regularization</strong> &mdash; collapses sliver triangles from CAD tessellation so each output triangle samples the texture coherently. Toggle under <em>Advanced / Beta Features</em>.</li>
         <li><strong>Bake Textures (beta)</strong> &mdash; apply the current texture and continue editing on the textured mesh. Find it under <em>Advanced / Beta Features</em>.</li>
         <li><strong>Significantly improved cylindrical mapping workflow</strong></li>
         <li><strong>Part rotation gizmo</strong></li>

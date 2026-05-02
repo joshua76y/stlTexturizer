@@ -110,6 +110,7 @@ export default {
   "ui.noDownwardZHeading": "Proteção contra saliências",
   "ui.noDownwardZDesc": "Algumas texturas empurram vértices da superfície para baixo, criando novas saliências. Quando ativado, os vértices nunca são movidos na direção −Z durante a texturização. O movimento em X e Y permanece inalterado.",
   "ui.noDownwardZ": "Impedir deslocamento de vértices para baixo (−Z)",
+  "ui.enableMeshRegularization": "Ativar regularização da malha",
   "alerts.bakeFailed": "Falha ao aplicar: {msg}",
   "progress.finalizing": "Finalizando…",
   "sections.export": "Exportar ⓘ",

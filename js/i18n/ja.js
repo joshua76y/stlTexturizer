@@ -110,6 +110,7 @@ export default {
   "ui.noDownwardZHeading": "オーバーハング防止",
   "ui.noDownwardZDesc": "一部のテクスチャは表面の頂点を下方向に押し下げ、新たなオーバーハングを生み出します。有効にすると、テクスチャ適用時に頂点が −Z 方向へ移動しなくなります。X および Y 方向の移動には影響しません。",
   "ui.noDownwardZ": "頂点の下方向 (−Z) への変位を防止する",
+  "ui.enableMeshRegularization": "メッシュ正則化を有効にする",
   "alerts.bakeFailed": "焼き込みに失敗しました: {msg}",
   "progress.finalizing": "仕上げ中…",
   "sections.export": "エクスポート ⓘ",

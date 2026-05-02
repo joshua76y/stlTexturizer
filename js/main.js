@@ -105,12 +105,7 @@ const settings = {
   regularizeExtremeAspect:   8,
   regularizeNormalDeg:       15,
   regularizeAggressiveNormalDeg: 25,
-  regularizeSecondPassMul:   1.5,
-  // When enabled, run regularize on the freshly-loaded (or re-baked) input
-  // mesh to collapse CAD-tessellation slivers (sub-µm-thick fillet strips,
-  // near-collinear flat slivers) before any other operation sees them.  Off
-  // by default — modifies the imported geometry, which surprises some users.
-  regularizeCleanInput:     false,
+  regularizeSecondPassMul:   1.1,
 };
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
@@ -311,7 +306,6 @@ const regExtremeAspectEl     = document.getElementById('reg-extreme-aspect');
 const regNormalDegEl         = document.getElementById('reg-normal-deg');
 const regAggressiveNormalDegEl = document.getElementById('reg-aggressive-normal-deg');
 const regSecondPassMulEl     = document.getElementById('reg-second-pass-mul');
-const regCleanInputChk       = document.getElementById('reg-clean-input-chk');
 
 // ── Exclusion panel DOM refs ──────────────────────────────────────────────────
 const exclBrushBtn        = document.getElementById('excl-brush-btn');
@@ -359,7 +353,7 @@ const imprintClose   = document.getElementById('imprint-close');
 // ── Welcome / What's New popup ───────────────────────────────────────────────
 // Bump this date whenever the "What's New" bullets in index.html change to
 // re-show the popup to all returning visitors who previously dismissed it.
-const WELCOME_LAST_UPDATED = '2026-04-28';
+const WELCOME_LAST_UPDATED = '2026-05-02';
 const WELCOME_STORAGE_KEY  = 'stlt-welcome-seen';
 const welcomeLink     = document.getElementById('welcome-link');
 const welcomeOverlay  = document.getElementById('welcome-overlay');
@@ -1420,12 +1414,6 @@ function wireEvents() {
       if (Number.isFinite(v)) { settings[key] = v; updatePreview(); }
     });
   };
-  regCleanInputChk.checked = settings.regularizeCleanInput;
-  regCleanInputChk.addEventListener('change', () => {
-    settings.regularizeCleanInput = regCleanInputChk.checked;
-    // Don't auto-apply on toggle — only on subsequent loads/bakes — to avoid
-    // surprising the user by mutating their currently-loaded mesh.
-  });
   _wireRegNumber(regAspectThresholdEl,    'regularizeAspectThreshold');
   _wireRegNumber(regSlackEl,              'regularizeSlack');
   _wireRegNumber(regAggressiveSlackEl,    'regularizeAggressiveSlack');
@@ -2766,14 +2754,6 @@ function loadDefaultCube() {
   currentStlName  = 'cube_50x50x50';
   checkAmplitudeWarning();
 
-  // Optional input-mesh cleanup (Advanced toggle).
-  {
-    const diag = Math.sqrt(currentBounds.size.x ** 2 + currentBounds.size.y ** 2 + currentBounds.size.z ** 2);
-    const cleanLen = Math.max(0.05, Math.min(5.0, +(diag / 250).toFixed(2)));
-    currentGeometry = _maybeCleanInputMesh(currentGeometry, cleanLen);
-    geo = currentGeometry;
-  }
-
   loadGeometry(geo);
   dropHint.classList.add('hidden');
 
@@ -2855,17 +2835,6 @@ async function handleModelFile(file) {
     const removedCount = (nanCount ?? 0) + (degenerateCount ?? 0);
     if (removedCount > 0) {
       console.warn(`Removed ${nanCount} NaN and ${degenerateCount} degenerate triangles at load time`);
-    }
-
-    // Optional input-mesh cleanup (Advanced toggle).  Must happen before the
-    // adjacency / loadGeometry / triangle-info passes below so they all see
-    // the cleaned geometry.  We derive refineLength inline using the same
-    // formula as below, since settings.refineLength isn't set yet at this
-    // point in the flow.
-    {
-      const diag = Math.sqrt(bounds.size.x ** 2 + bounds.size.y ** 2 + bounds.size.z ** 2);
-      const cleanLen = Math.max(0.05, Math.min(5.0, +(diag / 250).toFixed(2)));
-      currentGeometry = _maybeCleanInputMesh(currentGeometry, cleanLen);
     }
 
     // Dispose old preview material and reset state for the new mesh
@@ -3751,23 +3720,6 @@ function getEffectiveMapEntry() {
   return _effectiveMapCache;
 }
 
-// If the auto-clean-input toggle is on, run regularize on a freshly-loaded
-// (or freshly-baked) mesh to collapse CAD-tessellation slivers — the
-// sub-µm-thick fillet strips and near-collinear flat slivers some CAD tools
-// emit.  Returns the cleaned geometry (caller assigns it; old one disposed)
-// or the original geometry unchanged when the toggle is off.
-function _maybeCleanInputMesh(geo, refineLength) {
-  if (!settings.regularizeCleanInput || !settings.regularizeEnabled) return geo;
-  const triCount = geo.attributes.position.count / 3;
-  const initialFaceIds = new Int32Array(triCount);
-  for (let i = 0; i < triCount; i++) initialFaceIds[i] = i;
-  const reg = regularizeMesh(geo, initialFaceIds, refineLength, _regularizeOpts());
-  const outTris = reg.geometry.attributes.position.count / 3;
-  console.log(`[clean-input] regularize collapsed ${reg.collapseCount} edges (${triCount} → ${outTris} tris)`);
-  geo.dispose();
-  return reg.geometry;
-}
-
 // Build the regularize.js opts object from current settings.  Centralised so
 // preview / export / bake stay in sync with the Advanced-panel debug knobs.
 function _regularizeOpts() {
@@ -4381,7 +4333,7 @@ async function handleExport(format = 'stl') {
         const label = triCount != null
           ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
           : t('progress.subdividing');
-        setProgress(0.02 + p * 0.35, label);
+        setProgress(0.02 + p * 0.28, label);
       },
       faceWeights
     ));
@@ -4394,11 +4346,22 @@ async function handleExport(format = 'stl') {
     // first subdivide via faceWeights → excludeWeight, which regularize then
     // copies through and we can pass straight to the second subdivide.
     if (settings.regularizeEnabled) {
+      setProgress(0.30, t('progress.regularizing'));
+      await yieldFrame();
       const reg = regularizeMesh(subdivided, new Int32Array(subdivided.attributes.position.count / 3), settings.refineLength, _regularizeOpts());
       subdivided.dispose();
       const exclAttr = reg.geometry.attributes.excludeWeight;
       const secondPassWeights = exclAttr ? exclAttr.array : null;
-      const { geometry: resub } = await subdivide(reg.geometry, settings.refineLength * settings.regularizeSecondPassMul, null, secondPassWeights, { fast: false });
+      const { geometry: resub } = await subdivide(
+        reg.geometry, settings.refineLength * settings.regularizeSecondPassMul,
+        (p, triCount, longestEdge) => {
+          const label = triCount != null
+            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setProgress(0.32 + p * 0.06, label);
+        },
+        secondPassWeights, { fast: false }
+      );
       reg.geometry.dispose();
       subdivided = resub;
     }
@@ -4633,7 +4596,7 @@ async function bakeTextures() {
         const label = triCount != null
           ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
           : t('progress.subdividing');
-        setBakeProgress(0.02 + p * 0.45, label);
+        setBakeProgress(0.02 + p * 0.34, label);
       },
       faceWeights
     ));
@@ -4643,12 +4606,21 @@ async function bakeTextures() {
     // off.  Compose the two parent maps so faceParentId still points at
     // original-mesh faces (used below to remap user exclusions onto baked output).
     if (settings.regularizeEnabled) {
+      setBakeProgress(0.36, t('progress.regularizing'));
+      await yieldFrame();
       const reg = regularizeMesh(subdivided, faceParentId, settings.refineLength, _regularizeOpts());
       subdivided.dispose();
       const exclAttr = reg.geometry.attributes.excludeWeight;
       const secondPassWeights = exclAttr ? exclAttr.array : null;
       const { geometry: resub, faceParentId: resubParents } = await subdivide(
-        reg.geometry, settings.refineLength * settings.regularizeSecondPassMul, null, secondPassWeights, { fast: false }
+        reg.geometry, settings.refineLength * settings.regularizeSecondPassMul,
+        (p, triCount, longestEdge) => {
+          const label = triCount != null
+            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setBakeProgress(0.38 + p * 0.09, label);
+        },
+        secondPassWeights, { fast: false }
       );
       reg.geometry.dispose();
       const composed = new Int32Array(resubParents.length);
@@ -4791,9 +4763,6 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   currentStlName  = `${currentStlName}_baked`;
   checkAmplitudeWarning();
 
-  // Optional input-mesh cleanup (Advanced toggle) — bake re-authors the
-  // geometry so the same CAD-sliver risk applies as on a fresh load.
-  currentGeometry = _maybeCleanInputMesh(currentGeometry, settings.refineLength);
   geometry = currentGeometry;
 
   // Dispose preview material so updatePreview rebuilds it on the new mesh.

@@ -110,6 +110,7 @@ export default {
   "ui.noDownwardZHeading": "Protection anti-surplomb",
   "ui.noDownwardZDesc": "Certaines textures poussent les sommets de la surface vers le bas, créant ainsi de nouveaux surplombs. Quand activé, les sommets ne sont jamais déplacés dans la direction −Z lors de la texturation. Le mouvement en X et Y reste inchangé.",
   "ui.noDownwardZ": "Empêcher le déplacement des sommets vers le bas (−Z)",
+  "ui.enableMeshRegularization": "Activer la régularisation du maillage",
   "alerts.bakeFailed": "Échec de la cuisson : {msg}",
   "progress.finalizing": "Finalisation…",
   "sections.export": "Exportation ⓘ",
