@@ -123,17 +123,37 @@ export function export3MF(geometry, filename = 'textured.3mf') {
 
   const vertCount = uniqueXYZ.length / 3;
 
-  // ── Build 3dmodel.model XML ──────────────────────────────────────────────
-  // Stream into an array of string chunks then join once — much faster than
-  // repeated concatenation for large meshes.
-  const chunks = [];
-  chunks.push(
-    '<?xml version="1.0" encoding="UTF-8"?>\n',
-    '<model unit="millimeter" xml:lang="en-US" ',
-    'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n',
-    '<resources>\n',
-    '<object id="1" type="model">\n',
-    '<mesh>\n',
+  // ── Build 3dmodel.model XML as Uint8Array chunks ─────────────────────────
+  // A single concatenated string would exceed V8's max-string-length limit
+  // (~512 MiB) for meshes around 10M+ triangles, throwing "Invalid string
+  // length".  Encode chunks to UTF-8 bytes as we go, flushing the small
+  // staging string every ~1 MiB so it never grows large enough to trip the
+  // limit.  Final concat is byte-wise (no string-length cap).
+  const enc = new TextEncoder();
+  const byteChunks = [];
+  let totalBytes = 0;
+  let pending = '';
+  const FLUSH_THRESHOLD = 1 << 20; // 1 MiB
+
+  function flush() {
+    if (!pending) return;
+    const b = enc.encode(pending);
+    byteChunks.push(b);
+    totalBytes += b.length;
+    pending = '';
+  }
+  function emit(s) {
+    pending += s;
+    if (pending.length >= FLUSH_THRESHOLD) flush();
+  }
+
+  emit(
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<model unit="millimeter" xml:lang="en-US" ' +
+    'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n' +
+    '<resources>\n' +
+    '<object id="1" type="model">\n' +
+    '<mesh>\n' +
     '<vertices>\n'
   );
 
@@ -146,36 +166,41 @@ export function export3MF(geometry, filename = 'textured.3mf') {
   };
   for (let i = 0; i < vertCount; i++) {
     const b = i * 3;
-    chunks.push(
-      '<vertex x="', fmt(uniqueXYZ[b]),
-      '" y="', fmt(uniqueXYZ[b + 1]),
-      '" z="', fmt(uniqueXYZ[b + 2]),
+    emit(
+      '<vertex x="' + fmt(uniqueXYZ[b]) +
+      '" y="'       + fmt(uniqueXYZ[b + 1]) +
+      '" z="'       + fmt(uniqueXYZ[b + 2]) +
       '"/>\n'
     );
   }
 
-  chunks.push('</vertices>\n<triangles>\n');
+  emit('</vertices>\n<triangles>\n');
 
   for (let i = 0; i < triCount; i++) {
     const b = i * 3;
-    chunks.push(
-      '<triangle v1="', triIdx[b],
-      '" v2="', triIdx[b + 1],
-      '" v3="', triIdx[b + 2],
+    emit(
+      '<triangle v1="' + triIdx[b] +
+      '" v2="'         + triIdx[b + 1] +
+      '" v3="'         + triIdx[b + 2] +
       '"/>\n'
     );
   }
 
-  chunks.push(
-    '</triangles>\n',
-    '</mesh>\n',
-    '</object>\n',
-    '</resources>\n',
-    '<build>\n<item objectid="1"/>\n</build>\n',
+  emit(
+    '</triangles>\n' +
+    '</mesh>\n' +
+    '</object>\n' +
+    '</resources>\n' +
+    '<build>\n<item objectid="1"/>\n</build>\n' +
     '</model>\n'
   );
+  flush();
 
-  const modelXml = chunks.join('');
+  const modelBytes = new Uint8Array(totalBytes);
+  {
+    let off = 0;
+    for (const b of byteChunks) { modelBytes.set(b, off); off += b.length; }
+  }
 
   // ── Static package files ─────────────────────────────────────────────────
   const contentTypesXml =
@@ -196,7 +221,7 @@ export function export3MF(geometry, filename = 'textured.3mf') {
   const zipped = zipSync({
     '[Content_Types].xml': strToU8(contentTypesXml),
     '_rels/.rels':         strToU8(relsXml),
-    '3D/3dmodel.model':    strToU8(modelXml),
+    '3D/3dmodel.model':    modelBytes,
   }, { level: 6 });
 
   triggerDownload(

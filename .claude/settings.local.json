@@ -54,7 +54,12 @@
       "Bash(node test-fillet-quant-sweep.mjs)",
       "Bash(node test-sliver-collapse.mjs)",
       "Bash(node test-smooth-bottom.mjs)",
-      "Bash(node test-laserplate-diag.mjs)"
+      "Bash(node test-laserplate-diag.mjs)",
+      "Bash(node --max-old-space-size=8192 test-puerta-debug.mjs)",
+      "Bash(node --max-old-space-size=8192 test-laserplate.mjs)",
+      "Bash(node --max-old-space-size=8192 bench-tri-estimate.mjs)",
+      "Bash(node --max-old-space-size=8192 bench-sim-timing.mjs)",
+      "Bash(node --max-old-space-size=8192 -e ' *)"
     ]
   }
 }

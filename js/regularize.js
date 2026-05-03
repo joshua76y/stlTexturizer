@@ -155,8 +155,20 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   // and BOTH endpoints are marked frozen — never used as collapse endpoints.
   // This preserves 45°/90° corners exactly while leaving interior-of-face
   // slivers free to collapse.
+  //
+  // Sliver-aware: dihedrals between extreme slivers are unreliable — a sliver's
+  // normal is dominated by the position of its far apex, so a 0.1 mm Z noise
+  // on a 30 mm needle pivots the normal by tens of degrees with no real
+  // feature behind it (puerta texturized.stl, May 2026).  When EITHER
+  // adjacent tri is an extreme sliver, we skip the freeze for that edge —
+  // the per-collapse normal-change gate (measured against original normals)
+  // remains as the primary safeguard against feature damage.  Real CAD
+  // features (cube edges, chamfers) are bordered by well-shaped tris on
+  // each side and are unaffected.
   const frozenVert = new Uint8Array(nextVid);
   {
+    const triThin2 = new Float32Array(triCount);
+    for (let t = 0; t < triCount; t++) triThin2[t] = triAspectSq(t);
     const edgeSeen = new Map(); // numeric key → first triangle index
     const edgeKey = (a, b) => a < b ? a * nextVid + b : b * nextVid + a;
     for (let t = 0; t < triCount; t++) {
@@ -165,6 +177,7 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
         const k = edgeKey(u, v);
         const other = edgeSeen.get(k);
         if (other === undefined) { edgeSeen.set(k, t); continue; }
+        if (triThin2[t] > extremeAspect2 || triThin2[other] > extremeAspect2) continue;
         const dot = triNrmX[t]*triNrmX[other] + triNrmY[t]*triNrmY[other] + triNrmZ[t]*triNrmZ[other];
         if (dot < sharpEdgeCos) { frozenVert[u] = 1; frozenVert[v] = 1; }
       }

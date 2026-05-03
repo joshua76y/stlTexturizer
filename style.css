@@ -886,15 +886,16 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 
 /* ── Smart-resolution button + diagnostic ──────────────────────────────────── */
 .smart-res-btn {
-  flex-shrink: 0;
-  height: 22px;
-  padding: 0 8px;
+  display: block;
+  width: 100%;
+  margin-bottom: 6px;
+  padding: 7px 12px;
   background: var(--surface2);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
   transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
 .smart-res-btn:hover:not(:disabled) {

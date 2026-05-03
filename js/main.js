@@ -3180,17 +3180,22 @@ function applySmartResolution() {
   });
   if (!result) return;
 
-  // Programmatic .value assignments don't fire input events, so set directly
-  // — no live-preview refresh needed (refineLength only affects export).
+  // Apply both values together.  Resolution and max-tri are a matched pair —
+  // both are derived from the texture / amplitude / surface area, and the
+  // chosen edge assumes decimation will land near `recommendedMaxTri`.
+  // Setting them in lockstep means clicking Smart twice is idempotent.
+  const d = result.diagnostics;
   settings.refineLength = result.edge;
   refineLenSlider.value = result.edge;
   refineLenVal.value    = result.edge;
   checkResolutionWarning();
 
-  const d = result.diagnostics;
-  const triLabel = d.estTriangles >= 1e6
-    ? `${(d.estTriangles / 1e6).toFixed(1)} M`
-    : `${(d.estTriangles / 1e3).toFixed(0)} k`;
+  // Set max-tri via the slider's existing input event so settings.maxTriangles
+  // and the displayed label stay consistent with all other slider drag paths.
+  maxTriSlider.value = d.recommendedMaxTri;
+  maxTriSlider.dispatchEvent(new Event('input', { bubbles: true }));
+
+  const maxLabel = formatM(d.recommendedMaxTri);
   const clampedNote = d.budgetClamped
     ? ` <span class="clamped">[${t('ui.smartResBudgetCapped')}]</span>`
     : '';
@@ -3199,7 +3204,7 @@ function applySmartResolution() {
     ppe:  d.pixelsPerEdge.toFixed(1),
     pix:  d.pixMm.toFixed(3),
     area: (d.surfaceArea / 100).toFixed(0),  // cm²
-    tris: triLabel,
+    tris: maxLabel,
   }) + clampedNote;
   smartResInfo.classList.remove('hidden');
 }
