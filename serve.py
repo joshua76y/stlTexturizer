@@ -26,6 +26,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 if __name__ == '__main__':
     with socketserver.TCPServer(('', PORT), Handler) as httpd:
-        print(f'\n  ✦  stlTexturizer  —  http://localhost:{PORT}')
+        print(f'\n  ✦  STL质感生成器  —  http://localhost:{PORT}')
         print(f'  ✦  Press Ctrl+C to stop\n')
         httpd.serve_forever()

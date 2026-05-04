@@ -1,6 +1,8 @@
-# BumpMesh · 焦糖铁观音@2026
+# STL质感生成器
 
 **3D 模型置换纹理工具** — 在浏览器中为 STL、OBJ、3MF 模型添加表面置换纹理，无需安装，纯本地处理。
+
+> 焦糖铁观音基于 [CNC Kitchen](https://github.com/CNCKitchen/stlTexturizer) 的 **BumpMesh** 项目修改并本地化。
 
 ---
 
@@ -139,4 +141,4 @@ js/
 
 ## 许可
 
-GNU AGPL v3.0 — 参见 [LICENSE](LICENSE)。
+MIT 协议 — 参见 [LICENSE](LICENSE)。

@@ -1,11 +1,11 @@
 @echo off
-title BumpMesh - 置换纹理工具
+title STL质感生成器 - 置换纹理工具
 cd /d "%~dp0"
 
 echo.
 echo  ╔══════════════════════════════════╗
-echo  ║   BumpMesh · 焦糖铁观音@2026     ║
-echo  ║   3D 模型置换纹理工具            ║
+echo  ║     STL质感生成器                ║
+echo  ║     3D 模型置换纹理工具           ║
 echo  ╚══════════════════════════════════╝
 echo.
 
