@@ -1,174 +1,142 @@
-# BumpMesh by CNC Kitchen
+# BumpMesh · 焦糖铁观音@2026
 
-**Live:** https://bumpmesh.com  
-**GitHub:** https://github.com/CNCKitchen/stlTexturizer
-**Author:** Stefan Hermann
+**3D 模型置换纹理工具** — 在浏览器中为 STL、OBJ、3MF 模型添加表面置换纹理，无需安装，纯本地处理。
 
-A browser-based tool for applying surface displacement textures to 3D meshes — no installation required.
+---
 
-Load an STL, OBJ, or 3MF file, pick a texture, tune the parameters, and export a new displaced STL ready for slicing.
+## 快速开始
 
-## Recent Updates
+### Windows
+双击 **`start.bat`**，自动打开浏览器即可使用。
 
-- Save / load project files (`.bumpmesh`)
-- Undo / redo history
-- Part rotation gizmo
-- Mesh diagnostics
-- Smooth masking borders
-- New languages: Italian, Spanish, Portuguese, Japanese, French
-- 2–3× speed improvement
-- 3MF export
-- Mouse-wheel fine tuning of values
-- Quality of life improvements
+### macOS
+双击 **`start.command`**（如提示安全警告，右键 → 打开），自动打开浏览器。
 
-## Features
+### 手动启动（任何平台）
+```bash
+python -m http.server 8080
+```
+然后访问 http://localhost:8080
 
-### Textures
-- **24 built-in seamless textures** — basket, brick, bubble, carbon fiber, crystal, dots, grid, grip surface, hexagon, hexagons, isogrid, knitting, knurling, leather 2, noise, stripes (×2 variants), voronoi, weave (×3 variants), wood (×3 variants)
-- **Custom textures** — upload your own image as a displacement map
-- **Texture smoothing** — configurable blur to soften the displacement map before applying
+> 由于浏览器安全策略限制 ES Module 加载，请务必通过 HTTP 服务器访问，不要直接双击 `index.html`。
 
-### Projection Modes
-- **Triplanar** (default) — blends three planar projections based on surface normals; best for complex shapes
-- **Cubic (Box)** — projects from 6 box faces with edge-seam blending and smart axis dominance
-- **Cylindrical** — wraps texture around a cylindrical axis with configurable cap angle
-- **Spherical** — maps texture spherically around the object
-- **Planar XY / XZ / YZ** — flat axis-aligned projections
+---
 
-### UV & Transform Controls
-- **Scale U/V** — independent or locked scaling (0.05–10×, logarithmic)
-- **Offset U/V** — position the texture on each axis
-- **Rotation** — rotate texture before projection
-- **Seam Blend Strength** — softens hard edges where Cubic/Cylindrical projection faces meet
-- **Seam Band Width** — controls blending zone width at seam edges
-- **Cap Angle** (Cylindrical) — threshold for switching to top/bottom cap projection
+## 功能特性
 
-### Displacement
-- **Amplitude** — scales displacement depth from 0 % to 100 %
-- **Symmetric displacement** — 50 % grey stays neutral, white pushes out, black pushes in (preserves volume)
-- **3D displacement preview** — real-time GPU-accelerated preview toggle showing actual vertex displacement
-- **Amplitude overlap warning** — alerts when depth exceeds 10 % of the smallest model dimension
+### 纹理贴图
+- **36 种内置无缝纹理** — 包含编织、砖墙、气泡、碳纤维、水晶、点阵、网格、防滑纹、六边形、等栅格、针织、滚花、皮革、噪点、条纹（×2）、钻石纹、编织纹（×3）、木材（×3），以及 Cement、Geo、Leaf、Grip 1/2 等更多预设
+- **自定义纹理** — 上传自己的图片作为置换贴图
+- **纹理平滑** — 可调节模糊半径柔化置换贴图细节
 
-### Surface Masking
-- **Angle masking** — suppress texture on near-horizontal top and/or bottom faces (0°–90° threshold each)
-- **Face exclusion / inclusion painting** — paint individual faces to exclude (orange) or exclusively include (green) them
-  - Brush tool — single-triangle click or adjustable-radius circle brush
-  - Bucket fill — flood-fills adjacent faces up to a configurable dihedral-angle threshold
-  - Erase — hold Shift to undo painted faces
-  - Clear all — reset masking
+### 投影模式
+- **三平面**（默认）— 根据表面法线混合三个平面投影，适合复杂形状
+- **立方体（盒状）** — 从 6 个盒面投影，带边缘接缝混合
+- **圆柱** — 沿圆柱轴环绕纹理，可配置端盖角度
+- **球体** — 球面映射纹理
+- **平面 XY / XZ / YZ** — 沿坐标轴的平面投影
 
-### Mesh Processing
-- **Adaptive subdivision** — subdivides edges until they are ≤ a target length; respects sharp creases (>30° dihedral)
-- **QEM decimation** — simplifies the result to a target triangle count using Quadric Error Metrics with boundary protection, link-condition checks, normal-flip rejection, and crease preservation
-- **Mesh diagnostics** — automatic checks for open edges and shell count, with advanced diagnostics and overlay highlights for problem areas
-- **Safety cap** — hard limit of 10 M triangles during subdivision to prevent out-of-memory
+### UV 与变换控制
+- **缩放 U/V** — 独立或锁定等比缩放（0.05–10×，对数曲线）
+- **偏移 U/V** — 在纹理坐标系中平移贴图
+- **旋转** — 投影前旋转纹理
+- **接缝混合** — 柔化立方体/圆柱模式的接缝
+- **过渡平滑** — 控制接缝边缘混合区域宽度
+- **端盖角度**（圆柱）— 触发顶部/底部端盖投影的阈值
 
-### 3D Viewer
-- **Orbit / pan / zoom** controls
-- **Wireframe toggle** — visualise mesh topology
-- **Mesh info** — live triangle count, file size, bounding-box dimensions
-- **Grid & axes indicator** — X = red, Y = green, Z = blue
-- **Place on Face** — click a face to orient it downward onto the print bed
+### 置换深度
+- **纹理高度** — 0%–100% 可调置换深度
+- **对称置换** — 50% 灰保持中性，白色外凸，黑色内凹（保持体积大致恒定）
+- **3D 置换预览** — 实时 GPU 加速预览，直接显示顶点位移效果
+- **重叠警告** — 当深度超过模型最小尺寸 10% 时发出提醒
 
-### File Support
-- **.STL** — binary and ASCII
-- **.OBJ** — via Three.js OBJLoader
-- **.3MF** — ZIP-based format (via fflate decompression)
+### 表面遮罩
+- **角度遮罩** — 抑制近乎水平的顶面和/或底面的纹理（0°–90° 可调）
+- **面排除/包含绘制** — 用画笔标记个别面：排除（橙色）或仅包含（绿色）
+  - 画笔工具 — 单击单三角形或可调半径圆形画笔
+  - 桶填充 — 按二面角阈值填充相邻面
+  - 擦除 — 按住 Shift 撤销绘制
+  - 清除全部 — 重置遮罩
 
-### Export
-- Downloads a **binary STL** with displacement baked in
-- Progress reporting through subdivision → displacement → decimation → writing stages
-- Configurable edge-length threshold and output triangle limit
+### 网格处理
+- **自适应细分** — 将边细分至目标长度以下，保留尖锐折痕（>30° 二面角）
+- **QEM 简化** — 基于四元误差矩阵将结果简化至目标三角形数量
+- **网格规整化** — 折叠 CAD 三角剖分产生的细长三角形，使采样更一致
+- **网格诊断** — 自动检查开放边、壳数，以及高级的相交/重叠检测
+- **安全上限** — 细分阶段硬限制为 1000 万三角形，防止内存溢出
 
-### Other
-- **Light / Dark theme** — respects OS preference, persisted per browser
-- **Multilingual** — English and German UI with auto-detection
+### 3D 查看器
+- **轨道/平移/缩放** — 鼠标控制
+- **线框模式** — 可视化网格拓扑
+- **网格信息** — 实时显示三角形数、文件大小、包围盒尺寸
+- **坐标系指示** — X=红、Y=绿、Z=蓝
+- **贴面放置** — 点击面将其朝下定向到打印平台
 
-## Usage
+### 文件支持
+- **.STL** — 二进制和 ASCII 格式
+- **.OBJ** — 通过 Three.js OBJLoader
+- **.3MF** — 基于 ZIP 的格式
 
-1. Open `index.html` in a modern browser (Chrome, Edge, Firefox, Safari).
-2. Drop a model onto the viewport or click **Load STL…** (supports STL, OBJ, 3MF).
-3. Select a texture preset from the sidebar (or upload a custom image).
-4. Choose a projection mode and adjust UV scale, offset, rotation, and amplitude.
-5. Optionally mask or exclude surfaces with the angle sliders or paint tools.
-6. Click **Export STL** to download the displaced mesh.
+### 导出
+- **导入/导出项目** — 保存为 `.bumpmesh` 文件，随时恢复工作状态
+- **撤销/重做** — 完整的键盘快捷键支持
+- **导出 STL / 3MF** — 烘焙纹理后直接下载
+- **进度报告** — 细分 → 置换 → 简化 → 写入各阶段进度显示
 
-> **Note:** All processing runs entirely in the browser — no data is uploaded to any server.
+### 界面
+- **中/英/德/意/西/葡/法/日/韩 多语言** — 自动检测浏览器语言，可手动切换
+- **浅色/深色主题** — 跟随系统偏好，可手动切换
+- **全本地处理** — 所有计算均在浏览器内完成，不上传任何数据
 
-## Project Structure
+---
+
+## 项目结构
 
 ```
-index.html            # Main entry point
-style.css             # Styles (light / dark theme)
-logo.png              # Favicon & header logo
-CNAME                 # Custom domain (bumpmesh.com)
-textures/             # Built-in JPG/PNG displacement map images (24 textures)
+index.html              # 主入口
+style.css               # 样式（浅色/深色主题）
+logo.png                # Favicon 和头部 Logo
+start.bat               # Windows 一键启动
+start.command           # macOS 一键启动
+textures/               # 内置纹理图片（36 种）
+textures/thumbs/        # 纹理缩略图
 js/
-  main.js             # App bootstrap & UI wiring
-  viewer.js           # Three.js scene / camera / controls
-  stlLoader.js        # Binary & ASCII STL parser
-  presetTextures.js   # Built-in texture presets + custom upload
-  previewMaterial.js  # Three.js material for live & displacement preview
-  mapping.js          # UV projection logic (7 modes)
-  displacement.js     # Vertex displacement baking
-  subdivision.js      # Adaptive mesh subdivision
-  decimation.js       # QEM mesh decimation
-  exclusion.js        # Face exclusion / inclusion painting
-  exporter.js         # Binary STL export
-  i18n.js             # Translations (EN / DE)
+  main.js               # 应用主逻辑和 UI 绑定
+  viewer.js             # Three.js 场景/相机/控制
+  stlLoader.js          # STL 解析器（二进制和 ASCII）
+  presetTextures.js     # 内置纹理预设 + 自定义上传
+  previewMaterial.js    # 实时预览的 Three.js 材质
+  mapping.js            # UV 投影逻辑（7 种模式）
+  displacement.js       # 顶点置换烘焙
+  subdivision.js        # 自适应网格细分
+  decimation.js         # QEM 网格简化
+  regularization.js     # 网格规整化
+  exclusion.js          # 面排除/包含绘制
+  exporter.js           # STL/3MF 导出
+  meshValidation.js     # 网格诊断
+  i18n.js               # 国际化引擎
+  i18n/                 # 翻译文件（9 种语言）
 ```
 
-## Run Locally
+---
 
-All processing runs entirely in the browser — no backend or build step is needed. You just need a local HTTP server because browsers block ES module imports and texture loading from `file://` URLs.
+## 依赖
 
-```bash
-# Clone the repository
-git clone https://github.com/CNCKitchen/stlTexturizer.git
-cd stlTexturizer
-```
+通过 CDN（[jsDelivr](https://www.jsdelivr.com/)）加载，无需构建或安装：
 
-Then start any static file server from the project root. Pick whichever you have installed:
+| 库 | 版本 | 协议 | 用途 |
+|---|---|---|---|
+| [Three.js](https://threejs.org/) | 0.170.0 | MIT | 3D 渲染、场景管理、材质 |
+| — [OrbitControls](https://threejs.org/docs/#examples/en/controls/OrbitControls) | 0.170.0 | MIT | 相机轨道/平移/缩放 |
+| — [STLLoader](https://threejs.org/docs/#examples/en/loaders/STLLoader) | 0.170.0 | MIT | STL 导入 |
+| — [OBJLoader](https://threejs.org/docs/#examples/en/loaders/OBJLoader) | 0.170.0 | MIT | OBJ 导入 |
+| — [LineSegments2 / LineSegmentsGeometry / LineMaterial](https://threejs.org/docs/#examples/en/lines/LineSegments2) | 0.170.0 | MIT | 宽线框叠加显示 |
+| [fflate](https://github.com/101arrowz/fflate) | 0.8.2 | MIT | 3MF 导入/导出的 ZIP 压缩解压 |
 
-**Python (3.x)**
-```bash
-python -m http.server 8000
-```
+所有依赖均为 MIT 协议。
 
-**Python (2.x)**
-```bash
-python -m SimpleHTTPServer 8000
-```
+---
 
-**Node.js (npx, no install needed)**
-```bash
-npx serve .
-```
+## 许可
 
-**PHP**
-```bash
-php -S localhost:8000
-```
-
-Open http://localhost:8000 in your browser and you're ready to go.
-
-> **Tip:** Any static server will work — the app has no server-side dependencies.
-
-## Dependencies
-
-Loaded via CDN ([jsDelivr](https://www.jsdelivr.com/)) — no build step or npm install needed:
-
-| Library | Version | License | Usage |
-|---------|---------|---------|-------|
-| [Three.js](https://threejs.org/) | 0.170.0 | MIT | 3D rendering, scene management, materials |
-| — [OrbitControls](https://threejs.org/docs/#examples/en/controls/OrbitControls) | 0.170.0 | MIT | Camera orbit / pan / zoom |
-| — [STLLoader](https://threejs.org/docs/#examples/en/loaders/STLLoader) | 0.170.0 | MIT | Binary & ASCII STL import |
-| — [OBJLoader](https://threejs.org/docs/#examples/en/loaders/OBJLoader) | 0.170.0 | MIT | OBJ mesh import |
-| — [LineSegments2 / LineSegmentsGeometry / LineMaterial](https://threejs.org/docs/#examples/en/lines/LineSegments2) | 0.170.0 | MIT | Wide-line wireframe overlay |
-| [fflate](https://github.com/101arrowz/fflate) | 0.8.2 | MIT | ZIP compression & decompression for 3MF import/export |
-
-All dependencies are MIT-licensed.
-
-## License
-
-GNU AGPL v3.0 — see [LICENSE](LICENSE).
+GNU AGPL v3.0 — 参见 [LICENSE](LICENSE)。
