@@ -14,6 +14,10 @@ PRESETS = [
     "knurling.jpg", "leather2.png", "noise.jpg", "stripes.png",
     "stripes_02.png", "voronoi.jpg", "weave.png", "weave_02.jpg",
     "weave_03.jpg", "wood.jpg", "woodgrain_02.jpg", "woodgrain_03.jpg",
+    # 新增 (来自 置换纹理贴图)
+    "Grip_1.webp", "Grip_2.webp", "brick.webp", "carbon_fiber.webp",
+    "cement.webp", "geo.webp", "hexagon.webp", "leaf.webp",
+    "leather.webp", "wood.webp", "wood_2.webp", "wood_3.webp",
 ]
 
 total = 0

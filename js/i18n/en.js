@@ -215,5 +215,22 @@ export default {
   "ui.cylinderPanelLabel": "Define cylinder projection",
   "ui.cylinderNoModel1": "Load a model to position",
   "ui.cylinderNoModel2": "the cylinder axis",
-  "ui.cylinderPanelMinimize": "Minimize / restore"
+  "ui.cylinderPanelMinimize": "Minimize / restore",
+
+  "regularize.heading": "Regularize Mesh ⓘ",
+  "regularize.desc": "After subdividing, collapse sliver triangles produced by CAD-tessellation needles (fan-tessellated faces, near-collinear \"flat slivers\") so each output triangle samples coherent texels. A second subdivide brings stretched edges back near the resolution target, while masked surfaces are skipped.",
+  "regularize.sliverThreshold": "Sliver threshold",
+  "regularize.sliverThresholdTitle": "Triangles with thinness (longest edge / shortest altitude) above this become collapse candidates. Lower = more aggressive sliver detection.",
+  "regularize.edgeSlackBase": "Edge slack (base)",
+  "regularize.edgeSlackBaseTitle": "Base edge cap = refineLength × slack. Surviving collapses must keep new edges below this.",
+  "regularize.edgeSlackAggressive": "Edge slack (aggressive)",
+  "regularize.edgeSlackAggressiveTitle": "Loose edge cap used when at least one wing of the collapse is an extreme sliver. Higher = more aggressive sliver clearing, larger stretched edges (re-subdivided afterwards).",
+  "regularize.extremeAspect": "Extreme sliver threshold",
+  "regularize.extremeAspectTitle": "Thinness above which a wing counts as 'extreme', triggering the aggressive edge & normal caps. Higher = more conservative (protects fillets).",
+  "regularize.normalChangeLimit": "Normal change limit (°)",
+  "regularize.normalChangeLimitTitle": "Maximum normal swing per collapse (degrees). Lower = better feature preservation.",
+  "regularize.aggressiveNormalLimit": "Aggressive normal limit (°)",
+  "regularize.aggressiveNormalLimitTitle": "Looser normal swing limit when both wings are extreme slivers. Higher = better chain-sliver dissolution, risk of bending fine fillets.",
+  "regularize.resubdivideCap": "Re-subdivide cap (× target)",
+  "regularize.resubdivideCapTitle": "Cap for the post-regularize subdivide = refineLength × this. Higher = fewer triangles but uneven sampling near sliver-cleared regions."
 };

@@ -103,24 +103,6 @@
 [data-theme="light"] .theme-toggle .icon-moon { display: none; }
 [data-theme="light"] .theme-toggle .icon-sun  { display: block; }
 
-.github-link {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  color: var(--text-muted);
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-  flex-shrink: 0;
-}
-.github-link:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
 html, body {
   height: 100%;
   font-family: 'Segoe UI', system-ui, sans-serif;

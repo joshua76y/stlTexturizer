@@ -4,6 +4,7 @@
 export const TRANSLATIONS = {
   en: { 'lang.name': 'English' },
   de: { 'lang.name': 'Deutsch' },
+  zh: { 'lang.name': '简体中文' },
   it: { 'lang.name': 'Italiano' },
   es: { 'lang.name': 'Español' },
   pt: { 'lang.name': 'Português' },

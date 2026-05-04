@@ -45,6 +45,19 @@ const IMAGE_PRESETS = [
   { name: 'Wood 1',       url: 'textures/wood.jpg',         thumb: 'textures/thumbs/wood.webp',         defaultScale: 0.5 },
   { name: 'Wood 2',       url: 'textures/woodgrain_02.jpg', thumb: 'textures/thumbs/woodgrain_02.webp', defaultScale: 1.0 },
   { name: 'Wood 3',       url: 'textures/woodgrain_03.jpg', thumb: 'textures/thumbs/woodgrain_03.webp', defaultScale: 1.0 },
+  // 新增纹理 (来自 置换纹理贴图)
+  { name: 'Cement',       url: 'textures/cement.webp',      thumb: 'textures/thumbs/cement.webp',      defaultScale: 0.5 },
+  { name: 'Geo',          url: 'textures/geo.webp',         thumb: 'textures/thumbs/geo.webp',         defaultScale: 0.5 },
+  { name: 'Leaf',         url: 'textures/leaf.webp',        thumb: 'textures/thumbs/leaf.webp',        defaultScale: 0.5 },
+  { name: 'Grip 1',       url: 'textures/Grip_1.webp',      thumb: 'textures/thumbs/Grip_1.webp',      defaultScale: 0.5 },
+  { name: 'Grip 2',       url: 'textures/Grip_2.webp',      thumb: 'textures/thumbs/Grip_2.webp',      defaultScale: 0.5 },
+  { name: 'Brick (alt)',  url: 'textures/brick.webp',       thumb: 'textures/thumbs/brick.webp',       defaultScale: 0.5 },
+  { name: 'Carbon (alt)', url: 'textures/carbon_fiber.webp', thumb: 'textures/thumbs/carbon_fiber.webp', defaultScale: 0.5 },
+  { name: 'Hexagon (alt)',url: 'textures/hexagon.webp',     thumb: 'textures/thumbs/hexagon.webp',     defaultScale: 0.5 },
+  { name: 'Leather',      url: 'textures/leather.webp',     thumb: 'textures/thumbs/leather.webp',     defaultScale: 0.5 },
+  { name: 'Wood (alt)',   url: 'textures/wood.webp',        thumb: 'textures/thumbs/wood.webp',        defaultScale: 0.5 },
+  { name: 'Woodgrain 2',  url: 'textures/wood_2.webp',      thumb: 'textures/thumbs/wood_2.webp',      defaultScale: 0.5 },
+  { name: 'Woodgrain 3',  url: 'textures/wood_3.webp',      thumb: 'textures/thumbs/wood_3.webp',      defaultScale: 0.5 },
 ];
 
 // Cache for full-resolution preset data (keyed by index)
