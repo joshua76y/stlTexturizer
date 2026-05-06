@@ -114,6 +114,8 @@ export default {
   "ui.smoothBottomDesc": "Snap any vertex within 0.1 mm of the bottom plane onto it after texturing. Keeps the bed-contact surface perfectly flat so slicers don't shade tiny height variations on bottom slivers.",
   "ui.smoothBottom": "Snap near-bottom vertices to the bottom plane",
   "ui.enableMeshRegularization": "Enable mesh regularization",
+  "ui.regularizeFullModel": "Regularize entire model",
+  "ui.regularizeFullModelTitle": "When checked, regularize the entire mesh. Otherwise only process textured areas; untextured regions pass through unchanged.",
   "alerts.bakeFailed": "Bake failed: {msg}",
   "progress.finalizing": "Finalizing…",
   "sections.export": "Export ⓘ",

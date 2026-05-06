@@ -114,6 +114,8 @@ export default {
   "ui.smoothBottomDesc": "Vertices, die weniger als 0,1 mm von der Unterseite entfernt liegen, werden nach dem Texturieren exakt auf diese Ebene gesnappt. So bleibt die Druckbett-Auflage perfekt flach und Slicer schattieren keine winzigen Höhenunterschiede mehr.",
   "ui.smoothBottom": "Bodennahe Vertices auf die Unterseite snappen",
   "ui.enableMeshRegularization": "Netz-Regularisierung aktivieren",
+  "ui.regularizeFullModel": "Gesamtes Modell regularisieren",
+  "ui.regularizeFullModelTitle": "Wenn aktiviert, wird das gesamte Netz regularisiert. Andernfalls nur texturierte Bereiche; nicht texturierte Regionen bleiben unverändert.",
   "alerts.bakeFailed": "Einbacken fehlgeschlagen: {msg}",
   "progress.finalizing": "Wird abgeschlossen…",
   "sections.export": "Export ⓘ",

@@ -498,6 +498,14 @@
               <span data-i18n="ui.enableMeshRegularization">Enable mesh regularization</span>
             </label>
           </div>
+          <div class="form-row">
+            <label class="checkbox-label" for="regularize-full-chk"
+                   data-i18n-title="ui.regularizeFullModelTitle"
+                   title="When checked, regularize the entire mesh. Otherwise only process textured areas; untextured regions pass through unchanged.">
+              <input type="checkbox" id="regularize-full-chk" checked />
+              <span data-i18n="ui.regularizeFullModel">Regularize entire model</span>
+            </label>
+          </div>
           <div id="regularize-debug-rows" class="regularize-debug-rows">
             <div class="form-row slider-row">
               <label for="reg-aspect-threshold"

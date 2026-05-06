@@ -114,6 +114,8 @@ export default {
   "ui.smoothBottomDesc": "纹理化后将距离底部平面 0.1 mm 内的顶点吸附到底部平面。确保与打印平台接触的面保持完美平整，避免切片软件在底部细小三角形上出现微小高度变化。",
   "ui.smoothBottom": "将靠近底部的顶点吸附到底部平面",
   "ui.enableMeshRegularization": "启用网格规整化",
+  "ui.regularizeFullModel": "规整化整个模型",
+  "ui.regularizeFullModelTitle": "勾选时规整化整个模型，否则只处理已进行贴图的部分，未贴图区域保持不变",
   "alerts.bakeFailed": "烘焙失败：{msg}",
   "progress.finalizing": "正在收尾…",
   "sections.export": "导出 ⓘ",

@@ -41,6 +41,9 @@
  * @param {number}              [opts.maxNormalDeltaCos=cos(15°)]       – min dot of new vs old face normal (base)
  * @param {number}              [opts.aggressiveNormalDeltaCos=cos(25°)] – min dot when BOTH wings are extreme slivers
  * @param {number}              [opts.maxRounds=8]       – iterate until stable, capped at this
+ * @param {Uint8Array}          [opts.excludedTris]      – per-triangle skip flag (1 = skip).  When provided,
+ *                                                          excluded triangles are marked as deleted before the
+ *                                                          regularize loop, so they pass through unchanged.
  * @returns {{ geometry, faceParentId, collapseCount }}
  */
 
@@ -184,12 +187,26 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     }
   }
 
+  // Freeze vertices of excluded triangles (untextured/masked regions) so no
+  // collapse moves them — excluded areas pass through regularize unchanged.
+  const excludedTris = opts.excludedTris;
+  if (excludedTris) {
+    for (let t = 0; t < triCount; t++) {
+      if (excludedTris[t]) {
+        frozenVert[corners[t*3]] = 1;
+        frozenVert[corners[t*3+1]] = 1;
+        frozenVert[corners[t*3+2]] = 1;
+      }
+    }
+  }
+
   // helper: triangles that contain both u and v
   function trianglesSharingEdge(u, v) {
     const out = [];
     const setV = vertTris[v];
     for (const t of vertTris[u]) {
       if (triDeleted[t]) continue;
+      if (excludedTris && excludedTris[t]) continue;
       if (setV.has(t)) out.push(t);
     }
     return out;
@@ -222,6 +239,7 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     const candidates = [];
     for (let t = 0; t < triCount; t++) {
       if (triDeleted[t]) continue;
+      if (excludedTris && excludedTris[t]) continue;
       const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
       const lAB2 = sqDist(a, b), lBC2 = sqDist(b, c), lCA2 = sqDist(c, a);
       const lmin2 = Math.min(lAB2, lBC2, lCA2);
@@ -466,6 +484,7 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     const set = new Set();
     for (const t of vertTris[vid]) {
       if (triDeleted[t]) continue;
+      if (excludedTris && excludedTris[t]) continue;
       const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
       if (a !== vid) set.add(a);
       if (b !== vid) set.add(b);

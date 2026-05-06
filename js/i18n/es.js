@@ -111,6 +111,8 @@ export default {
   "ui.noDownwardZDesc": "Algunas texturas empujan los vértices de la superficie hacia abajo, creando nuevos voladizos. Cuando se activa, los vértices nunca se mueven en la dirección −Z durante el texturizado. El movimiento en X e Y no se ve afectado.",
   "ui.noDownwardZ": "Evitar desplazamiento de vértices hacia abajo (−Z)",
   "ui.enableMeshRegularization": "Activar regularización de la malla",
+  "ui.regularizeFullModel": "Regularizar todo el modelo",
+  "ui.regularizeFullModelTitle": "Cuando está marcado, regulariza toda la malla. De lo contrario, solo procesa áreas texturizadas; las regiones sin textura permanecen intactas.",
   "alerts.bakeFailed": "Horneado fallido: {msg}",
   "progress.finalizing": "Finalizando…",
   "sections.export": "Exportar ⓘ",

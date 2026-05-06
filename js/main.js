@@ -105,6 +105,7 @@ const settings = {
   // mirror regularize.js opts; second-pass cap is for the post-regularize
   // subdivide step in main.js.
   regularizeEnabled:        true,
+  regularizeFullModel:      true,  // true = regularize entire mesh; false = only textured areas
   regularizeAspectThreshold: 5,
   regularizeSlack:           3.0,
   regularizeAggressiveSlack: 8.0,
@@ -306,6 +307,7 @@ const dispPreviewToggle      = document.getElementById('displacement-preview');
 const noDownwardZChk         = document.getElementById('no-downward-z-chk');
 const smoothBottomChk        = document.getElementById('smooth-bottom-chk');
 const regularizeEnabledChk   = document.getElementById('regularize-enabled-chk');
+const regularizeFullChk      = document.getElementById('regularize-full-chk');
 const regularizeDebugRows    = document.getElementById('regularize-debug-rows');
 const regAspectThresholdEl   = document.getElementById('reg-aspect-threshold');
 const regSlackEl             = document.getElementById('reg-slack');
@@ -1375,6 +1377,12 @@ function wireEvents() {
   regularizeEnabledChk.addEventListener('change', () => {
     settings.regularizeEnabled = regularizeEnabledChk.checked;
     regularizeDebugRows.classList.toggle('disabled', !settings.regularizeEnabled);
+    updatePreview();
+  });
+  // Regularize full model vs. only textured areas.
+  regularizeFullChk.checked = settings.regularizeFullModel;
+  regularizeFullChk.addEventListener('change', () => {
+    settings.regularizeFullModel = regularizeFullChk.checked;
     updatePreview();
   });
   // Helper — wire a number input to a settings key, schedule a preview update.
@@ -4165,7 +4173,21 @@ async function toggleDisplacementPreview(enable) {
     // The whole regularize+resub block can be disabled from the Advanced panel.
     let activeGeo, activeParents;
     if (settings.regularizeEnabled) {
-      const regPrev = regularizeMesh(subdivided, faceParentId, previewEdge, _regularizeOpts());
+      // Build exclusion mask for regularize: when regularizeFullModel is off,
+      // only regularize textured areas; untextured/masked regions pass through.
+      let regOpts = _regularizeOpts();
+      if (!settings.regularizeFullModel && (excludedFaces.size > 0 || selectionMode)) {
+        const triCount = subdivided.attributes.position.count / 3;
+        const excludedTris = new Uint8Array(triCount);
+        for (let i = 0; i < triCount; i++) {
+          const origFace = faceParentId[i];
+          let isExcluded = excludedFaces.has(origFace);
+          if (selectionMode) isExcluded = !isExcluded;
+          if (isExcluded) excludedTris[i] = 1;
+        }
+        regOpts = { ...regOpts, excludedTris };
+      }
+      const regPrev = regularizeMesh(subdivided, faceParentId, previewEdge, regOpts);
       subdivided.dispose();
       if (dispPreviewToken !== myToken) { regPrev.geometry.dispose(); return; }
 
@@ -4336,7 +4358,19 @@ async function handleExport(format = 'stl') {
     if (settings.regularizeEnabled) {
       setProgress(0.30, t('progress.regularizing'));
       await yieldFrame();
-      const reg = regularizeMesh(subdivided, new Int32Array(subdivided.attributes.position.count / 3), settings.refineLength, _regularizeOpts());
+      let regOpts = _regularizeOpts();
+      if (!settings.regularizeFullModel) {
+        const exclAttr = subdivided.attributes.excludeWeight;
+        if (exclAttr) {
+          const triCount = subdivided.attributes.position.count / 3;
+          const excludedTris = new Uint8Array(triCount);
+          for (let i = 0; i < triCount; i++) {
+            if (exclAttr.getX(i * 3) > 0.5) excludedTris[i] = 1;
+          }
+          regOpts = { ...regOpts, excludedTris };
+        }
+      }
+      const reg = regularizeMesh(subdivided, new Int32Array(subdivided.attributes.position.count / 3), settings.refineLength, regOpts);
       subdivided.dispose();
       const exclAttr = reg.geometry.attributes.excludeWeight;
       const secondPassWeights = exclAttr ? exclAttr.array : null;
@@ -4596,7 +4630,19 @@ async function bakeTextures() {
     if (settings.regularizeEnabled) {
       setBakeProgress(0.36, t('progress.regularizing'));
       await yieldFrame();
-      const reg = regularizeMesh(subdivided, faceParentId, settings.refineLength, _regularizeOpts());
+      let regOpts = _regularizeOpts();
+      if (!settings.regularizeFullModel) {
+        const exclAttr = subdivided.attributes.excludeWeight;
+        if (exclAttr) {
+          const triCount = subdivided.attributes.position.count / 3;
+          const excludedTris = new Uint8Array(triCount);
+          for (let i = 0; i < triCount; i++) {
+            if (exclAttr.getX(i * 3) > 0.5) excludedTris[i] = 1;
+          }
+          regOpts = { ...regOpts, excludedTris };
+        }
+      }
+      const reg = regularizeMesh(subdivided, faceParentId, settings.refineLength, regOpts);
       subdivided.dispose();
       const exclAttr = reg.geometry.attributes.excludeWeight;
       const secondPassWeights = exclAttr ? exclAttr.array : null;

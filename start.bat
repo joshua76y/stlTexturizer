@@ -9,7 +9,7 @@ echo  ║     3D 模型置换纹理工具           ║
 echo  ╚══════════════════════════════════╝
 echo.
 
-:: 尝试 Python 3
+:: ── 寻找 Python 3 ──
 set PYTHON=
 where python >nul 2>&1
 if %errorlevel%==0 (
@@ -17,15 +17,15 @@ if %errorlevel%==0 (
     if %errorlevel%==0 set PYTHON=python
 )
 if "%PYTHON%"=="" (
+    where python3 >nul 2>&1
+    if %errorlevel%==0 set PYTHON=python3
+)
+if "%PYTHON%"=="" (
     where py >nul 2>&1
     if %errorlevel%==0 (
         py --version 2>&1 | find "3." >nul
         if %errorlevel%==0 set PYTHON=py
     )
-)
-if "%PYTHON%"=="" (
-    where python3 >nul 2>&1
-    if %errorlevel%==0 set PYTHON=python3
 )
 
 if "%PYTHON%"=="" (
@@ -37,16 +37,19 @@ if "%PYTHON%"=="" (
 )
 
 echo  [信息] 使用 %PYTHON%
+
+:: ── 先启动服务器（新的最小化窗口）──
 echo  [信息] 正在启动本地服务器...
-echo.
-echo  请在浏览器中打开：http://localhost:8080
-echo  按 Ctrl+C 停止服务器
-echo.
+start "STL质感生成器 - 服务器" /MIN %PYTHON% serve.py
 
-:: 打开浏览器
+:: ── 等服务器就绪 ──
+timeout /t 2 /nobreak >nul
+
+:: ── 再打开浏览器 ──
+echo  [信息] 正在打开浏览器...
 start http://localhost:8080
-
-:: 启动服务器
-%PYTHON% -m http.server 8080
-
+echo.
+echo  服务器已在后台运行，关闭此窗口不会影响服务器。
+echo  要停止服务器，请关闭 "STL质感生成器 - 服务器" 窗口。
+echo.
 pause
