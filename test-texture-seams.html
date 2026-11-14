@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<!--
+  Copyright (c) 2026 CNCKitchen (Stefan Hermann) and contributors
+  SPDX-License-Identifier: AGPL-3.0-only
+-->
+<!-- Measure wrap-edge continuity of ALL preset textures (PNG + JPEG) using
+     the browser's own decoder — the same pixels displacement samples.
+     Serve repo root, open this page; results stream to the HTTP server log
+     via beacon requests and render in the page body. -->
+<html>
+<head><meta charset="utf-8"><title>texture-seams</title></head>
+<body><pre id="out">running…</pre>
+<script>
+const FILES = [
+  'basket.png','brick.png','bubble.png','crystal.png','dots.png','grid.png',
+  'isogrid.png','knitting.png','leather2.png','stripes.png','stripes_02.png','weave.png',
+  'carbonFiber.jpg','gripSurface.png','hexagon.png','hexagons.png','knurling.png','noise.png',
+  'voronoi.png','weave_02.png','weave_03.png','wood.png','woodgrain_02.jpg','woodgrain_03.png',
+];
+const out = [];
+const beacon = (s) => { try { fetch('/__test__/' + encodeURIComponent(s)).catch(() => {}); } catch {} };
+
+function analyze(g, w, h) {
+  const colDiff = (x0, x1) => { let s = 0; for (let y = 0; y < h; y++) s += Math.abs(g[y*w+x0] - g[y*w+x1]); return s / h; };
+  const rowDiff = (y0, y1) => { let s = 0; for (let x = 0; x < w; x++) s += Math.abs(g[y0*w+x] - g[y1*w+x]); return s / w; };
+  let interior = 0, n = 0;
+  for (let x = 8; x < w - 8; x += Math.max(1, (w / 32) | 0)) { interior += colDiff(x, x + 1); n++; }
+  for (let y = 8; y < h - 8; y += Math.max(1, (h / 32) | 0)) { interior += rowDiff(y, y + 1); n++; }
+  interior /= n;
+  return { interior, wrapX: colDiff(w - 1, 0), wrapY: rowDiff(h - 1, 0) };
+}
+
+(async () => {
+  for (const f of FILES) {
+    try {
+      const img = new Image();
+      img.src = 'textures/' + f;
+      await img.decode();
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const d = ctx.getImageData(0, 0, c.width, c.height).data;
+      const g = new Uint8ClampedArray(c.width * c.height);
+      for (let i = 0; i < g.length; i++) g[i] = d[i * 4];
+      const { interior, wrapX, wrapY } = analyze(g, c.width, c.height);
+      const worst = Math.max(wrapX, wrapY) / Math.max(interior, 0.01);
+      const verdict = worst < 1.5 ? 'seamless' : worst < 3 ? 'slight-seam' : 'SEAM';
+      const line = `${f} ${c.width}x${c.height} interior=${interior.toFixed(2)} wrapX=${wrapX.toFixed(2)} wrapY=${wrapY.toFixed(2)} ${verdict} ${worst.toFixed(1)}x`;
+      out.push(line); beacon(line);
+    } catch (e) {
+      const line = `${f} ERROR ${e.message}`;
+      out.push(line); beacon(line);
+    }
+    document.getElementById('out').textContent = out.join('\n');
+  }
+  beacon('DONE');
+  document.title = 'DONE';
+})();
+</script>
+</body>
+</html>

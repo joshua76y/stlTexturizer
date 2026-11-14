@@ -4,5 +4,9 @@ node_modules/
 package.json
 package-lock.json
 debug_out/
-/*.stl
+*.stl
+*.3mf
 test-*.mjs
+test-fixtures/
+.env
+.codegraph

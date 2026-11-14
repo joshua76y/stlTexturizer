@@ -1,36 +1,67 @@
+/*
+ * Copyright (c) 2026 CNCKitchen (Stefan Hermann) and contributors
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
 import * as THREE from 'three';
 import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWireframe,
          getControls, getCamera, getCurrentMesh,
          setExclusionOverlay, setHoverPreview, setViewerTheme,
          setProjection, requestRender,
          clearDiagOverlays, setDiagEdges, addDiagFaces,
-         setRotationGizmo, isGizmoDragging } from './viewer.js';
+         setRotationGizmo, isGizmoDragging, isSoftwareRendering, setTurntable,
+         setSectionView, setSectionAxis, flipSection, setSectionHandlesLocked,
+         sectionVisibleHits } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
+import { estimateStep } from './stepLoader.js';
+import { resolveStepSettings } from './stepConvert.js';
 import { computeSmartResolution } from './smartResolution.js';
-import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
-import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
+import { REF_TEXTURE_SIZE } from './textureAnalysis.js';
+import { loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
+import { initTextureGallery } from './textureGallery.js';
+import { getCustomTextureFile } from './customTextures.js';
+import { initSidebarToggle } from './sidebarToggle.js';
+import { initSpaceMousePanel } from './spaceMousePanel.js';
+import { createPreviewMaterial, updateMaterial, MAX_LAYERS } from './previewMaterial.js';
 import { subdivide }          from './subdivision.js';
-import { regularizeMesh }     from './regularize.js';
-import { applyDisplacement }  from './displacement.js';
-import { decimate }           from './decimation.js';
+import { runExportPipeline }  from './exportPipeline.js';
+import { runPreviewPipeline, computeFaceNormals } from './previewPipeline.js';
 import { exportSTL, export3MF } from './exporter.js';
 import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
+import { buildSoftExclusion, softPaintedFaces } from './softMask.js';
+import { PaintTree } from './paintTree.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
-         getEdgePositions, getShellAssignments } from './meshValidation.js';
-import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
+         getEdgePositions } from './meshValidation.js';
+import { t, tHtml, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
+import { getScaleReferenceLengths, isStampActive, stampFrame, stampUV, stampUntouchedFaces, buildStampDepth,
+         STAMP_DEPTH_RES, stampAxes, stampSurfaceAt, MODE_OUTLINE_WRAP } from './mapping.js';
+import { buildOutlineWrap, outlineWrapPlaces } from './outlineWrap.js';
+import { QuantizedPointMap } from './meshIndex.js';
+import { APP_VERSION } from './version.js';
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let currentGeometry   = null;   // original loaded geometry
 let currentBounds     = null;   // bounds of the original geometry
+// Forward rigid transform from the file's original coordinates to the in-app
+// (centered, possibly rotated) working space: mem = poseRot·orig + poseTrans.
+// Import centering, in-app rotation, and place-on-face all fold into it; the
+// full INVERSE is applied on export so files leave BumpMesh in their original
+// position AND orientation (issue #82) — in-app rotation is a texturing aid,
+// not part of the output.
+let currentPoseRot    = new THREE.Quaternion();
+let currentPoseTrans  = new THREE.Vector3();
+let _rotatePoseSnapshot = null; // { rot, trans } captured on rotate-mode entry, restored by the reset button alongside _rotateOriginalPositions
 let currentStlName    = 'model'; // base filename of the loaded STL (no extension)
-let activeMapEntry    = null;   // { name, texture, imageData, width, height, isCustom? }
+let currentStlExt     = '.stl';  // source file extension (.stl/.obj/.3mf/.step/.stp), for the stats line
+let activeMapEntry    = null;   // { name, texture, imageData, width, height, isCustom?, customId? (library id) }
 let _lastCustomMap    = null;   // most recent uploaded/imported custom-map entry, kept across preset switches so the thumbnail can re-activate it
 let previewMaterial   = null;
 let isExporting       = false;
 let isBaking          = false;
+let smoothBottomAutoOff = false; // Smooth Bottom was switched off by Bottom faces = 0 (#126), see syncSmoothBottomToLimit
 let previewDebounce   = null;
 
 // Boundary edge data texture for per-fragment falloff in bump-only preview
@@ -39,40 +70,66 @@ let _boundaryEdgeCount = 0;
 let _falloffDirty      = true;   // recompute falloff on next updateFaceMask
 let _falloffGeometry   = null;   // geometry the falloff was last computed for
 
-// ── Exclusion state ───────────────────────────────────────────────────────────
-let excludedFaces      = new Set();   // triangle indices in currentGeometry
+// ── Surface paint state ───────────────────────────────────────────────────────
+// All layers' surface masks live in one PaintTree over currentGeometry
+// (js/paintTree.js): triangles split adaptively under the brush, paint per
+// layer. The viewer shows the flattened tree (paintGeometry) whenever a face
+// is split, the base mesh otherwise.
+let paintTree          = null;
+let paintGeometry      = null;        // flattened tree mesh, or null when no face is split
+let paintFlat          = null;        // paintTree.flatten() result behind paintGeometry
+let _paintStructureVersion = -1;
+let _paintCoverCache   = new Map();   // per (slot, geometry): paint arrays for the current paintVersion
 let triangleAdjacency  = null;        // Array from buildAdjacency
 let triangleCentroids  = null;        // Float32Array from buildAdjacency
 let triangleFaceNormals = null;       // Float32Array — local-space unit face normal per tri
 let exclusionTool      = null;        // 'brush' | 'bucket' | null
 let eraseMode          = false;
-let brushIsRadius      = false;
+let brushIsRadius      = true;
 let brushRadius        = 5.0;
+let brushHardness      = 0.5;         // circle brush: 1 = hard, leaf-exact; < 1 = soft, coverage per tree vertex
+let brushPrecision     = true;        // circle brush: true = Precision (refines under the stroke), false = Standard (whole triangles)
 let bucketThreshold    = 20;
 let isPainting         = false;
 let selectionMode      = false;       // false = exclude painted faces; true = include only painted faces
+let maskModeChosen     = false;       // false until the user (or a loaded/seeded mask) engages surface masking — neither mode button is highlighted
 let _lastHoverTriIdx   = -1;          // last triangle index used for hover preview
+let _lastHoverKey      = '';          // Standard circle brush: erase flag + faces of the last hover preview
 let placeOnFaceActive  = false;       // true while "Place on Face" mode is active
+let stampPlaceActive   = false;       // true while the next click on the model places the stamp
+let _stampDragging     = false;       // true from a stamp press until release (the stamp follows the cursor)
+let _stampGrab         = null;        // grab offset while dragging the patch itself (null = centre follows the cursor)
+let _stampLastSurface  = null;        // Surface normal: the surface point under the cursor on the previous drag frame
+let _stampWheelArmed   = false;       // after a stamp press: the wheel resizes the stamp until the next press elsewhere
+let _stampHoverCursor  = false;       // the 'move' cursor is showing over the stamp's patch
 let rotateActive       = false;       // true while rotate mode is active
 let rotateAngles       = { x: 0, y: 0, z: 0 };  // accumulated rotation in degrees
+let refineLengthUserSet = false;      // true once the user picks an output resolution (slider, field, wheel or Smart) — kept across model loads
 let _rotateOriginalPositions = null;  // Float32Array snapshot before any rotation
 const _raycaster       = new THREE.Raycaster();
 let _lastPaintHitPoint = null;        // THREE.Vector3 — last brush paint position for shift-line
+let _strokeLastPoint   = null;        // THREE.Vector3 — previous point of the current drag (soft brush sweeps from it)
 let _shiftLineMesh     = null;        // THREE.Line — preview line from last paint to cursor
-let _lastEffectiveTexture = null;
-let _effectiveMapCache    = null;
-let _effectiveMapCacheKey = null;
 
 const settings = {
   mappingMode:   5,     // Triplanar default
-  scaleU:        0.5,
-  scaleV:        0.5,
+  // Texture tile size in ABSOLUTE millimetres (one full repeat along U/V).
+  // Initialized per model on load: DEFAULT_TILE_FRACTION × largest bbox edge
+  // (the default 50 mm cube → 25 mm). Consumers convert to relative factors
+  // via mapping.js scaleMmToRelative.
+  scaleU:        25,
+  scaleV:        25,
   amplitude:     0.5,
   textureHeight: 0.5,
   invertDisplacement: false,
   offsetU:       0.0,
   offsetV:       0.0,
   rotation:      0,
+  // Triplanar / Cubic: turn the side projections around Z by `rotation`
+  // instead of spinning the texture inside each side plane (mapping.js
+  // isRotateAroundZ) — keeps directional patterns heading the same way on
+  // top and side faces.
+  rotateAroundZ: false,
   refineLength:  1.0,
   maxTriangles:  750_000,
   lockScale:     true,
@@ -81,6 +138,7 @@ const settings = {
   mappingBlend:     1,
   seamBandWidth:    0.5,
   textureSmoothing: 0,
+  invertTexture: false,
   // Laplacian smoothing iterations applied to the per-vertex blend normal
   // (only the normal that drives projection-direction blend weights — not
   // the displacement direction). 0 = off, 4–8 = noticeable seam smoothing,
@@ -88,9 +146,21 @@ const settings = {
   blendNormalSmoothing: 32,
   capAngle:         20,
   boundaryFalloff:  0,
+  // Shape of the 0→1 displacement ramp inside the boundary-falloff band:
+  // 'linear' (constant slope), 'scurve' (smoothstep, eased at both ends),
+  // 'ease' (quadratic ease-in, gentlest at the mask edge). Old snapshots
+  // without the key fall back to 'linear' — the only ramp they had.
+  boundaryFalloffCurve: 'ease',
   symmetricDisplacement: false,
   noDownwardZ: false,
   smoothBottom: true,
+  harvestFlatFaces: true,
+  harvestTol: 0.005,
+  // Preserve Untextured Surfaces (beta): regularize + decimation leave faces
+  // excluded from texturing (painted mask, selection mode, top/bottom angle
+  // masks) completely untouched, so original fillets and fine CAD detail
+  // survive. Subdivision already skips their interior edges regardless.
+  preserveUntextured: true,
   useDisplacement: false,
   // Cylindrical-mode controls.
   // null/undefined → derive from bounds (preserves legacy / non-cylindrical behavior).
@@ -99,13 +169,26 @@ const settings = {
   cylinderCenterY:  null,
   cylinderRadius:   null,
   cylinderPanelMinimized: false,
-  // Regularize Mesh (Advanced/Beta).  Two-step pipeline applied after the
-  // initial subdivide: collapse sliver chains, then re-subdivide stretched
-  // edges back to a configurable multiple of refineLength.  All knobs here
-  // mirror regularize.js opts; second-pass cap is for the post-regularize
-  // subdivide step in main.js.
+  // Stamp ("place once", surface normal, planar and cylindrical modes): the
+  // image appears once, centred on a picked surface point (model mm; null =
+  // bounds centre), on the surfaces facing stampSide (±1 along the projection
+  // axis; null = the mode's unmirrored side) — for Surface normal, facing
+  // along stampNormal (the surface normal at the centre; null = front).
+  // See mapping.js stampFrame.
+  stampOnce:    false,
+  stampCenterX: null,
+  stampCenterY: null,
+  stampCenterZ: null,
+  stampSide:    null,
+  stampNormalX: null,
+  stampNormalY: null,
+  stampNormalZ: null,
+  // Regularize Mesh.  Two-step pipeline applied after the initial subdivide:
+  // collapse sliver chains, then re-subdivide stretched edges back to a
+  // multiple of refineLength.  Always on with these standard values — the
+  // knobs here mirror regularize.js opts; second-pass cap is for the
+  // post-regularize subdivide step in main.js.
   regularizeEnabled:        true,
-  regularizeFullModel:      true,  // true = regularize entire mesh; false = only textured areas
   regularizeAspectThreshold: 5,
   regularizeSlack:           3.0,
   regularizeAggressiveSlack: 8.0,
@@ -114,6 +197,32 @@ const settings = {
   regularizeAggressiveNormalDeg: 25,
   regularizeSecondPassMul:   1.1,
 };
+
+// ── Texture layers ────────────────────────────────────────────────────────────
+// A layer is a texture plus its own projection/displacement settings
+// (LAYER_KEYS) and its own surface mask. The ACTIVE layer lives in the
+// existing globals — settings.*, activeMapEntry, selectionMode and
+// maskModeChosen; its paint lives in paintTree under the layer's id — so the sidebar
+// edits it exactly as it always did; the other layers are kept as plain data
+// in `layers` and only feed the preview shader and the export pipeline.
+// Switching layers stores the live state into layers[activeLayer] and
+// materialises the new one through the same code path a project load uses.
+// Everything else in `settings` (resolution, triangle limit, angle masks,
+// bottom handling, regularize knobs) stays global.
+const LAYER_KEYS = [
+  'mappingMode', 'scaleU', 'scaleV', 'lockScale',
+  'offsetU', 'offsetV', 'rotation', 'rotateAroundZ',
+  'amplitude', 'textureHeight', 'invertDisplacement', 'invertTexture', 'textureSmoothing',
+  'symmetricDisplacement', 'mappingBlend', 'seamBandWidth', 'capAngle',
+  'boundaryFalloff', 'boundaryFalloffCurve',
+  'snapSeamlessWrap', 'cylinderCenterX', 'cylinderCenterY', 'cylinderRadius',
+  'stampOnce', 'stampCenterX', 'stampCenterY', 'stampCenterZ', 'stampSide',
+  'stampNormalX', 'stampNormalY', 'stampNormalZ',
+];
+let layers = [];        // layer records, composition order (first = bottom); see _newLayer
+let activeLayer = 0;    // index into `layers` of the layer the sidebar edits
+let _layerSeq = 0;
+layers = [_newLayer()];
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
 const CANVAS_FILTER_SUPPORTED = 'filter' in CanvasRenderingContext2D.prototype;
@@ -186,27 +295,28 @@ function blurCanvas(canvas, sigma) {
   }
 }
 
-// ── Precision masking state ────────────────────────────────────────────────────
-let precisionMaskingEnabled = false;
-let precisionGeometry       = null;   // subdivided geometry for finer masking
-let precisionParentMap      = null;   // Int32Array: refined face → original face index
-let precisionEdgeLength     = null;   // edge length used for current refinement
-let precisionBusy           = false;  // true while async subdivision is running
-let precisionCentroids      = null;   // Float32Array from buildAdjacency on refined mesh
-let precisionFaceNormals    = null;   // Float32Array — local-space unit face normal per refined tri
-let precisionAdjacency      = null;   // Array from buildAdjacency on refined mesh
-let precisionExcludedFaces  = new Set(); // precision face indices excluded while precision is active
-
 // ── Displacement preview state ────────────────────────────────────────────────
 let dispPreviewGeometry  = null;   // subdivided geometry with smoothNormal attribute
-let dispPreviewBusy      = false;  // true while async subdivision is running
 let dispPreviewParentMap = null;   // Int32Array: subdivided face → original face index
+let dispPreviewEdgeInfo  = null;   // { floorEdge, maxEdge, edge } of the latest build; edge null while building
+// Declared up here, not beside their functions: model loads during module
+// init already call cancelDisplacementPreviewBuild().
+let _previewWorkerAbort  = null;   // set while a worker build is in flight: kill + resolve(null)
+let _dispPreviewResolutionTimer = null;
+
+// 3D-preview mesh budget, in predicted first-subdivide triangles (see
+// choosePreviewEdge in previewPipeline.js).  That count drives the build time
+// (~2 µs per triangle in the preview worker on a desktop CPU) and the
+// preview's memory.  Low-memory and touch devices get a smaller budget.
+const PREVIEW_TRI_BUDGET =
+  (navigator.deviceMemory && navigator.deviceMemory < 4) || matchMedia('(pointer: coarse)').matches
+    ? 600_000
+    : 1_500_000;
 
 // ── Operation tokens (stale-result guards) ────────────────────────────────────
 // Each async operation captures the current token at start and checks it after
 // every await. When a new model loads all tokens are incremented, causing any
 // in-flight operation to silently abort rather than apply results to new state.
-let precisionToken   = 0;
 let dispPreviewToken = 0;
 let exportToken      = 0;
 let diagToken        = 0;
@@ -220,14 +330,34 @@ const canvas         = document.getElementById('viewport');
 const brushCursorEl  = document.getElementById('brush-cursor');
 const dropZone       = document.getElementById('drop-zone');
 const dropHint       = document.getElementById('drop-hint');
+const MODEL_FILE_RE  = /\.(stl|obj|3mf|step|stp)$/i;
 const stlFileInput   = document.getElementById('stl-file-input');
 const textureInput   = document.getElementById('texture-file-input');
-const presetGrid     = document.getElementById('preset-grid');
-const activeMapName  = document.getElementById('active-map-name');
 const customMapRow      = document.getElementById('custom-map-row');
 const customMapSwatch   = document.getElementById('custom-map-swatch');
 const customMapRemoveBtn = document.getElementById('custom-map-remove');
 const meshInfo       = document.getElementById('mesh-info');
+const importProgress    = document.getElementById('import-progress');
+const importProgBar     = document.getElementById('import-progress-bar');
+const importProgPct     = document.getElementById('import-progress-pct');
+const importProgLbl     = document.getElementById('import-progress-label');
+const stepOverlay       = document.getElementById('step-overlay');
+const stepDialogClose   = document.getElementById('step-dialog-close');
+const stepModelSize     = document.getElementById('step-model-size');
+const stepSurfaceDev    = document.getElementById('step-surface-dev');
+const stepNormalDev     = document.getElementById('step-normal-dev');
+const stepMaxEdge       = document.getElementById('step-max-edge');
+const stepImportGo      = document.getElementById('step-import-go');
+const stepImportCancel  = document.getElementById('step-import-cancel');
+
+// Render the bottom-left mesh stats line, prefixed with the loaded model's
+// name (currentStlName, extension-stripped) so the user can see which file
+// the stats belong to.
+function _setMeshInfo(triCount, mb, sx, sy, sz) {
+  const stats = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  const fileName = currentStlName ? `${currentStlName}${currentStlExt}` : '';
+  meshInfo.textContent = fileName ? `${fileName} · ${stats}` : stats;
+}
 const exportBtn        = document.getElementById('export-btn');
 const export3mfBtn     = document.getElementById('export-3mf-btn');
 const exportProgress   = document.getElementById('export-progress');
@@ -245,6 +375,8 @@ const advancedSection  = document.getElementById('advanced-section');
 const advancedToggle   = document.getElementById('advanced-toggle');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
+const sectionToggle    = document.getElementById('section-toggle');
+const sectionControls  = document.getElementById('section-controls');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
 const rotateBtn        = document.getElementById('rotate-btn');
 const rotateControls   = document.getElementById('rotate-controls');
@@ -289,9 +421,12 @@ const seamBandWidthSlider    = document.getElementById('seam-band-width');
 const seamBandWidthVal       = document.getElementById('seam-band-width-val');
 const textureSmoothingSlider = document.getElementById('texture-smoothing');
 const textureSmoothingVal    = document.getElementById('texture-smoothing-val');
+const invertTextureCheckbox = document.getElementById('invert-texture');
 const capAngleSlider         = document.getElementById('cap-angle');
 const capAngleVal            = document.getElementById('cap-angle-val');
 const capAngleRow            = document.getElementById('cap-angle-row');
+const rotateAroundZRow       = document.getElementById('rotate-around-z-row');
+const rotateAroundZCheckbox  = document.getElementById('rotate-around-z');
 const cylinderSnapRow        = document.getElementById('cylinder-snap-row');
 const cylinderSnapToggle     = document.getElementById('cylinder-snap-toggle');
 const cylinderAxisRow        = document.getElementById('cylinder-axis-row');
@@ -300,22 +435,28 @@ const cylinderResetBtn       = document.getElementById('cylinder-reset-btn');
 const cylinderPanel          = document.getElementById('cylinder-panel');
 const cylinderCanvas         = document.getElementById('cylinder-canvas');
 const cylinderPanelMinimize  = document.getElementById('cylinder-panel-minimize');
+const stampModeBtn           = document.getElementById('stamp-mode-btn');
+const stampPlaceRow          = document.getElementById('stamp-place-row');
+const stampPlaceBtn          = document.getElementById('stamp-place-btn');
+const stampHint              = document.getElementById('stamp-hint');
+const outlineWrapNote        = document.getElementById('outline-wrap-note');
 const boundaryFalloffSlider    = document.getElementById('boundary-falloff');
 const boundaryFalloffVal       = document.getElementById('boundary-falloff-val');
+const falloffCurveButtons      = {
+  linear: document.getElementById('falloff-curve-linear'),
+  scurve: document.getElementById('falloff-curve-scurve'),
+  ease:   document.getElementById('falloff-curve-ease'),
+};
 const symmetricDispToggle    = document.getElementById('symmetric-displacement');
 const dispPreviewToggle      = document.getElementById('displacement-preview');
+const dispPreviewSpinner     = document.getElementById('displacement-preview-spinner');
 const noDownwardZChk         = document.getElementById('no-downward-z-chk');
 const smoothBottomChk        = document.getElementById('smooth-bottom-chk');
-const regularizeEnabledChk   = document.getElementById('regularize-enabled-chk');
-const regularizeFullChk      = document.getElementById('regularize-full-chk');
-const regularizeDebugRows    = document.getElementById('regularize-debug-rows');
-const regAspectThresholdEl   = document.getElementById('reg-aspect-threshold');
-const regSlackEl             = document.getElementById('reg-slack');
-const regAggressiveSlackEl   = document.getElementById('reg-aggressive-slack');
-const regExtremeAspectEl     = document.getElementById('reg-extreme-aspect');
-const regNormalDegEl         = document.getElementById('reg-normal-deg');
-const regAggressiveNormalDegEl = document.getElementById('reg-aggressive-normal-deg');
-const regSecondPassMulEl     = document.getElementById('reg-second-pass-mul');
+const smoothBottomRow        = document.getElementById('smooth-bottom-row');
+const harvestFlatChk         = document.getElementById('harvest-flat-chk');
+const harvestTolInput        = document.getElementById('harvest-tol');
+const harvestTolRow          = document.getElementById('harvest-tol-row');
+const preserveUntexturedChk  = document.getElementById('preserve-untextured-chk');
 
 // ── Exclusion panel DOM refs ──────────────────────────────────────────────────
 const exclBrushBtn        = document.getElementById('excl-brush-btn');
@@ -323,9 +464,15 @@ const exclBucketBtn       = document.getElementById('excl-bucket-btn');
 const exclBrushTypeRow    = document.getElementById('excl-brush-type-row');
 const exclBrushSingleBtn  = document.getElementById('excl-brush-single');
 const exclBrushRadiusBtn  = document.getElementById('excl-brush-radius-btn');
+const exclBrushModeRow    = document.getElementById('excl-brush-mode-row');
+const exclBrushStandardBtn  = document.getElementById('excl-brush-standard');
+const exclBrushPrecisionBtn = document.getElementById('excl-brush-precision');
 const exclRadiusRow       = document.getElementById('excl-radius-row');
 const exclBrushRadiusSlider = document.getElementById('excl-brush-radius-slider');
 const exclBrushRadiusVal    = document.getElementById('excl-brush-radius-val');
+const exclHardnessRow       = document.getElementById('excl-hardness-row');
+const exclBrushHardnessSlider = document.getElementById('excl-brush-hardness-slider');
+const exclBrushHardnessVal    = document.getElementById('excl-brush-hardness-val');
 const exclThresholdRow    = document.getElementById('excl-threshold-row');
 const exclThresholdSlider = document.getElementById('excl-threshold-slider');
 const exclThresholdVal    = document.getElementById('excl-threshold-val');
@@ -336,13 +483,10 @@ const exclModeIncludeBtn  = document.getElementById('excl-mode-include');
 const exclSectionHeading  = document.getElementById('excl-section-heading');
 const exclHint            = document.getElementById('excl-hint');
 
-// ── Precision masking DOM refs ────────────────────────────────────────────────
-const precisionMaskingRow     = document.getElementById('precision-masking-row');
-const precisionMaskingToggle  = document.getElementById('precision-masking-toggle');
-const precisionStatus         = document.getElementById('precision-status');
-const precisionOutdated       = document.getElementById('precision-outdated');
-const precisionRefreshBtn     = document.getElementById('precision-refresh-btn');
-const precisionWarning        = document.getElementById('precision-warning');
+// ── Texture layer strip DOM refs ──────────────────────────────────────────────
+const layerList   = document.getElementById('layer-list');
+const layerAddBtn = document.getElementById('layer-add-btn');
+let _layerStripSig = '';
 
 // ── Mesh diagnostics DOM refs ────────────────────────────────────────────────
 const meshDiagnostics    = document.getElementById('mesh-diagnostics');
@@ -352,16 +496,63 @@ const meshDiagRunBtn     = document.getElementById('mesh-diag-run-btn');
 const meshDiagSpinner    = document.getElementById('mesh-diag-spinner');
 const meshDiagAdvanced   = document.getElementById('mesh-diag-advanced');
 
+// ── License panel DOM refs ────────────────────────────────────────────────────
+const licenseLink    = document.getElementById('license-link');
+const licenseOverlay = document.getElementById('license-overlay');
+const licenseClose   = document.getElementById('license-close');
+const imprintLink    = document.getElementById('imprint-link');
+const imprintOverlay = document.getElementById('imprint-overlay');
+const imprintClose   = document.getElementById('imprint-close');
+
+// ── Welcome / What's New popup ───────────────────────────────────────────────
+// Bump this date whenever the "What's New" bullets in index.html change to
+// re-show the popup to all returning visitors who previously dismissed it.
+const WELCOME_LAST_UPDATED = '2026-11-04';
+const WELCOME_STORAGE_KEY  = 'stlt-welcome-seen';
+const welcomeLink     = document.getElementById('welcome-link');
+const welcomeOverlay  = document.getElementById('welcome-overlay');
+const welcomeClose    = document.getElementById('welcome-close');
+const welcomeGotIt    = document.getElementById('welcome-got-it');
+const welcomeDontShow = document.getElementById('welcome-dont-show');
+
 // ── Language selector DOM refs ────────────────────────────────────────────────────
 const languageSelector = document.querySelector('.lang-seg');
 
 // ── Scale slider log helpers ──────────────────────────────────────────────────
-// Slider stores 0–1000; actual scale spans 0.05–10 on a log axis.
-// Middle position 500 → scale ~0.71 (log midpoint between 0.05 and 10).
-const _LOG_MIN = Math.log(0.05);
-const _LOG_MAX = Math.log(10);
-const scaleToPos = v => Math.round(Math.max(0, Math.min(1000, (Math.log(Math.max(0.01, Math.min(10, v))) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000)));
-const posToScale = p => parseFloat(Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - _LOG_MIN)).toFixed(2));
+// The slider stores 0–1000 and sweeps 0.05×–10× of the current model's
+// largest bbox edge on a log axis — the exact travel and default position of
+// the legacy relative slider — but the value it reads/writes is the absolute
+// tile size in mm. The numeric input accepts values beyond the slider range
+// (clamped in _applyScaleU/V); the slider just pins to its end.
+const SCALE_REL_SLIDER_MIN = 0.05;
+const SCALE_REL_SLIDER_MAX = 10;
+const SCALE_MM_INPUT_MIN   = 0.01;
+const SCALE_MM_INPUT_MAX   = 10000;
+// Fraction of the model's largest bbox edge used to pre-calculate a
+// nice-looking initial tile size when a model loads (legacy relative 0.5 —
+// lands at slider position 435, same as always).
+const DEFAULT_TILE_FRACTION = 0.5;
+const _LOG_MIN = Math.log(SCALE_REL_SLIDER_MIN);
+const _LOG_MAX = Math.log(SCALE_REL_SLIDER_MAX);
+
+/** Largest bbox edge of the loaded model — the slider's per-model anchor. */
+function _scaleAnchorMm() {
+  return currentBounds
+    ? Math.max(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z)
+    : 50;
+}
+
+const scaleToPos = mm => {
+  const rel = Math.max(SCALE_REL_SLIDER_MIN, Math.min(SCALE_REL_SLIDER_MAX, mm / _scaleAnchorMm()));
+  return Math.round((Math.log(rel) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000);
+};
+const posToScale = p => parseFloat(
+  (_scaleAnchorMm() * Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - _LOG_MIN))).toPrecision(3));
+
+/** Tile size (mm) that visually matches the legacy relative default on this model. */
+function _defaultTileMm(relFraction = DEFAULT_TILE_FRACTION) {
+  return parseFloat((relFraction * _scaleAnchorMm()).toPrecision(3));
+}
 
 // Compute the active U texture-aspect factor (mirrors updatePreview's logic so
 // the snap math agrees with what computeUV actually does).
@@ -371,27 +562,44 @@ function _currentTextureAspectU() {
   return tmax / Math.max(tw, 1);
 }
 
-// Round a U scale to the nearest seamless-wrap value:
-//   tiles around circumference = aspectU / scaleU  →  must be a positive integer.
-// Returns the snapped scale, clamped to [aspectU/MAX_TILES, aspectU].
-function _snapScaleUForSeamlessWrap(scaleU) {
-  const aU = _currentTextureAspectU();
-  const MAX_TILES = 20;
-  let n = Math.round(aU / Math.max(scaleU, 1e-6));
-  if (!Number.isFinite(n) || n < 1) n = 1;
-  if (n > MAX_TILES) n = MAX_TILES;
-  return parseFloat((aU / n).toFixed(4));
+// True when the active mapping mode wraps U around the model, so snapping the
+// U scale to integer tile counts can make the wrap seam disappear. A stamp
+// never wraps — its size is the footprint the user typed.
+function _isSeamlessWrapMode() {
+  if (isStampActive(settings)) return false;
+  return settings.mappingMode === 3 /* MODE_CYLINDRICAL */ ||
+         settings.mappingMode === 4 /* MODE_SPHERICAL */;
 }
 
+// Round a U texture size (mm) to the nearest seamless-wrap value:
+//   tiles around circumference = aspectU × C / scaleU_mm  →  must be a
+//   positive integer, where C is the mode's wrap circumference (projection
+//   cylinder circumference, or the sphere's equator).
+function _snapScaleUForSeamlessWrap(scaleUMm) {
+  const aU = _currentTextureAspectU();
+  const size = currentBounds ? currentBounds.size : { x: 50, y: 50, z: 50 };
+  const { refU: C } = getScaleReferenceLengths(settings.mappingMode, settings, { size });
+  const MAX_TILES = 200;
+  let n = Math.round((aU * C) / Math.max(scaleUMm, 1e-6));
+  if (!Number.isFinite(n) || n < 1) n = 1;
+  if (n > MAX_TILES) n = MAX_TILES;
+  return parseFloat(((aU * C) / n).toFixed(4));
+}
+
+// The Size U/V number boxes show at most 2 decimals; the precise value
+// (needed for exact seamless-wrap snapping) stays in settings.scaleU/scaleV.
+const fmtScaleVal = v => +(+v).toFixed(2);
+
 function _applyScaleU(v) {
-  v = Math.max(0.01, Math.min(10, v));
-  if (settings.snapSeamlessWrap && settings.mappingMode === 3 /* MODE_CYLINDRICAL */) {
+  v = Math.max(SCALE_MM_INPUT_MIN, Math.min(SCALE_MM_INPUT_MAX, v));
+  if (settings.snapSeamlessWrap && _isSeamlessWrapMode()) {
     v = _snapScaleUForSeamlessWrap(v);
   }
   settings.scaleU = v;
   scaleUSlider.value = scaleToPos(v);
-  scaleUVal.value = v;
-  if (settings.lockScale) { settings.scaleV = v; scaleVSlider.value = scaleToPos(v); scaleVVal.value = v; }
+  scaleUVal.value = fmtScaleVal(v);
+  if (settings.lockScale) { settings.scaleV = v; scaleVSlider.value = scaleToPos(v); scaleVVal.value = fmtScaleVal(v); }
+  _reorientNormalStamp();
   clearTimeout(previewDebounce); previewDebounce = setTimeout(updatePreview, 80);
 }
 
@@ -707,6 +915,11 @@ function _scheduleCylinderPreviewUpdate() {
   if (_cylPreviewThrottle) return;
   _cylPreviewThrottle = setTimeout(() => {
     _cylPreviewThrottle = null;
+    // Texture size is absolute mm, so a radius change alters the tile count
+    // around the circumference — re-snap to keep the wrap seamless.
+    if (settings.snapSeamlessWrap && settings.mappingMode === 3 /* MODE_CYLINDRICAL */) {
+      _applyScaleU(settings.scaleU);
+    }
     updatePreview();
     // updatePreview() mutates uniforms in place; the 3D viewport's render
     // loop only re-draws when _needsRender flips, so push it explicitly.
@@ -779,7 +992,9 @@ cylinderCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
 function updateCylinderUIVisibility() {
   const isCyl = settings.mappingMode === 3 /* MODE_CYLINDRICAL */;
-  cylinderSnapRow.style.display = isCyl ? '' : 'none';
+  // The seamless-wrap snap applies to both wrap-around modes (cylindrical
+  // and spherical); the rest of this panel is cylinder-only.
+  cylinderSnapRow.style.display = _isSeamlessWrapMode() ? '' : 'none';
   cylinderAxisRow.style.display = isCyl ? '' : 'none';
   // Show the panel whenever the user is in cylindrical mode, even without a
   // model loaded — they get the empty placeholder until they load one, which
@@ -857,7 +1072,19 @@ function autoFitCylinderAxis() {
 
 let PRESETS = [];
 
+document.getElementById('app-version').textContent = `v${APP_VERSION}`;
+console.info(`BumpMesh v${APP_VERSION}`);
+
 initViewer(canvas);
+
+// A CPU-rendered viewer runs at a few fps and just looks broken — say why (#75).
+if (isSoftwareRendering()) {
+  const gpuWarning = document.getElementById('gpu-warning');
+  gpuWarning.classList.remove('hidden');
+  document.getElementById('gpu-warning-dismiss').addEventListener('click', () => {
+    gpuWarning.classList.add('hidden');
+  });
+}
 
 // Apply saved theme to 3D viewport on startup
 setViewerTheme(document.documentElement.getAttribute('data-theme') === 'light');
@@ -902,7 +1129,7 @@ function populateLanguageSelector() {
       const sx = currentBounds.size.x.toFixed(2);
       const sy = currentBounds.size.y.toFixed(2);
       const sz = currentBounds.size.z.toFixed(2);
-      meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+      _setMeshInfo(triCount, mb, sx, sy, sz);
       refreshExclusionOverlay();
       if (lastFastDiag) renderFastDiag(lastFastDiag);
       if (lastAdvancedDiag) renderAdvancedDiag(lastAdvancedDiag);
@@ -910,6 +1137,8 @@ function populateLanguageSelector() {
     // The cylinder panel paints its placeholder text via Canvas2D, which
     // applyTranslations() doesn't reach — re-render so the new locale lands.
     _scheduleCylinderPanelRedraw();
+    gallery.refreshText();
+    _renderLayerStrip();
   });
 
   languageSelector.appendChild(select);
@@ -947,78 +1176,63 @@ document.getElementById('theme-toggle').addEventListener('click', () => {
   setViewerTheme(isLight);
 });
 
+// Favourites grid + texture gallery. Every preset is selectable right away (the full texture
+// loads on demand), so PRESETS is filled synchronously instead of waiting for thumbnails.
+const DEFAULT_PRESET_NAME = 'Crystal';
+let _activePresetIdx = -1;   // preset picked most recently (set before its texture finishes loading)
+PRESETS = IMAGE_PRESETS.map(p => ({ name: p.name, defaultScale: p.defaultScale }));
+// Picks can come from the keyboard (gallery arrow keys), which the pointerup undo hook never sees.
+// Capture once the texture has loaded: the snapshot's activeMapName follows activeMapEntry.
+const gallery = initTextureGallery({
+  onSelect: (idx) => selectPreset(idx).then(_scheduleUndoCapture),
+  onSelectCustom: (id) => selectCustomTexture(id).then(_scheduleUndoCapture),
+  setTurntable,
+});
+initSidebarToggle();
+initSpaceMousePanel();
+
+// The page itself never scrolls, but a mobile browser may still shift it to lift a focused input above
+// the on-screen keyboard, and overflow:hidden leaves the user no way back. Undo any such shift once the
+// keyboard closes, i.e. when the visual viewport grows again.
+if (window.visualViewport) {
+  let vvHeight = visualViewport.height;
+  visualViewport.addEventListener('resize', () => {
+    if (visualViewport.height > vvHeight) {
+      document.scrollingElement?.scrollTo(0, 0);
+      document.body.scrollTop = 0;
+    }
+    vvHeight = visualViewport.height;
+  });
+}
+
 wireEvents();
+showWelcomeIfNeeded();
 // Sync scale number inputs with the slider's initial position
-scaleUVal.value = posToScale(parseFloat(scaleUSlider.value));
-scaleVVal.value = posToScale(parseFloat(scaleVSlider.value));
+scaleUVal.value = fmtScaleVal(posToScale(parseFloat(scaleUSlider.value)));
+scaleVVal.value = fmtScaleVal(posToScale(parseFloat(scaleVSlider.value)));
 
 // Load geometry immediately — don't wait for textures
 loadDefaultCube();
 
-// Build swatches with placeholder canvases, then load thumbnails
-const DEFAULT_PRESET_NAME = 'Crystal';
-const _presetSwatches = IMAGE_PRESETS.map((p, idx) => {
-  const swatch = document.createElement('div');
-  swatch.className = 'preset-swatch preset-loading';
-  swatch.setAttribute('role', 'button');
-  swatch.setAttribute('tabindex', '0');
-  swatch.title = p.name;
+// Restore the map from the last session: a texture from the user's library if the browser still has
+// it, else the preset, else the default. If the user had ANY map active last session (preset or a
+// since-discarded custom upload), suppress preset defaults so the restored settings survive — we'd
+// otherwise clobber textureSmoothing / scaleU when falling back.
+// Deferred until the module has finished evaluating: selectPreset() touches top-level bindings
+// declared further down (e.g. _selectGeneration), which would still be in their TDZ here.
+queueMicrotask(async () => {
+  let persisted = null;
+  try { persisted = JSON.parse(sessionStorage.getItem('bumpmesh-settings')); } catch { /* ignore */ }
+  const persistedName = persisted?.activeMapName || null;
 
-  const placeholder = document.createElement('canvas');
-  placeholder.width = 80; placeholder.height = 80;
-  swatch.appendChild(placeholder);
+  if (persisted?.activeCustomId && await selectCustomTexture(persisted.activeCustomId, false)) return;
+  if (activeMapEntry || _activePresetIdx >= 0) return;   // the user picked a map while the library loaded
 
-  const label = document.createElement('span');
-  label.className = 'preset-label';
-  label.textContent = p.name;
-  swatch.appendChild(label);
-
-  swatch.addEventListener('click', () => selectPreset(idx, swatch));
-  swatch.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      selectPreset(idx, swatch);
-    }
-  });
-  presetGrid.appendChild(swatch);
-  return swatch;
-});
-
-// Load lightweight thumbnails (~49 KB total), then auto-select a preset.
-// If localStorage has a persisted preset name, pick that one with defaults
-// suppressed (so the user's saved textureSmoothing / scaleU are preserved);
-// otherwise fall back to the built-in default and apply its defaults.
-loadAllThumbnails().then(thumbs => {
-  thumbs.forEach((thumb, idx) => {
-    if (!thumb) return;
-    PRESETS[idx] = thumb;         // thumbnail-only entry for now
-    const swatch = _presetSwatches[idx];
-    if (!swatch) return;
-    swatch.classList.remove('preset-loading');
-    const placeholder = swatch.querySelector('canvas');
-    swatch.replaceChild(thumb.thumbCanvas, placeholder);
-  });
-
-  let persistedName = null;
-  try {
-    const raw = sessionStorage.getItem('bumpmesh-settings');
-    if (raw) persistedName = (JSON.parse(raw) || {}).activeMapName || null;
-  } catch { /* ignore */ }
-
-  let targetIdx = -1;
-  // If the user had ANY map active last session (preset or a since-discarded
-  // custom upload), suppress preset defaults so the restored settings survive
-  // — we'd otherwise clobber textureSmoothing / scaleU when falling back.
-  let applyDefaults = !persistedName;
-  if (persistedName) {
-    targetIdx = IMAGE_PRESETS.findIndex(p => p.name === persistedName);
-    if (!(targetIdx >= 0 && PRESETS[targetIdx])) targetIdx = -1;
-  }
+  const applyDefaults = !persistedName;
+  let targetIdx = persistedName ? IMAGE_PRESETS.findIndex(p => p.name === persistedName) : -1;
   if (targetIdx < 0) targetIdx = IMAGE_PRESETS.findIndex(p => p.name === DEFAULT_PRESET_NAME);
-  if (targetIdx >= 0 && PRESETS[targetIdx]) {
-    selectPreset(targetIdx, _presetSwatches[targetIdx], applyDefaults);
-  }
-}).catch(err => console.error('Failed to load thumbnails:', err));
+  if (targetIdx >= 0) selectPreset(targetIdx, applyDefaults);
+});
 
 // ── Preset grid ───────────────────────────────────────────────────────────────
 
@@ -1030,39 +1244,107 @@ function resetTextureSmoothing() {
 
 let _selectGeneration = 0;   // debounce rapid preset clicks
 
-async function selectPreset(idx, swatchEl, applyDefaults = true) {
+/** Un-highlight every preset (a custom map became the active map). */
+function _clearPresetActive() {
+  _activePresetIdx = -1;
+  gallery.markActive(-1);
+}
+
+async function selectPreset(idx, applyDefaults = true) {
   const gen = ++_selectGeneration;
-  document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
-  swatchEl.classList.add('active');
+  _activePresetIdx = idx;
+  customMapSwatch?.classList.remove('active');
+  gallery.markActive(idx);
 
   const entry = PRESETS[idx];
   if (!entry) return;
-  activeMapName.textContent = entry.name;
   if (applyDefaults) {
     resetTextureSmoothing();
-    if (entry.defaultScale != null) _applyScaleU(entry.defaultScale);
+    // defaultScale is a legacy fraction of the model's largest bbox edge —
+    // convert to the absolute mm tile size that looks the same on this model.
+    if (entry.defaultScale != null) _applyScaleU(_defaultTileMm(entry.defaultScale));
   }
 
   // If full texture is already loaded, use it directly
   if (entry.texture) {
     activeMapEntry = entry;
     updatePreview();
+    _autoSaveSettings();   // persist activeMapName now that it points at this preset
     return;
   }
 
   // Load full-resolution texture on demand
-  swatchEl.classList.add('preset-loading-full');
+  gallery.setLoading(idx, true);
   try {
     const full = await loadFullPreset(idx);
-    if (gen !== _selectGeneration) return;   // user clicked another preset meanwhile
     PRESETS[idx] = { ...entry, ...full };
+    if (gen !== _selectGeneration) return;   // user clicked another preset meanwhile
     activeMapEntry = PRESETS[idx];
-    swatchEl.classList.remove('preset-loading-full');
     updatePreview();
+    // The scale change above auto-saved before the texture loaded, i.e. with the previous map's
+    // name — save again so a reload restores this preset.
+    _autoSaveSettings();
   } catch (err) {
     console.error('Failed to load full texture:', err);
-    swatchEl.classList.remove('preset-loading-full');
+  } finally {
+    gallery.setLoading(idx, false);
   }
+}
+
+/**
+ * Make one of the user's stored textures (js/customTextures.js) the active map. Resolves false if
+ * the browser no longer has it (it may evict the library at any time) or it failed to decode. Only
+ * a user pick (applyDefaults) says so out loud; session and undo restores fall back quietly.
+ */
+async function selectCustomTexture(id, applyDefaults = true) {
+  const gen = ++_selectGeneration;
+  let entry = _lastCustomMap?.customId === id ? _lastCustomMap : null;
+  if (!entry) {
+    let file = null;
+    gallery.setCustomLoading(id, true);
+    try {
+      file = await getCustomTextureFile(id);
+      if (file) {
+        entry = await loadCustomTexture(file);
+        entry.isCustom = true;
+        entry.customId = id;
+      }
+    } catch (err) {
+      console.error('Failed to load stored texture:', err);
+    } finally {
+      gallery.setCustomLoading(id, false);
+    }
+    if (!entry) {
+      if (applyDefaults && gen === _selectGeneration) {
+        alert(file ? t('alerts.textureLoadFailed', { name: file.name }) : t('alerts.customTextureMissing'));
+      }
+      gallery.refreshCustoms();   // drop the tile if its file is gone
+      return false;
+    }
+  }
+  if (gen !== _selectGeneration) {   // user clicked another map meanwhile
+    if (entry !== _lastCustomMap) entry.texture.dispose();
+    return false;
+  }
+  _useCustomMap(entry, applyDefaults);
+  return true;
+}
+
+/** Make a decoded custom map the active map (fresh upload, library pick or project import). */
+function _useCustomMap(entry, resetSmoothing) {
+  _selectGeneration++;   // a preset or library load still in flight must not replace it
+  // Only the latest custom map is kept; free the GPU copy of the one it
+  // replaces — unless another layer still uses it.
+  if (_lastCustomMap && _lastCustomMap !== entry && !_mapEntryInUse(_lastCustomMap)) _lastCustomMap.texture.dispose();
+  activeMapEntry = entry;
+  _lastCustomMap = entry;
+  _clearPresetActive();
+  gallery.markActiveCustom(entry.customId);
+  _showCustomMapThumb(entry);
+  customMapSwatch.classList.add('active');
+  if (resetSmoothing) resetTextureSmoothing();
+  updatePreview();
+  _autoSaveSettings();
 }
 
 // ── Custom-map thumbnail (below the upload button) ───────────────────────────
@@ -1099,12 +1381,7 @@ function _hideCustomMapThumb() {
 
 /** Promote the kept-aside custom map back to the active map. No defaults reset. */
 function _activateCustomMap() {
-  if (!_lastCustomMap) return;
-  activeMapEntry = _lastCustomMap;
-  document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
-  customMapSwatch.classList.add('active');
-  activeMapName.textContent = _lastCustomMap.name;
-  updatePreview();
+  if (_lastCustomMap) _useCustomMap(_lastCustomMap, false);
 }
 
 if (customMapSwatch) {
@@ -1123,15 +1400,39 @@ if (customMapRemoveBtn) {
     if (wasActive) {
       // Fall back to the default preset so the viewer keeps a usable texture.
       const idx = IMAGE_PRESETS.findIndex(p => p.name === DEFAULT_PRESET_NAME);
-      if (idx >= 0 && _presetSwatches[idx] && PRESETS[idx]) {
-        selectPreset(idx, _presetSwatches[idx], /*applyDefaults=*/false);
+      if (idx >= 0) {
+        selectPreset(idx, /*applyDefaults=*/false);
       } else {
         activeMapEntry = null;
-        activeMapName.textContent = t('ui.noMapSelected');
         updatePreview();
       }
     }
   });
+}
+
+// ── Welcome popup: open / dismiss ─────────────────────────────────────────────
+function openWelcome({ allowDismissPersist }) {
+  welcomeDontShow.checked = false;
+  welcomeOverlay.classList.remove('hidden');
+  trapFocus(welcomeOverlay);
+
+  const close = () => {
+    if (allowDismissPersist && welcomeDontShow.checked) {
+      try { localStorage.setItem(WELCOME_STORAGE_KEY, WELCOME_LAST_UPDATED); } catch { /* quota / private mode */ }
+    }
+    welcomeOverlay.classList.add('hidden');
+  };
+  welcomeClose.onclick   = close;
+  welcomeGotIt.onclick   = close;
+  welcomeOverlay.onclick = (e) => { if (e.target === welcomeOverlay) close(); };
+}
+
+function showWelcomeIfNeeded() {
+  let seen = null;
+  try { seen = localStorage.getItem(WELCOME_STORAGE_KEY); } catch { /* private mode */ }
+  if (seen !== WELCOME_LAST_UPDATED) {
+    openWelcome({ allowDismissPersist: true });
+  }
 }
 
 // ── Accessibility: Modal focus trap ───────────────────────────────────────────
@@ -1160,6 +1461,24 @@ function trapFocus(overlay) {
   overlay.addEventListener('keydown', handler);
 }
 
+// Bottom faces = 0 textures the bed-contact face too, and the bottom snap
+// would flatten that texture again — the export skips the snap then (#126).
+// Mirror that in the UI: uncheck and grey out the checkbox, and restore it if
+// the limit goes back above 0 before the user touches the checkbox
+// (smoothBottomAutoOff, declared with the module state at the top).
+function syncSmoothBottomToLimit() {
+  const masked = settings.bottomAngleLimit > 0;
+  if (!masked && smoothBottomChk.checked) {
+    smoothBottomChk.checked = settings.smoothBottom = false;
+    smoothBottomAutoOff = true;
+  } else if (masked && smoothBottomAutoOff) {
+    smoothBottomChk.checked = settings.smoothBottom = true;
+    smoothBottomAutoOff = false;
+  }
+  smoothBottomChk.disabled = !masked;
+  smoothBottomRow.classList.toggle('disabled', !masked);
+}
+
 // ── Event wiring ──────────────────────────────────────────────────────────────
 
 function wireEvents() {
@@ -1168,6 +1487,9 @@ function wireEvents() {
     const file = e.target.files[0];
     if (!file) return;
     e.target.value = '';
+    // macOS pickers ignore the accept filter, so check the type here too (#124).
+    if (/\.bumpmesh$/i.test(file.name)) { importProject(file).catch(err => alert(t('alerts.importFailed', { msg: err.message }))); return; }
+    if (!MODEL_FILE_RE.test(file.name)) { alert(t('alerts.unsupportedModelType', { name: file.name })); return; }
     handleModelFile(file);
   });
 
@@ -1183,8 +1505,30 @@ function wireEvents() {
     const files = [...e.dataTransfer.files];
     const bmFile = files.find(f => /\.bumpmesh$/i.test(f.name));
     if (bmFile) { importProject(bmFile).catch(err => alert(t('alerts.importFailed', { msg: err.message }))); return; }
-    const file = files.find(f => /\.(stl|obj|3mf)$/i.test(f.name));
+    const file = files.find(f => MODEL_FILE_RE.test(f.name));
     if (file) handleModelFile(file);
+    else if (files.length) alert(t('alerts.unsupportedModelType', { name: files[0].name }));
+  });
+
+  // STEP import dialog: preset radios drive the tolerance fields; Import
+  // kicks off (re-)tessellation, Cancel/backdrop/× just closes.
+  for (const radio of document.querySelectorAll('input[name="step-preset"]')) {
+    radio.addEventListener('change', () => _stepUpdateFields());
+  }
+  stepImportGo.addEventListener('click', () => {
+    const file = _stepDialogFile;
+    if (!file) { closeStepDialog(); return; }
+    const preset = _stepSelectedPreset();
+    const settings = preset === 'custom'
+      ? { surfaceDeviation: +stepSurfaceDev.value, normalDeviation: +stepNormalDev.value, maxEdge: +stepMaxEdge.value }
+      : { preset };
+    closeStepDialog();
+    handleModelFile(file, settings);
+  });
+  stepImportCancel.addEventListener('click', closeStepDialog);
+  stepDialogClose.addEventListener('click', closeStepDialog);
+  stepOverlay.addEventListener('click', (e) => {
+    if (e.target === stepOverlay) closeStepDialog();
   });
 
   // Allow clicking the drop zone to open the file picker (except on canvas)
@@ -1202,7 +1546,9 @@ function wireEvents() {
 
     try {
       const token = { get() { return diagToken; } };
-      const results = await runExpensiveDiagnostics(currentGeometry, token);
+      const triCount = currentGeometry.attributes.position.count / 3;
+      const shellIds = lastFastDiag?.triCount === triCount ? lastFastDiag.shellIds : null;
+      const results = await runExpensiveDiagnostics(currentGeometry, token, shellIds);
 
       if (diagToken !== myToken) return; // model changed, discard
 
@@ -1226,17 +1572,23 @@ function wireEvents() {
     const file = e.target.files[0];
     if (!file) return;
     try {
-      activeMapEntry = await loadCustomTexture(file);
-      activeMapEntry.isCustom = true;
-      _lastCustomMap = activeMapEntry;
-      activeMapName.textContent = file.name;
-      document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
-      _showCustomMapThumb(activeMapEntry);
-      customMapSwatch.classList.add('active');
-      resetTextureSmoothing();
-      updatePreview();
+      const entry = await loadCustomTexture(file);
+      entry.isCustom = true;
+      _useCustomMap(entry, true);
+      // Keep the original in the gallery's "Your textures" (best effort — the map works either way).
+      gallery.rememberUpload(file, entry.fullCanvas).then((id) => {
+        if (!id) return;
+        entry.customId = id;
+        if (activeMapEntry === entry) {
+          gallery.markActiveCustom(id);
+          _autoSaveSettings();   // so a reload brings this map back
+        }
+      });
     } catch (err) {
+      // macOS pickers ignore accept="image/*", and browsers can't decode
+      // HEIC/TIFF — tell the user instead of silently keeping the old map (#124).
       console.error('Failed to load texture:', err);
+      alert(t('alerts.textureLoadFailed', { name: file.name }));
     }
     // Reset the file input so re-uploading the same filename still triggers 'change'.
     textureInput.value = '';
@@ -1244,19 +1596,33 @@ function wireEvents() {
 
   // ── Settings ──
   mappingSelect.addEventListener('change', () => {
+    const prevMode = settings.mappingMode;
     settings.mappingMode = parseInt(mappingSelect.value, 10);
+    if (settings.mappingMode === 7 /* MODE_SURFACE_NORMAL */ && prevMode !== 7) _faceStampSurface(prevMode);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
+    // Only the box-style projections (Triplanar, Cubic) have side projections to turn.
+    rotateAroundZRow.style.display = settings.mappingMode === 5 || settings.mappingMode === 6 ? '' : 'none';
     updateCylinderUIVisibility();
+    if (stampPlaceActive && !isStampActive(settings)) toggleStampPlace(false);
+    updateStampUIVisibility();
+    // The wrap circumference is mode-specific (cylinder vs sphere equator),
+    // so entering a wrap mode with snapping on re-snaps the U scale.
+    if (settings.snapSeamlessWrap && _isSeamlessWrapMode()) {
+      _applyScaleU(settings.scaleU);
+    }
     updatePreview();
   });
 
   cylinderSnapToggle.addEventListener('change', () => {
     settings.snapSeamlessWrap = cylinderSnapToggle.checked;
-    if (settings.snapSeamlessWrap && settings.mappingMode === 3) {
+    if (settings.snapSeamlessWrap && _isSeamlessWrapMode()) {
       // Snap immediately so the user sees the seam fix without dragging first.
       _applyScaleU(settings.scaleU);
     }
   });
+
+  stampModeBtn.addEventListener('click', () => _setStampMode(!settings.stampOnce));
+  stampPlaceBtn.addEventListener('click', () => toggleStampPlace(!stampPlaceActive));
 
   cylinderAutofitBtn.addEventListener('click', () => {
     if (autoFitCylinderAxis()) {
@@ -1292,21 +1658,22 @@ function wireEvents() {
   // Scale U — when lock is on, mirror to V
   const applyScaleU = (v) => _applyScaleU(v);
   scaleUSlider.addEventListener('input', () => applyScaleU(posToScale(parseFloat(scaleUSlider.value))));
-  scaleUSlider.addEventListener('dblclick', () => applyScaleU(posToScale(parseFloat(scaleUSlider.defaultValue))));
+  scaleUSlider.addEventListener('dblclick', () => applyScaleU(_defaultTileMm()));
   scaleUVal.addEventListener('change', () => applyScaleU(parseFloat(scaleUVal.value)));
   addFineWheelSupport(scaleUVal, applyScaleU);
 
   // Scale V — when lock is on, mirror to U
   const applyScaleV = (v) => {
-    v = Math.max(0.01, Math.min(10, v));
+    v = Math.max(SCALE_MM_INPUT_MIN, Math.min(SCALE_MM_INPUT_MAX, v));
     settings.scaleV = v;
     scaleVSlider.value = scaleToPos(v);
-    scaleVVal.value = v;
-    if (settings.lockScale) { settings.scaleU = v; scaleUSlider.value = scaleToPos(v); scaleUVal.value = v; }
+    scaleVVal.value = fmtScaleVal(v);
+    if (settings.lockScale) { settings.scaleU = v; scaleUSlider.value = scaleToPos(v); scaleUVal.value = fmtScaleVal(v); }
+    _reorientNormalStamp();
     clearTimeout(previewDebounce); previewDebounce = setTimeout(updatePreview, 80);
   };
   scaleVSlider.addEventListener('input', () => applyScaleV(posToScale(parseFloat(scaleVSlider.value))));
-  scaleVSlider.addEventListener('dblclick', () => applyScaleV(posToScale(parseFloat(scaleVSlider.defaultValue))));
+  scaleVSlider.addEventListener('dblclick', () => applyScaleV(_defaultTileMm()));
   scaleVVal.addEventListener('change', () => applyScaleV(parseFloat(scaleVVal.value)));
   addFineWheelSupport(scaleVVal, applyScaleV);
 
@@ -1318,7 +1685,7 @@ function wireEvents() {
     if (settings.lockScale) {
       settings.scaleV = settings.scaleU;
       scaleVSlider.value = scaleToPos(settings.scaleU);
-      scaleVVal.value = settings.scaleU;
+      scaleVVal.value = fmtScaleVal(settings.scaleU);
       updatePreview();
     }
   });
@@ -1339,6 +1706,9 @@ function wireEvents() {
     updatePreview();
   });
   linkSlider(boundaryFalloffSlider, boundaryFalloffVal, v => { settings.boundaryFalloff = v; _falloffDirty = true; return v.toFixed(1); });
+  for (const [mode, btn] of Object.entries(falloffCurveButtons)) {
+    btn.addEventListener('click', () => setFalloffCurve(mode));
+  }
   linkSlider(refineLenSlider, refineLenVal, v => {
     settings.refineLength = v;
     checkResolutionWarning();
@@ -1346,15 +1716,36 @@ function wireEvents() {
     // (applySmartResolution sets values without dispatching `input`, so this
     // only fires when the user drags or types — exactly what we want.)
     if (smartResInfo) smartResInfo.classList.add('hidden');
+    scheduleDisplacementPreviewResolutionRefresh();
     return v.toFixed(2);
   }, false);
   refineLenVal.addEventListener('change', checkResolutionWarning);
+  // Only genuine user input marks the resolution as chosen; programmatic
+  // restores (undo, reset, project import) dispatch untrusted events.
+  const markRefineLengthUserSet = (e) => { if (e.isTrusted) refineLengthUserSet = true; };
+  refineLenSlider.addEventListener('input', markRefineLengthUserSet);
+  refineLenSlider.addEventListener('dblclick', markRefineLengthUserSet);
+  refineLenVal.addEventListener('change', markRefineLengthUserSet);
+  refineLenVal.addEventListener('wheel', markRefineLengthUserSet);
   linkSlider(maxTriSlider, maxTriVal, v => { settings.maxTriangles = v; return formatM(v); }, false);
-  linkSlider(bottomAngleLimitSlider, bottomAngleLimitVal, v => { settings.bottomAngleLimit = v; _falloffDirty = true; return v; });
+  linkSlider(bottomAngleLimitSlider, bottomAngleLimitVal, v => {
+    settings.bottomAngleLimit = v; _falloffDirty = true;
+    syncSmoothBottomToLimit();
+    return v;
+  });
+  smoothBottomChk.addEventListener('change', () => { smoothBottomAutoOff = false; });
   linkSlider(topAngleLimitSlider,    topAngleLimitVal,    v => { settings.topAngleLimit    = v; _falloffDirty = true; return v; });
   linkSlider(seamBlendSlider,        seamBlendVal,        v => { settings.mappingBlend     = v; return v.toFixed(2); });
   linkSlider(seamBandWidthSlider,    seamBandWidthVal,    v => { settings.seamBandWidth    = v; return v.toFixed(2); });
   linkSlider(textureSmoothingSlider, textureSmoothingVal, v => { settings.textureSmoothing = v; return v.toFixed(1); });
+  invertTextureCheckbox.addEventListener('change', () => {
+    settings.invertTexture = invertTextureCheckbox.checked;
+    updatePreview();
+  });
+  rotateAroundZCheckbox.addEventListener('change', () => {
+    settings.rotateAroundZ = rotateAroundZCheckbox.checked;
+    updatePreview();
+  });
   linkSlider(capAngleSlider,          capAngleVal,          v => { settings.capAngle         = v; return Math.round(v); });
   symmetricDispToggle.addEventListener('change', () => {
     settings.symmetricDisplacement = symmetricDispToggle.checked;
@@ -1369,37 +1760,25 @@ function wireEvents() {
     settings.smoothBottom = smoothBottomChk.checked;
     // No preview rebuild needed — the snap is a final-export step only.
   });
-
-  // Regularize (Advanced/Beta) — toggle + 7 debug knobs.  The toggle disables
-  // the entire regularize+resub pipeline; the knobs adjust regularize.js opts.
-  regularizeEnabledChk.checked = settings.regularizeEnabled;
-  regularizeDebugRows.classList.toggle('disabled', !settings.regularizeEnabled);
-  regularizeEnabledChk.addEventListener('change', () => {
-    settings.regularizeEnabled = regularizeEnabledChk.checked;
-    regularizeDebugRows.classList.toggle('disabled', !settings.regularizeEnabled);
-    updatePreview();
+  syncSmoothBottomToLimit();
+  harvestFlatChk.checked = settings.harvestFlatFaces;
+  harvestTolRow.classList.toggle('disabled', !settings.harvestFlatFaces);
+  harvestFlatChk.addEventListener('change', () => {
+    settings.harvestFlatFaces = harvestFlatChk.checked;
+    harvestTolRow.classList.toggle('disabled', !settings.harvestFlatFaces);
+    // No preview rebuild needed — harvesting only affects the final decimation.
   });
-  // Regularize full model vs. only textured areas.
-  regularizeFullChk.checked = settings.regularizeFullModel;
-  regularizeFullChk.addEventListener('change', () => {
-    settings.regularizeFullModel = regularizeFullChk.checked;
-    updatePreview();
+  harvestTolInput.value = settings.harvestTol;
+  harvestTolInput.addEventListener('input', () => {
+    const v = parseFloat(harvestTolInput.value);
+    if (Number.isFinite(v) && v >= 0) settings.harvestTol = v;
+    // No preview rebuild needed — harvesting only affects the final decimation.
   });
-  // Helper — wire a number input to a settings key, schedule a preview update.
-  const _wireRegNumber = (el, key, parser = parseFloat) => {
-    el.value = settings[key];
-    el.addEventListener('input', () => {
-      const v = parser(el.value);
-      if (Number.isFinite(v)) { settings[key] = v; updatePreview(); }
-    });
-  };
-  _wireRegNumber(regAspectThresholdEl,    'regularizeAspectThreshold');
-  _wireRegNumber(regSlackEl,              'regularizeSlack');
-  _wireRegNumber(regAggressiveSlackEl,    'regularizeAggressiveSlack');
-  _wireRegNumber(regExtremeAspectEl,      'regularizeExtremeAspect');
-  _wireRegNumber(regNormalDegEl,          'regularizeNormalDeg');
-  _wireRegNumber(regAggressiveNormalDegEl,'regularizeAggressiveNormalDeg');
-  _wireRegNumber(regSecondPassMulEl,      'regularizeSecondPassMul');
+  preserveUntexturedChk.checked = settings.preserveUntextured;
+  preserveUntexturedChk.addEventListener('change', () => {
+    settings.preserveUntextured = preserveUntexturedChk.checked;
+    // Export/bake-time flag only — no preview rebuild needed.
+  });
 
   dispPreviewToggle.addEventListener('change', () => {
     toggleDisplacementPreview(dispPreviewToggle.checked);
@@ -1421,9 +1800,13 @@ function wireEvents() {
   rotateResetBtn.addEventListener('click', () => {
     if (!currentGeometry || !_rotateOriginalPositions) return;
 
-    // Restore original vertex positions
+    // Restore original vertex positions and the matching pose transform
     currentGeometry.attributes.position.array.set(_rotateOriginalPositions);
     currentGeometry.attributes.position.needsUpdate = true;
+    if (_rotatePoseSnapshot) {
+      currentPoseRot.copy(_rotatePoseSnapshot.rot);
+      currentPoseTrans.copy(_rotatePoseSnapshot.trans);
+    }
     currentGeometry.computeVertexNormals();
     if (currentGeometry.attributes.faceNormal) {
       currentGeometry.deleteAttribute('faceNormal');
@@ -1445,15 +1828,58 @@ function wireEvents() {
     });
   });
 
+  // ── License ──
+  licenseLink.addEventListener('click', () => { licenseOverlay.classList.remove('hidden'); trapFocus(licenseOverlay); });
+  licenseClose.addEventListener('click', () => licenseOverlay.classList.add('hidden'));
+  licenseOverlay.addEventListener('click', (e) => {
+    if (e.target === licenseOverlay) licenseOverlay.classList.add('hidden');
+  });
+
+  // ── Imprint & Privacy ──
+  imprintLink.addEventListener('click', () => { imprintOverlay.classList.remove('hidden'); trapFocus(imprintOverlay); });
+  imprintClose.addEventListener('click', () => imprintOverlay.classList.add('hidden'));
+  imprintOverlay.addEventListener('click', (e) => {
+    if (e.target === imprintOverlay) imprintOverlay.classList.add('hidden');
+  });
+
+  // ── Welcome / What's New ──
+  welcomeLink.addEventListener('click', () => openWelcome({ allowDismissPersist: false }));
+
   // ── Mesh diagnostics dismiss ──
   meshDiagDismiss.addEventListener('click', () => {
     meshDiagnostics.classList.add('hidden');
     clearDiagHighlight();
   });
 
+  // ── Support banner dismiss ──
+  document.getElementById('store-cta-dismiss').addEventListener('click', () => {
+    document.getElementById('store-cta-wrapper').classList.add('store-cta-hidden');
+  });
+
   // ── Export ──
   const startExport = (format) => {
+    // Start the export immediately — the pipeline runs in the worker, so the
+    // sponsor overlay sits on top of a live progress bar instead of delaying
+    // the work until it's dismissed.
     handleExport(format);
+
+    if (sessionStorage.getItem('stlt-no-sponsor') === '1') return;
+    const overlay = document.getElementById('sponsor-overlay');
+    const closeBtn = document.getElementById('sponsor-close');
+    // Button plus the inline text link (the button may be hidden or removed by adblockers)
+    const storeLinks = overlay.querySelectorAll('a[href="https://geni.us/CNCStoreTexture"]');
+    overlay.classList.remove('hidden');
+    trapFocus(overlay);
+
+    const dismiss = () => {
+      if (document.getElementById('sponsor-dont-show').checked) {
+        sessionStorage.setItem('stlt-no-sponsor', '1');
+      }
+      overlay.classList.add('hidden');
+    };
+
+    closeBtn.onclick = dismiss;
+    storeLinks.forEach(a => { a.onclick = () => setTimeout(dismiss, 150); });
   };
   exportBtn.addEventListener('click', () => startExport('stl'));
   export3mfBtn.addEventListener('click', () => startExport('3mf'));
@@ -1464,11 +1890,31 @@ function wireEvents() {
   });
   bakeBtn.addEventListener('click', bakeTextures);
 
+  // ── Texture layers ──
+  if (layerAddBtn) layerAddBtn.addEventListener('click', _addLayer);
+
   // ── Wireframe ──
   wireframeToggle.addEventListener('change', () => setWireframe(wireframeToggle.checked));
 
   // ── Projection toggle ──
   projectionToggle.addEventListener('change', () => setProjection(projectionToggle.checked));
+
+  // ── Section view ──
+  sectionToggle.addEventListener('change', () => {
+    // The plane handles hide while a click tool is active; switching the cut on
+    // hands the mouse to them so it can be placed first.
+    if (sectionToggle.checked) {
+      if (exclusionTool) setExclusionTool(null);
+      if (placeOnFaceActive) togglePlaceOnFace(false);
+      if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
+    }
+    setSectionView(sectionToggle.checked);
+    sectionControls.classList.toggle('hidden', !sectionToggle.checked);
+  });
+  sectionControls.querySelectorAll('[data-section-axis]').forEach(btn => {
+    btn.addEventListener('click', () => setSectionAxis(btn.dataset.sectionAxis));
+  });
+  document.getElementById('section-flip').addEventListener('click', flipSection);
 
   // ── Exclusion tool wiring ─────────────────────────────────────────────────
 
@@ -1487,9 +1933,9 @@ function wireEvents() {
     brushIsRadius = false;
     exclBrushSingleBtn.classList.add('active');
     exclBrushRadiusBtn.classList.remove('active');
+    exclBrushModeRow.classList.add('hidden');
     exclRadiusRow.classList.add('hidden');
-    precisionMaskingRow.classList.add('hidden');
-    if (precisionMaskingEnabled) deactivatePrecisionMasking();
+    exclHardnessRow.classList.add('hidden');
     canvas.style.cursor = exclusionTool ? 'crosshair' : '';
     brushCursorEl.style.display = 'none';
   });
@@ -1498,36 +1944,65 @@ function wireEvents() {
     brushIsRadius = true;
     exclBrushRadiusBtn.classList.add('active');
     exclBrushSingleBtn.classList.remove('active');
+    if (exclusionTool === 'brush') exclBrushModeRow.classList.remove('hidden');
     if (exclusionTool === 'brush') exclRadiusRow.classList.remove('hidden');
-    if (exclusionTool === 'brush') precisionMaskingRow.classList.remove('hidden');
+    if (exclusionTool === 'brush' && brushPrecision) exclHardnessRow.classList.remove('hidden');
     if (exclusionTool === 'brush') canvas.style.cursor = 'none';
   });
+
+  // Standard marks whole triangles (hard only); Precision refines under the
+  // stroke and is the only mode with a soft edge.
+  const setBrushPrecision = (on) => {
+    brushPrecision = on;
+    exclBrushStandardBtn.classList.toggle('active', !on);
+    exclBrushPrecisionBtn.classList.toggle('active', on);
+    exclHardnessRow.classList.toggle('hidden', !(exclusionTool === 'brush' && brushIsRadius && on));
+    updateBrushCursorHardness();
+    _lastHoverTriIdx = -1;
+    setHoverPreview(null);
+  };
+  exclBrushStandardBtn.addEventListener('click', () => setBrushPrecision(false));
+  exclBrushPrecisionBtn.addEventListener('click', () => setBrushPrecision(true));
 
   exclBrushRadiusSlider.addEventListener('input', () => {
     brushRadius = parseFloat(exclBrushRadiusSlider.value) / 2;
     exclBrushRadiusVal.value = parseFloat(exclBrushRadiusSlider.value);
-    checkPrecisionOutdated();
   });
   exclBrushRadiusSlider.addEventListener('dblclick', () => {
     exclBrushRadiusSlider.value = exclBrushRadiusSlider.defaultValue;
     brushRadius = parseFloat(exclBrushRadiusSlider.value) / 2;
     exclBrushRadiusVal.value = parseFloat(exclBrushRadiusSlider.value);
-    checkPrecisionOutdated();
   });
   exclBrushRadiusVal.addEventListener('change', () => {
     let diam = Math.max(0.2, Math.min(100, parseFloat(exclBrushRadiusVal.value) || 10));
     brushRadius = diam / 2;
     exclBrushRadiusSlider.value = diam;
     exclBrushRadiusVal.value = diam;
-    checkPrecisionOutdated();
   });
   addFineWheelSupport(exclBrushRadiusVal, (v) => {
     const diam = Math.max(0.2, Math.min(100, v));
     brushRadius = diam / 2;
     exclBrushRadiusSlider.value = diam;
     exclBrushRadiusVal.value = diam;
-    checkPrecisionOutdated();
   });
+
+  // Hardness (percent in the UI, 0–1 internally). The brush refines the mesh
+  // under the stroke itself, so a soft fade works on any triangle size.
+  const setHardness = (pct) => {
+    pct = Math.max(0, Math.min(100, Math.round(pct)));
+    brushHardness = pct / 100;
+    exclBrushHardnessSlider.value = pct;
+    exclBrushHardnessVal.value = pct;
+    updateBrushCursorHardness();
+  };
+  exclBrushHardnessSlider.addEventListener('input', () => setHardness(parseFloat(exclBrushHardnessSlider.value)));
+  exclBrushHardnessSlider.addEventListener('dblclick', () => setHardness(parseFloat(exclBrushHardnessSlider.defaultValue)));
+  exclBrushHardnessVal.addEventListener('change', () => {
+    const v = parseFloat(exclBrushHardnessVal.value);
+    setHardness(Number.isFinite(v) ? v : parseFloat(exclBrushHardnessSlider.defaultValue));
+  });
+  addFineWheelSupport(exclBrushHardnessVal, (v) => setHardness(v));
+  updateBrushCursorHardness();
 
   exclThresholdSlider.addEventListener('input', () => {
     bucketThreshold = parseFloat(exclThresholdSlider.value);
@@ -1554,28 +2029,62 @@ function wireEvents() {
   });
 
   exclClearBtn.addEventListener('click', () => {
-    excludedFaces = new Set();
-    precisionExcludedFaces = new Set();
+    if (paintTree) paintTree.clearLayer(_activeSlot());
     refreshExclusionOverlay();
   });
 
-  exclModeExcludeBtn.addEventListener('click', () => setSelectionMode(false));
-  exclModeIncludeBtn.addEventListener('click', () => setSelectionMode(true));
-
-  // ── Precision masking wiring ──────────────────────────────────────────────
-  precisionMaskingToggle.addEventListener('change', () => {
-    togglePrecisionMasking(precisionMaskingToggle.checked);
+  // Clicking a mask-mode button pre-selects the fill tool so painting can
+  // start without an extra click (an already-active brush is kept). Only the
+  // buttons do this — programmatic setSelectionMode() calls (project load,
+  // session restore) must not activate a paint tool.
+  exclModeExcludeBtn.addEventListener('click', () => {
+    const tool = exclusionTool; // changing the mode drops the active tool
+    maskModeChosen = true;
+    setSelectionMode(false);   // early-returns if already exclude…
+    updateMaskModeButtons();   // …so refresh the highlight explicitly
+    if (!exclusionTool) setExclusionTool(tool || 'bucket');
   });
-  precisionRefreshBtn.addEventListener('click', () => {
-    refreshPrecisionMesh();
+  exclModeIncludeBtn.addEventListener('click', () => {
+    const tool = exclusionTool;
+    maskModeChosen = true;
+    setSelectionMode(true);
+    updateMaskModeButtons();
+    if (!exclusionTool) setExclusionTool(tool || 'bucket');
   });
 
   // ── Canvas mouse events for exclusion painting ────────────────────────────
   canvas.addEventListener('mousedown', (e) => {
+    // Any press that doesn't start a stamp gesture (orbit, pan, painting)
+    // hands the wheel back to zooming.
+    if (e.button !== 0 && _stampWheelArmed) _setStampWheelArmed(false);
     if (!currentGeometry || e.button !== 0) return;
 
     // Rotation gizmo takes priority
     if (isGizmoDragging()) return;
+
+    // Stamp placement: a hit centres the stamp and starts the drag; a miss
+    // falls through to OrbitControls.
+    if (stampPlaceActive) {
+      if (_placeStampAt(e, true)) {
+        e.preventDefault();
+        _startStampDrag();
+      } else {
+        _setStampWheelArmed(false);
+      }
+      return;
+    }
+
+    // Pressing on the stamp's patch grabs it — no tool needed.
+    if (!exclusionTool && !placeOnFaceActive && !rotateActive) {
+      const hit = _stampPatchHit(e);
+      if (hit) {
+        e.preventDefault();
+        _grabStamp(hit);
+        _startStampDrag();
+        return;
+      }
+    }
+    if (_stampWheelArmed) _setStampWheelArmed(false);
 
     // Place on Face mode
     if (placeOnFaceActive) {
@@ -1584,10 +2093,7 @@ function wireEvents() {
       return;
     }
 
-    if (!exclusionTool) return;
-
-    // Block painting while precision mesh is being built
-    if (precisionBusy) return;
+    if (!exclusionTool || !paintTree) return;
 
     if (exclusionTool === 'bucket') {
       e.preventDefault();
@@ -1596,20 +2102,9 @@ function wireEvents() {
       updateMaskingTriDebug(e);
       const triIdx = pickTriangle(e);
       if (triIdx >= 0) {
+        // Bucket fill works on base faces: every leaf of a filled face is painted.
         const filled = bucketFill(triIdx, triangleAdjacency, bucketThreshold);
-        // Bucket fill always uses original face indices
-        for (const t of filled) {
-          if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
-        }
-        // If precision is active, also sync to precisionExcludedFaces
-        if (precisionMaskingEnabled && precisionParentMap) {
-          const len = precisionParentMap.length;
-          for (let i = 0; i < len; i++) {
-            if (filled.has(precisionParentMap[i])) {
-              if (eraseMode) precisionExcludedFaces.delete(i); else precisionExcludedFaces.add(i);
-            }
-          }
-        }
+        paintTree.paintFaces(_activeSlot(), filled, eraseMode);
         refreshExclusionOverlay();
         _lastHoverTriIdx = -1;
         setHoverPreview(null);
@@ -1622,6 +2117,7 @@ function wireEvents() {
       updateMaskingTriDebug(e);
       getControls().enabled = false;
       isPainting = true;
+      _strokeLastPoint = null;
       _lastHoverTriIdx = -1;
       setHoverPreview(null);
       paintAt(e);
@@ -1655,6 +2151,12 @@ function wireEvents() {
         const ev = _pendingHoverEvent;
         if (!ev) return;
         _pendingHoverEvent = null;
+        if (_stampDragging) {
+          // Slide along the surface; the axis stays the one picked on press.
+          if (_placeStampAt(ev, false)) { _syncPreviewMaterial(); requestRender(); }
+          return;
+        }
+        if (currentGeometry) _updateStampHoverCursor(ev);
         if (placeOnFaceActive && currentGeometry) { updatePlaceOnFaceHover(ev); return; }
         if (exclusionTool === 'brush') {
           updateBrushCursor(ev);
@@ -1673,10 +2175,26 @@ function wireEvents() {
     brushCursorEl.style.display = 'none';
   });
 
-  document.addEventListener('mouseup', () => {
-    if (!isPainting) return;
+  document.addEventListener('mouseup', _endStampDrag);
+
+  // While armed, the wheel resizes the stamp. Captured on the canvas's parent
+  // so the viewer's cursor zoom (a wheel listener on the canvas) never sees it.
+  canvas.parentElement.addEventListener('wheel', (e) => {
+    if (!_stampWheelArmed || e.target !== canvas || !isStampActive(settings)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;   // lines → pixels (Firefox)
+    _scaleStampBy(Math.exp(-dy * 0.0015));
+  }, { capture: true, passive: false });
+
+  // A stroke belongs to the left button: tapping another one mustn't end it,
+  // or the camera would take over the rest of the drag.
+  document.addEventListener('mouseup', (e) => {
+    if (!isPainting || e.button !== 0) return;
     isPainting = false;
+    _strokeLastPoint = null;
     getControls().enabled = true;
+    _flushPaintRefresh();
     // Capture the completed stroke synchronously so quick consecutive strokes
     // each get their own undo entry — the debounced window-pointerup capture
     // would otherwise collapse strokes that finish within UNDO_DEBOUNCE_MS.
@@ -1684,11 +2202,21 @@ function wireEvents() {
     _commitUndoCapture();
   });
 
+  // OrbitControls only suppresses the context menu while enabled, and it's
+  // disabled during a stroke; a menu would swallow the left button's release.
+  document.addEventListener('contextmenu', (e) => {
+    if (isPainting) e.preventDefault();
+  });
+
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (rotateActive) toggleRotateMode(false);
       if (placeOnFaceActive) togglePlaceOnFace(false);
+      if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
       if (exclusionTool) setExclusionTool(null);
+      licenseOverlay.classList.add('hidden');
+      imprintOverlay.classList.add('hidden');
+      closeStepDialog();
       _clearShiftLinePreview();
     }
   });
@@ -1700,31 +2228,54 @@ function wireEvents() {
 
 // ── Exclusion helpers ─────────────────────────────────────────────────────────
 
-function setSelectionMode(include) {
+function setSelectionMode(include, { clear = true } = {}) {
   if (selectionMode === include) return;
   selectionMode = include;
-  exclModeExcludeBtn.classList.toggle('active', !selectionMode);
-  exclModeIncludeBtn.classList.toggle('active', selectionMode);
-  exclModeExcludeBtn.setAttribute('aria-pressed', String(!selectionMode));
-  exclModeIncludeBtn.setAttribute('aria-pressed', String(selectionMode));
+  // Include-only is never the implicit default, so entering it always counts
+  // as engaging the masking UI. Exclude can be entered programmatically as a
+  // reset-to-default; those call sites manage maskModeChosen themselves.
+  if (include) maskModeChosen = true;
+  updateMaskModeButtons();
   if (exclusionTool) setExclusionTool(null);
   exclSectionHeading.textContent = selectionMode ? t('sections.surfaceSelection') : t('sections.surfaceMasking');
   exclHint.textContent = selectionMode
     ? t('excl.hintInclude')
     : t('excl.hintExclude');
-  // Clear the painted set — faces had opposite semantics in the previous mode
-  excludedFaces = new Set();
-  precisionExcludedFaces = new Set();
+  // Clear the layer's paint — it had the opposite meaning in the previous
+  // mode. (Switching layers passes clear:false: the paint is the other
+  // layer's, already in its own mode.)
+  if (clear && paintTree) paintTree.clearLayer(_activeSlot());
   refreshExclusionOverlay();
+}
+
+// Neither mode button is highlighted until masking is engaged (maskModeChosen)
+// — Exclude is still the effective default internally, but the user should
+// deliberately pick a mode (or a tool) before it lights up.
+function updateMaskModeButtons() {
+  const excludeOn = maskModeChosen && !selectionMode;
+  const includeOn = maskModeChosen && selectionMode;
+  exclModeExcludeBtn.classList.toggle('active', excludeOn);
+  exclModeIncludeBtn.classList.toggle('active', includeOn);
+  exclModeExcludeBtn.setAttribute('aria-pressed', String(excludeOn));
+  exclModeIncludeBtn.setAttribute('aria-pressed', String(includeOn));
 }
 
 function setExclusionTool(tool) {
   // Clicking the active tool toggles it off; passing null always deactivates
   exclusionTool = (exclusionTool === tool) ? null : tool;
+  setSectionHandlesLocked(!!exclusionTool || placeOnFaceActive);
 
   // Deactivate place-on-face and rotate if an exclusion tool is being activated
   if (exclusionTool && placeOnFaceActive) togglePlaceOnFace(false);
   if (exclusionTool && rotateActive) toggleRotateMode(false);
+  if (exclusionTool && stampPlaceActive) toggleStampPlace(false);
+
+  // Activating any masking tool engages the masking UI — highlight the mode
+  // the paint will apply under (exclude unless include-only was chosen).
+  if (exclusionTool && !maskModeChosen) {
+    maskModeChosen = true;
+    updateMaskModeButtons();
+  }
 
   // Exit 3D displacement preview when a masking tool is activated
   if (exclusionTool && settings.useDisplacement) {
@@ -1737,9 +2288,9 @@ function setExclusionTool(tool) {
   // Show brush-type row only while brush is active
   exclBrushTypeRow.classList.toggle('hidden', exclusionTool !== 'brush');
   // Show radius row only while brush + radius mode is active
+  exclBrushModeRow.classList.toggle('hidden', !(exclusionTool === 'brush' && brushIsRadius));
   exclRadiusRow.classList.toggle('hidden', !(exclusionTool === 'brush' && brushIsRadius));
-  // Show precision masking row only when brush + circle mode is active
-  precisionMaskingRow.classList.toggle('hidden', !(exclusionTool === 'brush' && brushIsRadius));
+  exclHardnessRow.classList.toggle('hidden', !(exclusionTool === 'brush' && brushIsRadius && brushPrecision));
   // Show threshold row only while bucket is active
   exclThresholdRow.classList.toggle('hidden', exclusionTool !== 'bucket');
   canvas.style.cursor = (exclusionTool === 'brush' && brushIsRadius) ? 'none' : exclusionTool ? 'crosshair' : '';
@@ -1758,12 +2309,9 @@ function setExclusionTool(tool) {
     if (dbg) { dbg.hidden = true; dbg.textContent = ''; }
     // Recompute boundary falloff now that masking is done
     if (_falloffDirty && currentGeometry) {
-      const activeGeo = (precisionMaskingEnabled && precisionGeometry)
-        ? precisionGeometry
-        : (settings.useDisplacement && dispPreviewGeometry)
-          ? dispPreviewGeometry : currentGeometry;
-      updateFaceMask(activeGeo);
+      updateFaceMask(_displayGeometry());
     }
+    if (paintTree) paintTree.compactIfNeeded();
   }
 }
 
@@ -1783,6 +2331,8 @@ function _canvasNDC(e) {
 // face normal (in world space) points toward the camera ray origin.
 const _normalMatrix = new THREE.Matrix3();
 function getFrontFaceHit(hits, mesh) {
+  // Section view: the cut-away side isn't there, and the cut face covers what's behind it.
+  hits = sectionVisibleHits(hits, _raycaster.ray);
   if (!hits.length) return null;
   _normalMatrix.getNormalMatrix(mesh.matrixWorld);
   for (const hit of hits) {
@@ -1799,18 +2349,14 @@ function pickTriangle(e) {
   const hits = _raycaster.intersectObject(mesh);
   const hit = getFrontFaceHit(hits, mesh);
   if (!hit) return -1;
-  let fi = hit.faceIndex;
-  // When displacement preview is active the mesh uses the subdivided geometry,
-  // so the raycaster returns a subdivided face index.  Map it back to the
-  // original face index so that excludedFaces always stores original indices.
-  if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
-    fi = dispPreviewParentMap[fi];
-  }
-  // Same mapping for precision masking geometry
-  if (precisionGeometry && mesh.geometry === precisionGeometry && precisionParentMap) {
-    fi = precisionParentMap[fi];
-  }
-  return fi;
+  return _baseFaceOf(hit.faceIndex, mesh.geometry);
+}
+
+/** Map a face of whatever mesh the viewer shows back to its base face. */
+function _baseFaceOf(faceIndex, geometry) {
+  if (geometry === dispPreviewGeometry && dispPreviewParentMap) return dispPreviewParentMap[faceIndex];
+  if (geometry === paintGeometry && paintFlat) return paintFlat.faceParentId[faceIndex];
+  return faceIndex;
 }
 
 // Debug panel: dump vertex coords + edge stats for the *visually picked*
@@ -1841,7 +2387,7 @@ function updateMaskingTriDebug(e) {
   const lmax = Math.max(lAB, lBC, lCA);
   const aspect = lmin > 0 ? lmax / lmin : Infinity;
   const tag = geo === currentGeometry        ? 'orig'
-            : geo === precisionGeometry      ? 'precision'
+            : geo === paintGeometry          ? 'paint'
             : geo === dispPreviewGeometry    ? 'preview'
             : 'mesh';
   el.textContent =
@@ -1854,165 +2400,660 @@ function updateMaskingTriDebug(e) {
   el.hidden = false;
 }
 
-/**
- * Squared distance from point P to the closest point on triangle ABC.
- * Uses the Voronoi-region method (no allocations, pure arithmetic).
- */
-function distSqPointToTri(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
-  const abx = bx-ax, aby = by-ay, abz = bz-az;
-  const acx = cx-ax, acy = cy-ay, acz = cz-az;
-  const apx = px-ax, apy = py-ay, apz = pz-az;
-
-  const d1 = abx*apx + aby*apy + abz*apz;
-  const d2 = acx*apx + acy*apy + acz*apz;
-  if (d1 <= 0 && d2 <= 0) return apx*apx + apy*apy + apz*apz; // vertex A
-
-  const bpx = px-bx, bpy = py-by, bpz = pz-bz;
-  const d3 = abx*bpx + aby*bpy + abz*bpz;
-  const d4 = acx*bpx + acy*bpy + acz*bpz;
-  if (d3 >= 0 && d4 <= d3) return bpx*bpx + bpy*bpy + bpz*bpz; // vertex B
-
-  const cpx = px-cx, cpy = py-cy, cpz = pz-cz;
-  const d5 = abx*cpx + aby*cpy + abz*cpz;
-  const d6 = acx*cpx + acy*cpy + acz*cpz;
-  if (d6 >= 0 && d5 <= d6) return cpx*cpx + cpy*cpy + cpz*cpz; // vertex C
-
-  const vc = d1*d4 - d3*d2;
-  if (vc <= 0 && d1 >= 0 && d3 <= 0) { // edge AB
-    const v = d1 / (d1 - d3);
-    const qx = ax+v*abx-px, qy = ay+v*aby-py, qz = az+v*abz-pz;
-    return qx*qx + qy*qy + qz*qz;
-  }
-
-  const vb = d5*d2 - d1*d6;
-  if (vb <= 0 && d2 >= 0 && d6 <= 0) { // edge AC
-    const w = d2 / (d2 - d6);
-    const qx = ax+w*acx-px, qy = ay+w*acy-py, qz = az+w*acz-pz;
-    return qx*qx + qy*qy + qz*qz;
-  }
-
-  const va = d3*d6 - d5*d4;
-  if (va <= 0 && (d4-d3) >= 0 && (d5-d6) >= 0) { // edge BC
-    const w = (d4-d3) / ((d4-d3) + (d5-d6));
-    const qx = bx+w*(cx-bx)-px, qy = by+w*(cy-by)-py, qz = bz+w*(cz-bz)-pz;
-    return qx*qx + qy*qy + qz*qz;
-  }
-
-  // Inside triangle
-  const den = 1 / (va + vb + vc);
-  const v = vb*den, w = vc*den;
-  const qx = ax+abx*v+acx*w-px, qy = ay+aby*v+acy*w-py, qz = az+abz*v+acz*w-pz;
-  return qx*qx + qy*qy + qz*qz;
-}
-
-/**
- * BFS-along-adjacency circle brush (after PrusaSlicer's TriangleSelector).
- *
- * Starts at `seedTriIdx`, walks the mesh's neighbor graph, and invokes
- * cb(triIdx) for every triangle that:
- *   1. has at least one part inside the brush "cylinder" (the projection of
- *      a 3D distance-to-triangle test onto the plane perpendicular to
- *      `viewDir`), AND
- *   2. is reachable without crossing any back-facing triangle.
- *
- * Back-face culling at the BFS expansion step is what makes this both fast
- * and correct: the walk can't tunnel through a thin shell to its hidden
- * other side because the connecting wall faces away from the camera. Work
- * is bounded by the painted area, not the mesh size — no spatial index
- * required.
- */
-function bfsBrushSelect(seedTriIdx, hitPt, r2, viewDir, cb) {
-  const usePrecision = precisionMaskingEnabled && precisionGeometry;
-  const adjacency  = usePrecision ? precisionAdjacency  : triangleAdjacency;
-  const faceNormals = usePrecision ? precisionFaceNormals : triangleFaceNormals;
-  const geo        = usePrecision ? precisionGeometry   : currentGeometry;
-  if (!adjacency || !faceNormals || !geo || seedTriIdx < 0 || seedTriIdx >= adjacency.length) return;
-  const pos = geo.attributes.position;
-
-  const vdx = viewDir.x, vdy = viewDir.y, vdz = viewDir.z;
-  const hx  = hitPt.x,   hy  = hitPt.y,   hz  = hitPt.z;
-
-  const visited = new Uint8Array(adjacency.length);
-  visited[seedTriIdx] = 1;
-  const queue = [seedTriIdx];
-  let head = 0;
-
-  while (head < queue.length) {
-    const cur = queue[head++];
-    const i3 = cur * 3;
-
-    // Inside-test: project each vertex onto the plane through hitPt
-    // perpendicular to viewDir, then take 3D point-to-triangle distance to
-    // the projected triangle (equivalent to 2D screen-space disk in world
-    // units). Any triangle with at least partial overlap → cb + expand.
-    const ax = pos.getX(i3),     ay = pos.getY(i3),     az = pos.getZ(i3);
-    const bx = pos.getX(i3 + 1), by = pos.getY(i3 + 1), bz = pos.getZ(i3 + 1);
-    const cx = pos.getX(i3 + 2), cy = pos.getY(i3 + 2), cz = pos.getZ(i3 + 2);
-
-    const da = (ax - hx) * vdx + (ay - hy) * vdy + (az - hz) * vdz;
-    const db = (bx - hx) * vdx + (by - hy) * vdy + (bz - hz) * vdz;
-    const dc = (cx - hx) * vdx + (cy - hy) * vdy + (cz - hz) * vdz;
-
-    const d2 = distSqPointToTri(
-      hx, hy, hz,
-      ax - da * vdx, ay - da * vdy, az - da * vdz,
-      bx - db * vdx, by - db * vdy, bz - db * vdz,
-      cx - dc * vdx, cy - dc * vdy, cz - dc * vdz
-    );
-    if (d2 > r2) continue; // outside cylinder — don't paint, don't expand
-
-    cb(cur);
-
-    const nbrs = adjacency[cur];
-    if (!nbrs) continue;
-    for (let k = 0; k < nbrs.length; k++) {
-      const nb = nbrs[k].neighbor;
-      if (visited[nb]) continue;
-      visited[nb] = 1;
-      // Cull back-facing neighbors: front-facing means normal opposes view dir
-      // (their dot with viewDir is negative). Eq-zero (perpendicular) also
-      // culled — that's the seam at the silhouette where BFS should stop.
-      const nbi = nb * 3;
-      const dotN = faceNormals[nbi]   * vdx
-                 + faceNormals[nbi+1] * vdy
-                 + faceNormals[nbi+2] * vdz;
-      if (dotN >= 0) continue;
-      queue.push(nb);
-    }
-  }
-}
-
 const _viewDirScratch = new THREE.Vector3();
 function _viewDirFor(hitPt) {
-  return _viewDirScratch.subVectors(hitPt, getCamera().position).normalize();
+  const cam = getCamera();
+  // An orthographic camera looks along its axis everywhere; the ray from its
+  // position only matches on screen centre and skews the brush disk elsewhere
+  // (strongly at grazing angles, where the circle smeared into an ellipse).
+  if (cam.isOrthographicCamera) return cam.getWorldDirection(_viewDirScratch);
+  return _viewDirScratch.subVectors(hitPt, cam.position).normalize();
 }
 
-function _paintSingleHit(hit, mesh) {
-  const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
-  if (usePrecision) {
-    if (brushIsRadius) {
-      const r2 = brushRadius * brushRadius;
-      bfsBrushSelect(hit.faceIndex, hit.point, r2, _viewDirFor(hit.point), t => {
-        if (eraseMode) precisionExcludedFaces.delete(t); else precisionExcludedFaces.add(t);
-      });
-    } else {
-      const precIdx = hit.faceIndex;
-      if (eraseMode) precisionExcludedFaces.delete(precIdx); else precisionExcludedFaces.add(precIdx);
+// ── Surface paint: the paint tree ─────────────────────────────────────────────
+
+/** A fresh paint tree over currentGeometry; every layer gets a slot. */
+function _createPaintTree(adjData) {
+  paintTree = new PaintTree({
+    positions: currentGeometry.attributes.position.array,
+    vertId: adjData.vertId, vertCount: adjData.vertCount,
+    adjacency: adjData.adjacency, faceNormals: adjData.faceNormals,
+  });
+  for (const L of layers) paintTree.addLayer(L.id);
+  _dropPaintGeometry();
+}
+
+/**
+ * Carry the paint onto re-welded vertex ids of the SAME triangles (rotation,
+ * place on face): serialize with per-leaf-corner coverage, rebuild on the
+ * new positions, replay. Only a changed triangle count defeats this.
+ */
+function _rebuildPaintTreeKeepingPaint(adjData) {
+  const data = paintTree ? paintTree.serialize({ leafCov: true }) : null;
+  _createPaintTree(adjData);
+  if (data && !paintTree.deserialize(data)) console.warn('[stlTexturizer] surface paint could not follow the re-welded mesh');
+}
+
+/** Keep the tree's layer slots in step with `layers` (by id). */
+function _syncTreeLayers() {
+  if (!paintTree) return;
+  const ids = new Set(layers.map(L => L.id));
+  for (const tl of [...paintTree.layers]) if (!ids.has(tl.id)) paintTree.removeLayer(tl.id);
+  for (const L of layers) paintTree.addLayer(L.id);
+}
+
+function _activeSlot() { return paintTree ? paintTree.layerSlot(layers[activeLayer].id) : -1; }
+function _slotOf(i)    { return paintTree ? paintTree.layerSlot(layers[i].id) : -1; }
+
+function _dropPaintGeometry() {
+  if (paintGeometry) paintGeometry.dispose();
+  paintGeometry = null;
+  paintFlat = null;
+  _paintStructureVersion = -1;
+  _paintCoverCache = new Map();
+}
+
+/** The mesh shown while painting: the flattened tree when any face is split, else the base mesh. */
+function _paintDisplayGeometry() { return paintGeometry || currentGeometry; }
+
+/** The mesh the viewer currently shows. */
+function _displayGeometry() {
+  return (settings.useDisplacement && dispPreviewGeometry) ? dispPreviewGeometry : _paintDisplayGeometry();
+}
+
+/**
+ * Rebuild the flattened display mesh when the tree's structure changed
+ * (a split or merge). Returns true when the geometry was swapped.
+ */
+function _refreshPaintGeometry() {
+  if (!paintTree || !currentGeometry) return false;
+  if (paintTree.structureVersion === _paintStructureVersion) return false;
+  _paintStructureVersion = paintTree.structureVersion;
+  _paintCoverCache = new Map();
+  if (paintTree.isFlat) {
+    if (paintGeometry) paintGeometry.dispose();
+    paintGeometry = null;
+    paintFlat = null;
+  } else {
+    const flat = paintTree.flatten(currentGeometry.attributes.normal ? currentGeometry.attributes.normal.array : null);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(flat.positions, 3));
+    geo.setAttribute('normal',   new THREE.BufferAttribute(flat.normals, 3));
+    // Flat face normals for the shader's angle masking: a leaf lies in its
+    // parent's plane, so copy the base face's normal instead of recomputing.
+    if (triangleFaceNormals) {
+      const fn = new Float32Array(flat.triCount * 9);
+      for (let t = 0; t < flat.triCount; t++) {
+        const f = flat.faceParentId[t] * 3;
+        const x = triangleFaceNormals[f], y = triangleFaceNormals[f + 1], z = triangleFaceNormals[f + 2];
+        const o = t * 9;
+        fn[o] = x; fn[o + 1] = y; fn[o + 2] = z; fn[o + 3] = x; fn[o + 4] = y; fn[o + 5] = z; fn[o + 6] = x; fn[o + 7] = y; fn[o + 8] = z;
+      }
+      geo.setAttribute('faceNormal', new THREE.Float32BufferAttribute(fn, 3));
+    }
+    _owCarryPlaces(geo, flat.faceParentId);
+    if (paintGeometry) paintGeometry.dispose();
+    paintGeometry = geo;
+    paintFlat = flat;
+  }
+  _falloffDirty = true;
+  if (!(settings.useDisplacement && dispPreviewGeometry)) setMeshGeometry(_paintDisplayGeometry());
+  return true;
+}
+
+/**
+ * Layer paint on a mesh the viewer may show: per-corner paint (0..1, hard
+ * or soft) and per-face hard flag. Cached until the next stroke.
+ */
+function _layerPaintOn(slot, geometry) {
+  if (!paintTree || slot < 0 || !geometry) return { paint: null, hard: null };
+  const key = slot + ':' + (geometry === currentGeometry ? 'base' : geometry === paintGeometry ? 'paint' : geometry === dispPreviewGeometry ? 'disp' : 'x');
+  const hit = _paintCoverCache.get(key);
+  // A stroke only changes the active layer's paint; the others' is valid
+  // until the structure (and with it the flattened mesh) changes.
+  const version = slot === _activeSlot() ? paintTree.paintVersion : -1 - paintTree.structureVersion;
+  if (hit && hit.version === version && hit.geometry === geometry) return hit;
+  let r;
+  if (geometry === paintGeometry && paintFlat) r = paintTree.flatPaint(slot, paintFlat);
+  else if (geometry === currentGeometry) r = paintTree.basePaint(slot);
+  else if (geometry === dispPreviewGeometry && dispPreviewParentMap) r = _sampledPaint(slot, geometry, dispPreviewParentMap);
+  else r = { paint: null, hard: null };
+  r.version = version;
+  r.geometry = geometry;
+  _paintCoverCache.set(key, r);
+  return r;
+}
+
+/** Paint sampled from the tree at every corner of a refinement of the base mesh (3D preview). */
+function _sampledPaint(slot, geometry, parentMap) {
+  const pos = geometry.attributes.position.array;
+  const triCount = parentMap.length;
+  const paint = new Float32Array(triCount * 3);
+  const hard = new Uint8Array(triCount);
+  for (let t = 0; t < triCount; t++) {
+    const f = parentMap[t];
+    let allHard = true;
+    for (let k = 0; k < 3; k++) {
+      const i = t * 3 + k;
+      const v = paintTree.samplePaint(slot, f, pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+      paint[i] = v;
+      if (v < 1) allHard = false;
+    }
+    hard[t] = allHard ? 1 : 0;
+  }
+  return { paint, hard };
+}
+
+/**
+ * Layer i's coverage on `geometry` in shader terms: per-corner 1 = textured
+ * (null = everything textured) and per-face user-mask flag (1 = the face is
+ * hard-masked, i.e. it forms a mask boundary; null = none).
+ */
+function _layerCoverOn(i, geometry) {
+  const includeOnly = i === activeLayer ? selectionMode : !!layers[i].includeOnly;
+  const src = _layerPaintOn(_slotOf(i), geometry);
+  if (src.coverFor === includeOnly && src.cover !== undefined) return { cover: src.cover, hardMasked: src.hardMasked };
+  const { paint, hard } = src;
+  const triCount = geometry.attributes.position.count / 3;
+  if (!paint) {
+    src.coverFor = includeOnly;
+    src.cover = includeOnly ? new Float32Array(triCount * 3) : null;
+    src.hardMasked = includeOnly ? new Uint8Array(triCount).fill(1) : null;
+    return { cover: src.cover, hardMasked: src.hardMasked };
+  }
+  const cover = new Float32Array(paint.length);
+  const hardMasked = new Uint8Array(triCount);
+  if (includeOnly) {
+    for (let k = 0; k < paint.length; k++) cover[k] = paint[k];
+    for (let t = 0; t < triCount; t++) {
+      hardMasked[t] = (!hard[t] && paint[t * 3] === 0 && paint[t * 3 + 1] === 0 && paint[t * 3 + 2] === 0) ? 1 : 0;
     }
   } else {
-    let triIdx = hit.faceIndex;
-    if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
-      triIdx = dispPreviewParentMap[triIdx];
+    for (let k = 0; k < paint.length; k++) cover[k] = 1 - paint[k];
+    hardMasked.set(hard);
+  }
+  src.coverFor = includeOnly; src.cover = cover; src.hardMasked = hardMasked;
+  return { cover, hardMasked };
+}
+
+/** Brush edge limit: r/5 for a hard brush, finer across a soft brush's fade band. */
+function _brushEdgeLimit() {
+  let edge = brushRadius / 5;
+  if (brushHardness < 1) {
+    const band = (1 - brushHardness) * brushRadius;
+    edge = Math.min(edge, Math.max(band / 3, brushRadius / 10));
+  }
+  return Math.max(0.02, edge);
+}
+
+// strokeFrom: previous point of the same stroke — the brush sweeps the
+// segment from there to hit.point, so fast strokes stay continuous.
+function _paintSingleHit(hit, mesh, strokeFrom = null) {
+  if (!paintTree) return;
+  const slot = _activeSlot();
+  const seedFace = _baseFaceOf(hit.faceIndex, mesh.geometry);
+  if (brushIsRadius) {
+    paintTree.paintStroke({
+      slot, seedFace,
+      from: strokeFrom || hit.point, to: hit.point,
+      radius: brushRadius, view: _viewDirFor(hit.point),
+      hardness: brushHardness, erase: eraseMode,
+      edgeLimit: _brushEdgeLimit(), whole: !brushPrecision,
+    });
+  } else {
+    paintTree.paintFaces(slot, [seedFace], eraseMode);
+  }
+}
+
+/** Legacy project mask (face list + soft corners on the base mesh) → tree paint. */
+function _importLegacyMask(slot, mask) {
+  if (!paintTree || slot < 0 || !mask) return;
+  const triCount = paintTree.baseTriCount;
+  const faces = (Array.isArray(mask.excluded) ? mask.excluded : []).filter(i => Number.isInteger(i) && i >= 0 && i < triCount);
+  if (faces.length) paintTree.paintFaces(slot, faces, false);
+  const soft = mask.soft;
+  if (soft && Array.isArray(soft.corners) && Array.isArray(soft.values)) {
+    const n = Math.min(soft.corners.length, soft.values.length);
+    const corners = [], values = [];
+    for (let j = 0; j < n; j++) {
+      const c = soft.corners[j], v = soft.values[j];
+      if (Number.isInteger(c) && c >= 0 && c < triCount * 3 && v > 0) { corners.push(c); values.push(Math.min(1, v)); }
     }
-    if (brushIsRadius) {
-      const r2 = brushRadius * brushRadius;
-      bfsBrushSelect(triIdx, hit.point, r2, _viewDirFor(hit.point), t => {
-        if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
-      });
-    } else {
-      if (eraseMode) excludedFaces.delete(triIdx); else excludedFaces.add(triIdx);
+    if (corners.length) paintTree.setBaseCoverage(slot, corners, values);
+  }
+}
+
+// ── Texture layers: data model ───────────────────────────────────────────────
+
+/** The active layer's per-layer settings as a plain snapshot (see LAYER_KEYS). */
+function _layerSettingsSnapshot() {
+  const o = {};
+  for (const k of LAYER_KEYS) o[k] = settings[k];
+  o.scaleUnit = 'mm';   // absolute-mm marker, so applySettingsSnapshot never migrates it
+  return o;
+}
+
+/**
+ * A layer record. Its settings / map / mask fields are only current while
+ * the layer is NOT the active one — the active layer's truth is the live
+ * sidebar state, copied in by _storeActiveLayer.
+ */
+function _newLayer(opts = {}) {
+  return {
+    id: ++_layerSeq,
+    settings: _layerSettingsSnapshot(),
+    mapName:  activeMapEntry?.name ?? null,
+    customId: activeMapEntry?.customId ?? null,
+    mapEntry: activeMapEntry,
+    // Mask mode: false = painted surfaces are excluded (everything else
+    // textured); true = Include Only, painted surfaces are the textured ones.
+    // The paint itself lives in paintTree under this layer's id.
+    includeOnly: false,
+    maskModeChosen: false,
+    visible: true,
+    blendAdd: false,   // add to the layers below instead of covering them
+    ...opts,
+  };
+}
+
+/** Copy the live sidebar state into layers[activeLayer]. */
+function _storeActiveLayer() {
+  const L = layers[activeLayer];
+  if (!L) return;
+  L.settings = _layerSettingsSnapshot();
+  L.mapEntry = activeMapEntry;
+  L.mapName  = activeMapEntry?.name ?? null;
+  L.customId = activeMapEntry?.customId ?? null;
+  L.includeOnly = selectionMode;
+  L.maskModeChosen = maskModeChosen;
+}
+
+/** True when some layer other than the active one still uses this map entry. */
+function _mapEntryInUse(entry) {
+  if (!entry) return false;
+  return layers.some((L, i) => i !== activeLayer && L.mapEntry === entry);
+}
+
+/**
+ * Make layers[idx] the active layer: store the live state, then load the
+ * other layer's settings, map and mask into the sidebar.
+ */
+function _activateLayer(idx, { commitUndo = true } = {}) {
+  if (idx === activeLayer || idx < 0 || idx >= layers.length) return;
+  _flushUndoCapture();
+  if (exclusionTool) setExclusionTool(null);
+  _storeActiveLayer();
+  activeLayer = idx;
+  _undoApplyDepth++;
+  try { _materialiseActiveLayer(); } finally { _undoApplyDepth--; }
+  _renderLayerStrip();
+  updatePreview();
+  _autoSaveSettings();
+  if (commitUndo) _commitUndoCapture();
+}
+
+/** Load layers[activeLayer] into the live sidebar state. */
+function _materialiseActiveLayer() {
+  const L = layers[activeLayer];
+  if (!L) return;
+  const pausedBefore = _autoSavePaused;
+  _autoSavePaused = true;
+  try {
+    applySettingsSnapshot(L.settings);
+    _applyLayerMap(L);
+    // The layer's paint is already in the tree; only the mode changes.
+    setSelectionMode(!!L.includeOnly, { clear: false });
+    maskModeChosen = !!L.maskModeChosen || selectionMode;
+    updateMaskModeButtons();
+    _falloffDirty = true;
+    refreshExclusionOverlay();
+  } finally {
+    _autoSavePaused = pausedBefore;
+  }
+}
+
+/** Activate a layer's map without touching its settings (no preset defaults). */
+function _applyLayerMap(L) {
+  if (L.mapEntry && L.mapEntry.texture) {
+    if (L.mapEntry.isCustom) { _useCustomMap(L.mapEntry, false); return; }
+    if (_selectPresetByName(L.mapEntry.name)) return;
+  }
+  if (L.customId) { selectCustomTexture(L.customId, false); return; }
+  if (L.mapName && _selectPresetByName(L.mapName)) return;
+  activeMapEntry = null;
+  updatePreview();
+}
+
+/** Add a layer above the current ones (same texture and settings), in Include Only mode with nothing selected. */
+function _addLayer() {
+  if (layers.length >= MAX_LAYERS) return;
+  _flushUndoCapture();
+  if (exclusionTool) setExclusionTool(null);
+  _storeActiveLayer();
+  layers.push(_newLayer({ includeOnly: true, maskModeChosen: true }));
+  activeLayer = layers.length - 1;
+  _syncTreeLayers();
+  _undoApplyDepth++;
+  try { _materialiseActiveLayer(); } finally { _undoApplyDepth--; }
+  // A fresh layer covers nothing yet: hand the user the fill tool so the
+  // first click on a face gives the layer its surface.
+  maskModeChosen = true;
+  updateMaskModeButtons();
+  if (!exclusionTool) setExclusionTool('bucket');
+  _renderLayerStrip();
+  updatePreview();
+  _autoSaveSettings();
+  _commitUndoCapture();
+}
+
+function _removeLayer(idx) {
+  if (layers.length <= 1 || idx < 0 || idx >= layers.length) return;
+  _flushUndoCapture();
+  if (idx === activeLayer) {
+    if (exclusionTool) setExclusionTool(null);
+    layers.splice(idx, 1);
+    activeLayer = Math.min(idx, layers.length - 1);
+    _syncTreeLayers();
+    _undoApplyDepth++;
+    try { _materialiseActiveLayer(); } finally { _undoApplyDepth--; }
+  } else {
+    layers.splice(idx, 1);
+    if (idx < activeLayer) activeLayer--;
+    _syncTreeLayers();
+  }
+  _refreshPaintGeometry();
+  _renderLayerStrip();
+  updatePreview();
+  _autoSaveSettings();
+  _commitUndoCapture();
+}
+
+function _setLayerVisible(idx, visible) {
+  const L = layers[idx];
+  if (!L || L.visible === visible) return;
+  _flushUndoCapture();
+  L.visible = visible;
+  _falloffDirty = true;
+  _renderLayerStrip();
+  updatePreview();
+  _autoSaveSettings();
+  _commitUndoCapture();
+}
+
+function _setLayerBlendAdd(idx, blendAdd) {
+  const L = layers[idx];
+  if (!L || L.blendAdd === blendAdd) return;
+  _flushUndoCapture();
+  L.blendAdd = blendAdd;
+  _renderLayerStrip();
+  updatePreview();
+  _autoSaveSettings();
+  _commitUndoCapture();
+}
+
+/**
+ * Layers that take part in the preview, in composition order: every visible
+ * layer, plus the active one even while hidden (its mask must stay
+ * paintable). Capped at the shader's MAX_LAYERS; each gets one channel of
+ * the layerMask / layerFalloff attributes.
+ */
+function _layerSlots() {
+  const slots = [];
+  for (let i = 0; i < layers.length && slots.length < MAX_LAYERS; i++) {
+    const isActive = i === activeLayer;
+    if (!layers[i].visible && !isActive) continue;
+    slots.push({ index: i, isActive });
+  }
+  return slots;
+}
+
+/** Per-layer material parameters for the preview shader (see previewMaterial.js updateMaterial). */
+function _previewLayers() {
+  const slots = _layerSlots();
+  const list = [];
+  let activeIdx = -1;
+  for (const { index, isActive } of slots) {
+    const L = layers[index];
+    const s = isActive ? settings : L.settings;
+    const entry = isActive ? getEffectiveMapEntry()
+                           : _effectiveMapFor(L.mapEntry, s.textureSmoothing, s.invertTexture);
+    const tw = entry?.width ?? 1, th = entry?.height ?? 1;
+    const tmax = Math.max(tw, th, 1);
+    if (isActive) activeIdx = list.length;
+    list.push({
+      texture: entry?.texture ?? null,
+      mappingMode: s.mappingMode, scaleU: s.scaleU, scaleV: s.scaleV,
+      offsetU: s.offsetU, offsetV: s.offsetV, rotation: s.rotation,
+      // A hidden active layer keeps its slot (for painting) but no relief;
+      // a map that is still loading has nothing to show yet either.
+      amplitude: (L.visible && entry) ? s.amplitude : 0,
+      symmetricDisplacement: s.symmetricDisplacement,
+      mappingBlend: s.mappingBlend, seamBandWidth: s.seamBandWidth, capAngle: s.capAngle,
+      cylinderCenterX: s.cylinderCenterX, cylinderCenterY: s.cylinderCenterY, cylinderRadius: s.cylinderRadius,
+      textureAspectU: tmax / Math.max(tw, 1), textureAspectV: tmax / Math.max(th, 1),
+      blendAdd: index > 0 && L.blendAdd,
+      stampOnce: s.stampOnce, stampSide: s.stampSide,
+      stampCenterX: s.stampCenterX, stampCenterY: s.stampCenterY, stampCenterZ: s.stampCenterZ,
+      stampNormalX: s.stampNormalX, stampNormalY: s.stampNormalY, stampNormalZ: s.stampNormalZ,
+      mapWidth: tw, mapHeight: th,
+      boundaryFalloff: s.boundaryFalloff, boundaryFalloffCurve: s.boundaryFalloffCurve,
+      stampDepth: _stampDepthFor(index, _stampFrameFor(index)),
+      outlineWrap: _owReadyOn(_displayGeometry()) ? _owWrap : null,
+    });
+  }
+  return { list, activeIdx, count: slots.length };
+}
+
+/**
+ * Per-vertex exclusion weights for subdivision / preserve-untextured: 1.0 on
+ * faces that NO visible layer textures (the hard masks' intersection), plus
+ * the angle masks.
+ */
+function _unionFaceWeights(hardFlags, geometry, withAngle) {
+  const triCount = geometry.attributes.position.count / 3;
+  const excluded = new Set();
+  if (hardFlags.length && hardFlags.every(h => h)) {
+    for (let t = 0; t < triCount; t++) {
+      let all = true;
+      for (const h of hardFlags) { if (!h[t]) { all = false; break; } }
+      if (all) excluded.add(t);
     }
   }
+  if (!withAngle) return excluded;
+  const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
+  if (excluded.size === 0 && !hasAngleMask) return null;
+  return buildCombinedFaceWeights(geometry, excluded, false, settings, null);
+}
+
+/**
+ * Inputs for the export/bake pipeline. The mesh is the flattened paint tree
+ * (the base mesh when no face is split). One visible layer that is the
+ * active one, on an unsplit mesh, goes through the original single-texture
+ * path unchanged; anything else becomes the layered path (exportPipeline.js
+ * `layers`).
+ */
+function _pipelineInputs() {
+  const parts = [];
+  for (let i = 0; i < layers.length; i++) {
+    const L = layers[i];
+    if (!L.visible) continue;
+    const isActive = i === activeLayer;
+    const s = isActive ? settings : L.settings;
+    const entry = isActive ? getEffectiveMapEntry()
+                           : _effectiveMapFor(L.mapEntry, s.textureSmoothing, s.invertTexture);
+    if (!entry || !entry.imageData) continue;
+    parts.push({ L, i, isActive, s, entry });
+  }
+  _refreshPaintGeometry();
+  const split = !!(paintTree && !paintTree.isFlat && paintFlat);
+  const positions = split ? paintFlat.positions : currentGeometry.attributes.position.array;
+  const geometry = split ? paintGeometry : currentGeometry;
+
+  // A stamp always takes the layered path: the faces it can't reach join its
+  // hard mask there, so they are neither refined nor (with Preserve
+  // Untextured) touched by regularize and decimation.
+  if (!split && parts.length === 1 && parts[0].isActive && !isStampActive(parts[0].s)) {
+    // Legacy inputs from the root paint: hard faces as the excluded set, soft
+    // coverage on the welded base vertices.
+    const tl = paintTree ? paintTree.layers[_activeSlot()] : null;
+    const excluded = new Set();
+    let softValues = null;
+    if (tl) {
+      for (let f = 0; f < paintTree.baseTriCount; f++) if (tl.state[f]) excluded.add(f);
+      if (tl.cov) {
+        const sv = tl.cov.subarray(0, paintTree.baseVertCount);
+        for (let v = 0; v < sv.length; v++) if (sv[v] > 0) { softValues = sv; break; }
+      }
+    }
+    const vertId = paintTree ? paintTree.vertId : null;
+    const softFaces = (softValues && selectionMode) ? softPaintedFaces(vertId, softValues) : null;
+    const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
+    const faceWeights = (excluded.size > 0 || selectionMode || hasAngleMask)
+      ? buildCombinedFaceWeights(currentGeometry, excluded, selectionMode, settings, softFaces)
+      : null;
+    const softExclude = softValues ? buildSoftExclusion(vertId, softValues, excluded, selectionMode) : null;
+    const e = parts[0].entry;
+    return { positions, faceWeights, softExclude, imageData: e.imageData, imgWidth: e.width, imgHeight: e.height, layers: null, label: _mapLabel(activeMapEntry) };
+  }
+
+  const hardFlags = [];
+  const out = [];
+  for (const { L, i, s, entry } of parts) {
+    const coverOn = _layerCoverOn(i, geometry);
+    const cover = coverOn.cover;
+    let hardMasked = coverOn.hardMasked;
+    const frame = _stampFrameFor(i);
+    if (frame) {
+      // Occlusion: only the surface nearest the stamp gets it.
+      frame.depth = buildStampDepth(positions, frame);
+      // A copy — _layerCoverOn's flags are cached.
+      const untouched = stampUntouchedFaces(positions, frame);
+      if (hardMasked) for (let t = 0; t < untouched.length; t++) untouched[t] |= hardMasked[t];
+      hardMasked = untouched;
+    }
+    hardFlags.push(hardMasked);
+    let exclude = null;
+    if (cover) {
+      exclude = new Float32Array(cover.length);
+      for (let k = 0; k < cover.length; k++) exclude[k] = 1 - cover[k];
+    }
+    out.push({
+      imageData: entry.imageData, imgWidth: entry.width, imgHeight: entry.height,
+      settings: _owSettings({ ...settings, ...s }),
+      exclude, hardFaces: hardMasked,
+      blendAdd: L !== layers[0] && L.blendAdd,
+      stampDepth: frame ? frame.depth : null,
+    });
+  }
+  const faceWeights = _unionFaceWeights(hardFlags, geometry, true);
+  return {
+    positions, faceWeights, softExclude: null,
+    imageData: null, imgWidth: 0, imgHeight: 0,
+    layers: out,
+    label: parts.length ? (parts.length === 1 ? _mapLabel(parts[0].entry) : `${parts.length}layers`) : 'layers',
+  };
+}
+
+function _mapLabel(entry) {
+  if (!entry) return 'texture';
+  return entry.isCustom ? 'custom' : String(entry.name).replace(/\s+/g, '-');
+}
+
+/** True when the pipeline has something to texture with. */
+function _hasTexturedLayer() {
+  return layers.some((L, i) => L.visible && (i === activeLayer ? !!activeMapEntry : !!L.mapEntry));
+}
+
+// ── Texture layers: strip UI ─────────────────────────────────────────────────
+
+
+/** Rebuild the layer rows (cheap: at most MAX_LAYERS rows; skipped when nothing changed). */
+function _renderLayerStrip() {
+  if (!layerList) return;
+  const sig = layers.map((L, i) => {
+    const entry = i === activeLayer ? activeMapEntry : L.mapEntry;
+    return `${L.id}:${entry?.name ?? ''}:${entry?.customId ?? ''}:${L.visible ? 1 : 0}:${L.blendAdd ? 1 : 0}`;
+  }).join('|') + `#${activeLayer}#${getLang()}`;
+  if (sig === _layerStripSig) return;
+  _layerStripSig = sig;
+
+  layerList.innerHTML = '';
+  layers.forEach((L, i) => {
+    const isActive = i === activeLayer;
+    const entry = isActive ? activeMapEntry : L.mapEntry;
+    const row = document.createElement('div');
+    row.className = 'layer-row' + (isActive ? ' active' : '') + (L.visible ? '' : ' hidden-layer');
+    row.dataset.idx = String(i);
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    row.title = t('layers.rowTitle', { n: i + 1 });
+
+    const thumb = document.createElement('canvas');
+    thumb.className = 'layer-thumb';
+    thumb.width = thumb.height = 28;
+    if (entry?.fullCanvas) {
+      const ctx = thumb.getContext('2d');
+      const sw = entry.fullCanvas.width, sh = entry.fullCanvas.height;
+      const sc = Math.max(28 / sw, 28 / sh);
+      const dw = sw * sc, dh = sh * sc;
+      ctx.drawImage(entry.fullCanvas, (28 - dw) / 2, (28 - dh) / 2, dw, dh);
+    }
+    row.appendChild(thumb);
+
+    const name = document.createElement('span');
+    name.className = 'layer-name';
+    name.textContent = entry?.name ? `${i + 1} · ${entry.name}` : t('layers.name', { n: i + 1 });
+    row.appendChild(name);
+
+    if (i > 0) {
+      const blend = document.createElement('button');
+      blend.type = 'button';
+      blend.className = 'layer-btn layer-blend' + (L.blendAdd ? ' add' : '');
+      blend.textContent = L.blendAdd ? t('layers.blendAdd') : t('layers.blendCover');
+      blend.title = L.blendAdd ? t('layers.blendAddTitle') : t('layers.blendCoverTitle');
+      blend.addEventListener('click', (e) => { e.stopPropagation(); _setLayerBlendAdd(i, !L.blendAdd); });
+      row.appendChild(blend);
+    }
+
+    const eye = document.createElement('button');
+    eye.type = 'button';
+    eye.className = 'layer-btn layer-eye';
+    eye.setAttribute('aria-pressed', String(L.visible));
+    eye.title = L.visible ? t('layers.hide') : t('layers.show');
+    eye.innerHTML = L.visible
+      ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>'
+      : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.9 17.9A10.9 10.9 0 0 1 12 19c-7 0-11-7-11-7a20 20 0 0 1 5.1-5.9M9.9 4.2A10 10 0 0 1 12 4c7 0 11 7 11 7a20 20 0 0 1-3.2 4.2"/><path d="M14.1 14.1a3 3 0 1 1-4.2-4.2"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+    eye.addEventListener('click', (e) => { e.stopPropagation(); _setLayerVisible(i, !L.visible); });
+    row.appendChild(eye);
+
+    if (layers.length > 1) {
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'layer-btn layer-del';
+      del.title = t('layers.remove');
+      del.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      del.addEventListener('click', (e) => { e.stopPropagation(); _removeLayer(i); });
+      row.appendChild(del);
+    }
+
+    row.addEventListener('click', () => _activateLayer(i));
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _activateLayer(i); }
+    });
+    layerList.appendChild(row);
+  });
+  if (layerAddBtn) {
+    const full = layers.length >= MAX_LAYERS;
+    layerAddBtn.disabled = full;
+    layerAddBtn.title = full ? t('layers.max', { n: MAX_LAYERS }) : t('layers.addTitle');
+  }
+}
+
+/** Show the hardness core as a dashed inner ring on the brush cursor. */
+function updateBrushCursorHardness() {
+  const hardness = brushPrecision ? brushHardness : 1;
+  brushCursorEl.classList.toggle('soft', hardness < 1 && hardness > 0);
+  brushCursorEl.style.setProperty('--brush-hardness', String(hardness));
 }
 
 function _paintLineBetween(from, to, mesh) {
@@ -2022,6 +3063,7 @@ function _paintLineBetween(from, to, mesh) {
   const steps = Math.max(Math.ceil(dist / step), 1);
   const dir = new THREE.Vector3().subVectors(to, from);
   const cam = getCamera();
+  let prevPt = null; // soft brush: sweep between consecutive samples
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
     const pt = new THREE.Vector3().lerpVectors(from, to, t);
@@ -2030,7 +3072,8 @@ function _paintLineBetween(from, to, mesh) {
     _raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), cam);
     const hits = _raycaster.intersectObject(mesh);
     const hit = getFrontFaceHit(hits, mesh);
-    if (hit) _paintSingleHit(hit, mesh);
+    if (hit) _paintSingleHit(hit, mesh, prevPt);
+    prevPt = hit ? hit.point : null;
   }
 }
 
@@ -2040,17 +3083,35 @@ function paintAt(e) {
   _raycaster.setFromCamera(_canvasNDC(e), getCamera());
   const hits = _raycaster.intersectObject(mesh);
   const hit = getFrontFaceHit(hits, mesh);
-  if (!hit) return;
+  // Off the model: break the stroke so the soft brush doesn't sweep a band
+  // across the surface between where the cursor left and re-entered.
+  if (!hit) { _strokeLastPoint = null; return; }
 
   // Shift+click: draw line from last paint point to current
   if (e.ctrlKey && _lastPaintHitPoint) {
     _paintLineBetween(_lastPaintHitPoint, hit.point, mesh);
     _clearShiftLinePreview();
   } else {
-    _paintSingleHit(hit, mesh);
+    _paintSingleHit(hit, mesh, _strokeLastPoint);
   }
 
   _lastPaintHitPoint = hit.point.clone();
+  _strokeLastPoint = _lastPaintHitPoint;
+  _schedulePaintRefresh();
+}
+
+// Several mouse events can land in one frame; the tree takes every one of
+// them, the display (flatten + attributes) is refreshed once per frame.
+let _paintRefreshRaf = 0;
+function _schedulePaintRefresh() {
+  if (_paintRefreshRaf) return;
+  _paintRefreshRaf = requestAnimationFrame(() => {
+    _paintRefreshRaf = 0;
+    refreshExclusionOverlay();
+  });
+}
+function _flushPaintRefresh() {
+  if (_paintRefreshRaf) { cancelAnimationFrame(_paintRefreshRaf); _paintRefreshRaf = 0; }
   refreshExclusionOverlay();
 }
 
@@ -2095,19 +3156,453 @@ function _clearShiftLinePreview() {
   }
 }
 
+// ── Stamp placement ──────────────────────────────────────────────────────────
+// A stamp layer (settings.stampOnce; surface normal, planar or cylindrical
+// mode) shows its image once. Pressing on its patch grabs it: drag to slide
+// it along the surface. "Position on model" (or turning the stamp on)
+// instead centres it on the next press anywhere on the model — Surface
+// normal then faces the surface there, planar modes take the axis and side
+// of the clicked face. After either press the mouse wheel resizes the
+// stamp, until the next press that isn't on the stamp (orbit, pan) hands the
+// wheel back to zooming.
+
+// Stamps work with these projections only (mapping.js isStampActive).
+const STAMP_MODES = new Set([7, 0, 1, 2, 3]);   // Surface normal, Planar XY / XZ / YZ, Cylindrical
+let _modeBeforeStamp = null;   // the tiling projection Stamp mode switched away from, restored when it ends
+
+// A Surface-normal stamp faces the dominant orientation of the surface
+// within this fraction of its shorter side — its inscribed circle — so small
+// features and facets under it don't tip it (mapping.js stampSurfaceAt).
+const STAMP_NORMAL_RADIUS = 0.5;
+
+/**
+ * Stamp mode on/off. Turning it on from a projection that can't stamp
+ * (Triplanar, Cubic, Spherical, Outline wrap) switches to Surface normal and goes
+ * straight to placing; turning it off brings that projection back (or
+ * Triplanar, since Surface normal only exists for stamps).
+ */
+function _setStampMode(on) {
+  if (on) {
+    if (!STAMP_MODES.has(settings.mappingMode)) {
+      _modeBeforeStamp = settings.mappingMode;
+      mappingSelect.value = '7';
+      mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    settings.stampOnce = true;
+  } else {
+    settings.stampOnce = false;
+    updateStampUIVisibility();   // re-enables every projection before restoring one
+    if (_modeBeforeStamp == null && settings.mappingMode === 7) _modeBeforeStamp = 5;
+    if (_modeBeforeStamp != null) {
+      mappingSelect.value = String(_modeBeforeStamp);
+      _modeBeforeStamp = null;
+      mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+  updateStampUIVisibility();
+  toggleStampPlace(isStampActive(settings) && !!currentGeometry);
+  // Back to tiling around a cylinder: re-snap to a seamless wrap.
+  if (settings.snapSeamlessWrap && _isSeamlessWrapMode()) _applyScaleU(settings.scaleU);
+  updatePreview();
+  _autoSaveSettings();   // a button click isn't an input/change event
+}
+
+/** Stamp UI follows the mode: button state, projections it can use, placement and no offsets or seam smoothing while on. */
+function updateStampUIVisibility() {
+  const on = isStampActive(settings);
+  stampModeBtn.classList.toggle('active', !!settings.stampOnce);
+  stampModeBtn.setAttribute('aria-pressed', String(!!settings.stampOnce));
+  for (const opt of mappingSelect.options) {
+    const v = parseInt(opt.value, 10);
+    opt.disabled = settings.stampOnce ? !STAMP_MODES.has(v) : v === 7;   // Surface normal: stamps only
+    if (v === 7) opt.hidden = !settings.stampOnce;
+  }
+  stampPlaceRow.style.display = on ? '' : 'none';
+  stampHint.style.display = on ? '' : 'none';
+  offsetUSlider.closest('.form-row').style.display = on ? 'none' : '';
+  offsetVSlider.closest('.form-row').style.display = on ? 'none' : '';
+  seamBandWidthSlider.closest('.form-row').style.display = on ? 'none' : '';   // no projection seams on a stamp
+  cylinderSnapRow.style.display = _isSeamlessWrapMode() ? '' : 'none';
+  if (!on) _setStampWheelArmed(false);
+}
+
+/** While armed the hint lights up, so it's clear why the wheel resizes instead of zooming. */
+function _setStampWheelArmed(armed) {
+  _stampWheelArmed = armed;
+  stampHint.classList.toggle('armed', armed);
+}
+
+/** Leaving placement (Escape, another tool, a new model) also gives the wheel back to zooming. */
+function toggleStampPlace(active) {
+  stampPlaceActive = active;
+  stampPlaceBtn.classList.toggle('active', active);
+  if (active) {
+    if (exclusionTool) setExclusionTool(null);
+    if (placeOnFaceActive) togglePlaceOnFace(false);
+    if (rotateActive) toggleRotateMode(false);
+    canvas.style.cursor = 'crosshair';
+  } else {
+    if (_stampDragging) {
+      _stampDragging = false; _stampGrab = null; _stampFastDepth = false;
+      getControls().enabled = true;
+      _syncPreviewMaterial();
+      _autoSaveSettings();
+    }
+    _setStampWheelArmed(false);
+    if (!exclusionTool && !placeOnFaceActive) canvas.style.cursor = '';
+  }
+  setSectionHandlesLocked(!!exclusionTool || placeOnFaceActive || active);
+}
+
+/**
+ * The model point under the cursor (model space), its base face's normal and
+ * that point dropped onto the base face's plane (the preview may be
+ * displaced), or null on a miss.
+ */
+function _stampRaycast(e) {
+  const mesh = getCurrentMesh();
+  if (!mesh) return null;
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hit = getFrontFaceHit(_raycaster.intersectObject(mesh), mesh);
+  if (!hit) return null;
+  // The base face's normal, not the (possibly displaced) preview face's.
+  const base = _baseFaceOf(hit.faceIndex, mesh.geometry);
+  const fn = triangleFaceNormals;
+  const n = (fn && base >= 0 && base * 3 + 2 < fn.length)
+    ? new THREE.Vector3(fn[base * 3], fn[base * 3 + 1], fn[base * 3 + 2])
+    : hit.face.normal.clone();
+  const p = mesh.worldToLocal(hit.point.clone());
+  const pos = currentGeometry.attributes.position.array;
+  const onBase = p.clone();
+  if (base >= 0 && base * 9 + 8 < pos.length) {
+    const o = base * 9;
+    onBase.addScaledVector(n, -((p.x - pos[o]) * n.x + (p.y - pos[o + 1]) * n.y + (p.z - pos[o + 2]) * n.z));
+  }
+  return { p, n, onBase };
+}
+
+/** Layer i's stamp placement as the preview and export resolve it, or null when it isn't a stamp. */
+function _stampFrameFor(i) {
+  const L = layers[i];
+  if (!currentBounds || !L) return null;
+  const isActive = i === activeLayer;
+  const s = isActive ? settings : L.settings;
+  if (!isStampActive(s)) return null;
+  const entry = isActive ? getEffectiveMapEntry() : _effectiveMapFor(L.mapEntry, s.textureSmoothing, s.invertTexture);
+  const tw = entry?.width ?? 1, th = entry?.height ?? 1;
+  const tmax = Math.max(tw, th, 1);
+  return stampFrame({ ...s, textureAspectU: tmax / Math.max(tw, 1), textureAspectV: tmax / Math.max(th, 1) }, currentBounds);
+}
+
+/**
+ * The active layer's stamp placement with its depth map, so a hidden part
+ * of the footprint doesn't count as the patch — or null when it isn't a
+ * visible stamp.
+ */
+function _activeStampFrame() {
+  if (!layers[activeLayer]?.visible) return null;
+  const frame = _stampFrameFor(activeLayer);
+  if (frame) frame.depth = _stampDepthFor(activeLayer, frame)?.depth ?? null;
+  return frame;
+}
+
+// Preview depth maps per layer id: { key, depth, texture }. Rebuilt when the
+// placement or the base mesh changes — per frame while dragging or wheel-
+// resizing, so those use a coarser map (_stampFastDepth) and the full one is
+// rebuilt when the gesture ends.
+const _stampDepthCache = new Map();
+const STAMP_DEPTH_RES_FAST = 192;
+let _stampFastDepth = false;
+let _stampFastTimer = null;
+
+/** Layer i's stamp depth map on the base mesh, as data and as a float texture for the preview shader. */
+function _stampDepthFor(i, frame) {
+  if (!frame || !currentGeometry) return null;
+  const L = layers[i];
+  const pa = currentGeometry.attributes.position;
+  const res = _stampFastDepth ? STAMP_DEPTH_RES_FAST : STAMP_DEPTH_RES;
+  const key = [currentGeometry.uuid, pa.version, pa.count, res, frame.mode, frame.side, frame.cx, frame.cy, frame.cz,
+    frame.nx, frame.ny, frame.nz, frame.sizeU, frame.sizeV, frame.cosR, frame.sinR, frame.ccx, frame.ccy, frame.r].join(',');
+  const cached = _stampDepthCache.get(L.id);
+  if (cached && cached.key === key) return cached;
+  const depth = buildStampDepth(pa.array, frame, res);
+  const texture = new THREE.DataTexture(depth.data, depth.nu, depth.nv, THREE.RedFormat, THREE.FloatType);
+  texture.minFilter = texture.magFilter = THREE.NearestFilter;
+  texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  if (cached) cached.texture.dispose();
+  const entry = { key, depth, texture };
+  _stampDepthCache.set(L.id, entry);
+  return entry;
+}
+
+/** The raycast hit when the cursor is over the active stamp's patch, else null. */
+function _stampPatchHit(e) {
+  const frame = _activeStampFrame();
+  if (!frame) return null;
+  const hit = _stampRaycast(e);
+  if (!hit || stampUV(hit.p, hit.n, frame).cover <= 0) return null;
+  return { ...hit, frame };
+}
+
+/**
+ * Remember where on the patch it was grabbed, so dragging keeps that point
+ * under the cursor instead of snapping the centre to it. Cylindrical stamps
+ * keep the angle and height offset around the axis.
+ */
+function _grabStamp(hit) {
+  const f = hit.frame;
+  if (f.mode === 3 /* MODE_CYLINDRICAL */) {
+    _stampGrab = {
+      cyl: true, ccx: f.ccx, ccy: f.ccy,
+      rc: Math.hypot(f.cx - f.ccx, f.cy - f.ccy),
+      dth: Math.atan2(f.cy - f.ccy, f.cx - f.ccx) - Math.atan2(hit.p.y - f.ccy, hit.p.x - f.ccx),
+      dz: f.cz - hit.p.z,
+    };
+  } else if (f.mode === 7 /* MODE_SURFACE_NORMAL */) {
+    // The offset in the surface's own frame where it was grabbed, so it bends with the surface.
+    const s = _stampLastSurface = _stampSurfaceUnder(hit);
+    const ax = stampAxes(s.nx, s.ny, s.nz);
+    const dx = f.cx - s.x, dy = f.cy - s.y, dz = f.cz - s.z;
+    _stampGrab = {
+      normal: true,
+      du: dx * ax.ux + dy * ax.uy + dz * ax.uz,
+      dv: dx * ax.vx + dy * ax.vy + dz * ax.vz,
+      dn: dx * s.nx + dy * s.ny + dz * s.nz,
+    };
+  } else {
+    _stampGrab = { dx: f.cx - hit.p.x, dy: f.cy - hit.p.y, dz: f.cz - hit.p.z };
+  }
+}
+
+/** The active stamp's orientation-fit radius (mm): STAMP_NORMAL_RADIUS of its shorter side. */
+function _stampNormalRadius() {
+  const f = _stampFrameFor(activeLayer);
+  return STAMP_NORMAL_RADIUS * (f ? Math.min(f.sizeU, f.sizeV) : Math.min(settings.scaleU, settings.scaleV));
+}
+
+/** mapping.js stampSurfaceAt on the base mesh, over the active stamp's fit radius; `reach` (mm) bounds the snap. */
+function _stampSurfaceAt(q, hint, reach = _stampNormalRadius()) {
+  return stampSurfaceAt(currentGeometry.attributes.position.array, q, hint, _stampNormalRadius(), reach);
+}
+
+/** Surface normal: re-fit the orientation at the (unchanged) centre after a resize, since the fit spans the footprint. */
+function _reorientNormalStamp() {
+  if (!currentGeometry || !isStampActive(settings) || settings.mappingMode !== 7 /* MODE_SURFACE_NORMAL */) return;
+  if (settings.stampCenterX == null || settings.stampNormalX == null) return;
+  const s = _stampSurfaceAt({ x: settings.stampCenterX, y: settings.stampCenterY, z: settings.stampCenterZ },
+    { x: settings.stampNormalX, y: settings.stampNormalY, z: settings.stampNormalZ });
+  if (s) { settings.stampNormalX = s.nx; settings.stampNormalY = s.ny; settings.stampNormalZ = s.nz; }
+}
+
+/**
+ * Entering Surface normal with a stamp placed by another projection: keep
+ * its centre and face the surface there, starting from the side that
+ * projection stamped.
+ */
+function _faceStampSurface(prevMode) {
+  if (!currentGeometry || !currentBounds || !settings.stampOnce || settings.stampCenterX == null) return;
+  const f = stampFrame({ ...settings, mappingMode: prevMode }, currentBounds);
+  let hint;
+  if (prevMode === 0) hint = { x: 0, y: 0, z: f.side };
+  else if (prevMode === 1) hint = { x: 0, y: f.side, z: 0 };
+  else if (prevMode === 2) hint = { x: f.side, y: 0, z: 0 };
+  else if (prevMode === 3) hint = { x: (f.cx - f.ccx) * f.side, y: (f.cy - f.ccy) * f.side, z: 0 };
+  else return;
+  const s = _stampSurfaceAt({ x: f.cx, y: f.cy, z: f.cz }, hint);
+  if (s) { settings.stampNormalX = s.nx; settings.stampNormalY = s.ny; settings.stampNormalZ = s.nz; }
+}
+
+/** The surface point and fitted normal under a _stampRaycast hit (already on the surface: a short snap). */
+function _stampSurfaceUnder(hit) {
+  const q = hit.onBase;
+  return _stampSurfaceAt(q, hit.n, 0.1 * _stampNormalRadius() + 0.5)
+    ?? { x: q.x, y: q.y, z: q.z, nx: hit.n.x, ny: hit.n.y, nz: hit.n.z };
+}
+
+/** The cursor ray in model space: { o, d }. */
+function _stampCursorRay(e) {
+  const mesh = getCurrentMesh();
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const inv = mesh ? mesh.matrixWorld.clone().invert() : new THREE.Matrix4();
+  return { o: _raycaster.ray.origin.clone().applyMatrix4(inv), d: _raycaster.ray.direction.clone().transformDirection(inv) };
+}
+
+/**
+ * The surface point under the cursor for a Surface-normal stamp. While
+ * dragging it sticks to the surface it was on: when the cursor's hit turns
+ * away from it or jumps in depth (an edge — the deck past the gunwale, a wall
+ * behind it) or misses the model, the cursor ray is followed on that
+ * surface's tangent plane instead and dropped back onto the surface, so the
+ * stamp stops at the edge until the cursor is clearly past it (a quarter of
+ * the stamp's size) and only then moves over. Null when there is none.
+ */
+function _stampCursorSurface(hit, ray) {
+  let s = hit ? _stampSurfaceUnder(hit) : null;
+  const L = _stampDragging ? _stampLastSurface : null;
+  if (L) {
+    const R = _stampNormalRadius();
+    const left = !s || s.nx * L.nx + s.ny * L.ny + s.nz * L.nz < 0.5
+      || Math.abs((s.x - L.x) * L.nx + (s.y - L.y) * L.ny + (s.z - L.z) * L.nz) > 0.2 * R;
+    const den = ray.d.x * L.nx + ray.d.y * L.ny + ray.d.z * L.nz;
+    if (left && den < -1e-3) {
+      const t = ((L.x - ray.o.x) * L.nx + (L.y - ray.o.y) * L.ny + (L.z - ray.o.z) * L.nz) / den;
+      const q = { x: ray.o.x + t * ray.d.x, y: ray.o.y + t * ray.d.y, z: ray.o.z + t * ray.d.z };
+      const on = _stampSurfaceAt(q, { x: L.nx, y: L.ny, z: L.nz });
+      if (on && Math.hypot(on.x - q.x, on.y - q.y, on.z - q.z) < 0.5 * R) s = on;
+    }
+  }
+  if (s) _stampLastSurface = s;
+  return s;
+}
+
+/**
+ * Surface normal: centre on the surface under the cursor — or at the grab
+ * offset in the surface's frame there, dropped back onto the surface —
+ * facing its normal. Returns false when there is no surface to go to.
+ */
+function _moveNormalStamp(hit, ray) {
+  let s = _stampCursorSurface(hit, ray);
+  if (!s) return false;
+  const g = _stampGrab;
+  if (g && g.normal) {
+    const ax = stampAxes(s.nx, s.ny, s.nz);
+    const q = {
+      x: s.x + g.du * ax.ux + g.dv * ax.vx + g.dn * s.nx,
+      y: s.y + g.du * ax.uy + g.dv * ax.vy + g.dn * s.ny,
+      z: s.z + g.du * ax.uz + g.dv * ax.vz + g.dn * s.nz,
+    };
+    s = _stampSurfaceAt(q, { x: s.nx, y: s.ny, z: s.nz }, Math.max(_stampNormalRadius(), Math.hypot(g.du, g.dv)))
+      ?? { ...q, nx: s.nx, ny: s.ny, nz: s.nz };
+  }
+  settings.stampCenterX = s.x; settings.stampCenterY = s.y; settings.stampCenterZ = s.z;
+  settings.stampNormalX = s.nx; settings.stampNormalY = s.ny; settings.stampNormalZ = s.nz;
+  return true;
+}
+
+function _moveStampTo(hit) {
+  const g = _stampGrab;
+  const p = hit.p;
+  let x = p.x, y = p.y, z = p.z;
+  if (g && g.cyl) {
+    const th = Math.atan2(p.y - g.ccy, p.x - g.ccx) + g.dth;
+    x = g.ccx + g.rc * Math.cos(th);
+    y = g.ccy + g.rc * Math.sin(th);
+    z = p.z + g.dz;
+  } else if (g) {
+    x += g.dx; y += g.dy; z += g.dz;
+  }
+  settings.stampCenterX = x;
+  settings.stampCenterY = y;
+  settings.stampCenterZ = z;
+}
+
+function _startStampDrag() {
+  getControls().enabled = false;
+  _stampDragging = true;
+  _stampFastDepth = true;
+  _setStampWheelArmed(true);
+  _syncPreviewMaterial();
+  requestRender();
+}
+
+/** Resize the stamp by `factor`, keeping its proportions (wheel while armed). */
+function _scaleStampBy(factor) {
+  const clampMm = (v) => Math.max(SCALE_MM_INPUT_MIN, Math.min(SCALE_MM_INPUT_MAX, v));
+  const u = clampMm(settings.scaleU * factor);
+  const v = settings.lockScale ? u : clampMm(settings.scaleV * factor);
+  settings.scaleU = u; scaleUSlider.value = scaleToPos(u); scaleUVal.value = fmtScaleVal(u);
+  settings.scaleV = v; scaleVSlider.value = scaleToPos(v); scaleVVal.value = fmtScaleVal(v);
+  _reorientNormalStamp();
+  // Coarse occlusion while the wheel turns; full resolution once it stops.
+  _stampFastDepth = true;
+  clearTimeout(_stampFastTimer);
+  _stampFastTimer = setTimeout(() => {
+    _stampFastDepth = _stampDragging;
+    _syncPreviewMaterial();
+    requestRender();
+  }, 200);
+  _syncPreviewMaterial();
+  requestRender();
+  clearTimeout(previewDebounce); previewDebounce = setTimeout(updatePreview, 80);
+  _autoSaveSettings();
+  _scheduleUndoCapture();
+}
+
+/** 'move' cursor over the stamp's patch while no tool owns the cursor. */
+function _updateStampHoverCursor(e) {
+  const free = !placeOnFaceActive && !exclusionTool && !stampPlaceActive && !rotateActive && e.buttons === 0;
+  const over = free && !!_stampPatchHit(e);
+  if (over === _stampHoverCursor) return;
+  _stampHoverCursor = over;
+  if (over) canvas.style.cursor = 'move';
+  else if (free) canvas.style.cursor = '';
+}
+
+/**
+ * Centre the stamp on the model point under the cursor. With pickAxis, the
+ * clicked face also chooses the projection: for planar modes the axis its
+ * normal is closest to (switching between XY / XZ / YZ) and the side it
+ * faces; for cylindrical, outside or inside. (Surface normal always faces
+ * the surface under the centre.) Returns false on a miss.
+ */
+function _placeStampAt(e, pickAxis) {
+  const hit = _stampRaycast(e);
+  // Surface normal: a drag can carry on past an edge (the stamp stays on its surface).
+  if (settings.mappingMode === 7 /* MODE_SURFACE_NORMAL */) return _moveNormalStamp(hit, _stampCursorRay(e));
+  if (!hit) return false;
+  const { p, n } = hit;
+  if (pickAxis) {
+    if (settings.mappingMode === 3 /* MODE_CYLINDRICAL */) {
+      const { cx, cy } = getEffectiveCylinderCenter();
+      const rx = p.x - cx, ry = p.y - cy;
+      const len = Math.hypot(rx, ry);
+      const radial = len > 1e-6 ? (n.x * rx + n.y * ry) / len : 0;
+      // A cap face (no radial component) keeps the current side.
+      if (Math.abs(radial) > 0.2) settings.stampSide = radial > 0 ? 1 : -1;
+    } else {
+      const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+      const mode = (az >= ax && az >= ay) ? 0 : (ay >= ax ? 1 : 2);
+      const along = mode === 0 ? n.z : mode === 1 ? n.y : n.x;
+      settings.stampSide = along >= 0 ? 1 : -1;
+      if (mode !== settings.mappingMode) {
+        mappingSelect.value = String(mode);
+        mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+  }
+  _moveStampTo(hit);
+  return true;
+}
+
+/** Release: placement mode (if any) ends, but the wheel stays on the stamp until the next press. */
+function _endStampDrag() {
+  if (!_stampDragging) return;
+  _stampDragging = false;
+  _stampGrab = null;
+  _stampLastSurface = null;
+  _stampFastDepth = false;   // full-resolution occlusion again
+  getControls().enabled = true;
+  if (stampPlaceActive) toggleStampPlace(false);
+  _setStampWheelArmed(true);
+  updatePreview();
+  _autoSaveSettings();
+}
+
 // ── Place on Face ─────────────────────────────────────────────────────────────
 
 function togglePlaceOnFace(active) {
   placeOnFaceActive = active;
   placeOnFaceBtn.classList.toggle('active', active);
+  setSectionHandlesLocked(!!exclusionTool || active);
 
   if (active) {
     // Deactivate exclusion tool
     if (exclusionTool) setExclusionTool(null);
     // Deactivate rotate mode
     if (rotateActive) toggleRotateMode(false);
-    // Deactivate precision masking (geometry will be rotated/replaced)
-    if (precisionMaskingEnabled) deactivatePrecisionMasking();
+    if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
     canvas.style.cursor = 'crosshair';
   } else {
     if (!exclusionTool) canvas.style.cursor = '';
@@ -2159,11 +3654,16 @@ function handlePlaceOnFaceClick(e) {
     pos[i + 2] = v.z;
   }
 
+  // Fold the rotation into the pose transform (undone again on export).
+  currentPoseRot.premultiply(quat).normalize();
+  currentPoseTrans.applyQuaternion(quat);
+
   // Re-center geometry
   currentGeometry.computeBoundingBox();
   const center = new THREE.Vector3();
   currentGeometry.boundingBox.getCenter(center);
   currentGeometry.translate(-center.x, -center.y, -center.z);
+  currentPoseTrans.sub(center);
 
   // Recompute normals from scratch (fixes lighting + angle masking)
   currentGeometry.computeVertexNormals();
@@ -2179,6 +3679,8 @@ function handlePlaceOnFaceClick(e) {
   settings.cylinderCenterX = null;
   settings.cylinderCenterY = null;
   settings.cylinderRadius  = null;
+  settings.stampCenterX = settings.stampCenterY = settings.stampCenterZ = null;  // same for the stamp centre
+  settings.stampNormalX = settings.stampNormalY = settings.stampNormalZ = null;
   _cylSilhouetteCanvas = null;
   _cylSilhouetteGeometry = null;
   _cylSilhouetteAnchor = null;
@@ -2194,47 +3696,36 @@ function handlePlaceOnFaceClick(e) {
 
   loadGeometry(currentGeometry);
 
-  // Reset displacement preview
+  // Reset displacement preview (an in-flight build used the old pose)
+  cancelDisplacementPreviewBuild();
   if (dispPreviewGeometry) { dispPreviewGeometry.dispose(); dispPreviewGeometry = null; }
   settings.useDisplacement = false;
   dispPreviewToggle.checked = false;
 
-  // Reset precision masking (geometry was rotated)
-  if (precisionGeometry) { precisionGeometry.dispose(); precisionGeometry = null; }
-  precisionParentMap = null; precisionEdgeLength = null;
-  precisionCentroids = null; precisionFaceNormals = null; precisionAdjacency = null;
-  precisionMaskingEnabled = false; precisionMaskingToggle.checked = false;
-  precisionStatus.textContent = '';
-  precisionOutdated.classList.add('hidden'); precisionRefreshBtn.classList.add('hidden');
-  precisionWarning.classList.add('hidden'); precisionMaskingRow.classList.add('hidden');
-  precisionExcludedFaces = new Set();
-
-  // Deactivate tools but keep excludedFaces (face indices are stable after rotation)
+  // Deactivate tools but keep the paint (face indices are stable after rotation)
   exclusionTool     = null;
   eraseMode         = false;
   isPainting        = false;
   exclBrushBtn.classList.remove('active');
   exclBucketBtn.classList.remove('active');
   exclBrushTypeRow.classList.add('hidden');
+  exclBrushModeRow.classList.add('hidden');
   exclRadiusRow.classList.add('hidden');
+  exclHardnessRow.classList.add('hidden');
   exclThresholdRow.classList.add('hidden');
   canvas.style.cursor = '';
   setHoverPreview(null);
   _lastHoverTriIdx = -1;
 
-  // Rebuild adjacency
+  // Rebuild adjacency and carry the paint onto the moved vertices
   const adjData = buildAdjacency(currentGeometry);
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids;
   triangleFaceNormals = adjData.faceNormals;
+  _rebuildPaintTreeKeepingPaint(adjData);
 
   // Update edge length for new bounds
-  const diag = Math.sqrt(currentBounds.size.x ** 2 + currentBounds.size.y ** 2 + currentBounds.size.z ** 2);
-  const defaultEdge = Math.max(0.05, Math.min(5.0, +(diag / 300).toFixed(2)));
-  settings.refineLength = defaultEdge;
-  refineLenSlider.value = defaultEdge;
-  refineLenVal.value = defaultEdge;
-  checkResolutionWarning();
+  _applyDefaultRefineLength(currentBounds, 300);
 
   // Update mesh info
   const triCount = getTriangleCount(currentGeometry);
@@ -2242,20 +3733,16 @@ function handlePlaceOnFaceClick(e) {
   const sx = currentBounds.size.x.toFixed(2);
   const sy = currentBounds.size.y.toFixed(2);
   const sz = currentBounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
-  exportBtn.disabled = (activeMapEntry === null);
-  export3mfBtn.disabled = (activeMapEntry === null);
-  bakeBtn.disabled = (activeMapEntry === null);
+  exportBtn.disabled = !_hasTexturedLayer();
+  export3mfBtn.disabled = !_hasTexturedLayer();
+  bakeBtn.disabled = !_hasTexturedLayer();
   updateSmartResBtnState();
   updatePreview();
 
-  // Rebuild exclusion overlay with new vertex positions (face indices unchanged)
-  if (excludedFaces.size > 0) {
-    refreshExclusionOverlay();
-  } else {
-    setExclusionOverlay(null);
-  }
+  // Rebuild the paint display with the new vertex positions (face indices unchanged)
+  refreshExclusionOverlay();
 
   // Exit place-on-face mode
   togglePlaceOnFace(false);
@@ -2272,10 +3759,12 @@ function toggleRotateMode(active) {
     // Deactivate conflicting modes
     if (placeOnFaceActive) togglePlaceOnFace(false);
     if (exclusionTool) setExclusionTool(null);
+    if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
 
-    // Snapshot original positions for reset
+    // Snapshot original positions (and the matching pose transform) for reset
     if (currentGeometry) {
       _rotateOriginalPositions = new Float32Array(currentGeometry.attributes.position.array);
+      _rotatePoseSnapshot = { rot: currentPoseRot.clone(), trans: currentPoseTrans.clone() };
     }
     rotateAngles = { x: 0, y: 0, z: 0 };
     rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
@@ -2285,6 +3774,7 @@ function toggleRotateMode(active) {
   } else {
     setRotationGizmo(false);
     _rotateOriginalPositions = null;
+    _rotatePoseSnapshot = null;
 
     // Full rebuild now that rotation is done
     _rotateFinalize();
@@ -2356,6 +3846,10 @@ function _rotateGeometry(quat) {
     pos[i + 2] = v.z;
   }
 
+  // Fold the rotation into the pose transform (undone again on export).
+  currentPoseRot.premultiply(quat).normalize();
+  currentPoseTrans.applyQuaternion(quat);
+
   // Recompute normals
   currentGeometry.computeVertexNormals();
   if (currentGeometry.attributes.faceNormal) {
@@ -2375,12 +3869,13 @@ function _rotateGeometry(quat) {
 function _rotateFinalize() {
   if (!currentGeometry) return;
 
-  // Re-center
+  // Re-center, folding the shift into the pose transform (undone on export).
   currentGeometry.computeBoundingBox();
   const center = new THREE.Vector3();
   currentGeometry.boundingBox.getCenter(center);
   currentGeometry.translate(-center.x, -center.y, -center.z);
   currentGeometry.attributes.position.needsUpdate = true;
+  currentPoseTrans.sub(center);
 
   // Full refresh
   currentBounds = computeBounds(currentGeometry);
@@ -2394,18 +3889,15 @@ function _rotateFinalize() {
   _cylSilhouetteAnchor = null;
   updateCylinderUIVisibility();
 
-  // Rebuild adjacency for exclusion tools
+  // Rebuild adjacency for the paint tools and carry the paint onto the moved vertices
   const adjData = buildAdjacency(currentGeometry);
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids;
   triangleFaceNormals = adjData.faceNormals;
+  _rebuildPaintTreeKeepingPaint(adjData);
 
-  // Rebuild exclusion overlay
-  if (excludedFaces.size > 0) {
-    refreshExclusionOverlay();
-  } else {
-    setExclusionOverlay(null);
-  }
+  // Rebuild the paint display
+  refreshExclusionOverlay();
 
   // Dispose old preview material so it gets recreated
   if (previewMaterial) {
@@ -2419,30 +3911,24 @@ function _rotateFinalize() {
 }
 
 function refreshExclusionOverlay() {
-  if (!currentGeometry) return;
-
-  // Choose which geometry and face set to build the overlay from
-  const usePrecision = precisionMaskingEnabled && precisionGeometry;
-  const overlayGeo = usePrecision ? precisionGeometry : currentGeometry;
-  const overlayFaceSet = usePrecision ? precisionExcludedFaces : excludedFaces;
+  if (!currentGeometry || !paintTree) return;
 
   _falloffDirty = true;
 
   // Never show the flat-coloured MeshLambertMaterial overlay — the custom
   // shader handles mask visualisation with smooth, view-dependent shading.
   setExclusionOverlay(null);
-  const n = usePrecision ? precisionExcludedFaces.size : excludedFaces.size;
-  exclCount.textContent = selectionMode
+  const { faces: n, softVertices } = paintTree.countPainted(_activeSlot());
+  let countText = selectionMode
     ? t(n === 1 ? 'excl.faceSelected' : 'excl.facesSelected', { n: n.toLocaleString() })
     : t(n === 1 ? 'excl.faceExcluded' : 'excl.facesExcluded', { n: n.toLocaleString() });
+  if (softVertices > 0) countText += ' · ' + t('excl.softVertices', { n: softVertices.toLocaleString() });
+  exclCount.textContent = countText;
 
-  // Update the faceMask attribute on the active preview geometry so the shader
-  // reflects user-painted exclusions in real time.
-  const activeGeo = usePrecision
-    ? precisionGeometry
-    : (settings.useDisplacement && dispPreviewGeometry)
-      ? dispPreviewGeometry : currentGeometry;
-  updateFaceMask(activeGeo);
+  // A split or merge changes the mesh the viewer shows; the paint itself is
+  // an attribute update.
+  _refreshPaintGeometry();
+  updateFaceMask(_displayGeometry());
 }
 
 function updateBrushCursor(e) {
@@ -2450,12 +3936,16 @@ function updateBrushCursor(e) {
     brushCursorEl.style.display = 'none';
     return;
   }
+  // Hide the OS cursor only while the circle overlay is drawn on the model;
+  // off-model the default cursor returns, so the pointer never vanishes and
+  // painting vs. orbiting stays visually distinct (#52).
   const mesh = getCurrentMesh();
-  if (!mesh) { brushCursorEl.style.display = 'none'; return; }
+  if (!mesh) { brushCursorEl.style.display = 'none'; canvas.style.cursor = ''; return; }
   _raycaster.setFromCamera(_canvasNDC(e), getCamera());
   const hits = _raycaster.intersectObject(mesh);
   const frontHit = getFrontFaceHit(hits, mesh);
-  if (!frontHit) { brushCursorEl.style.display = 'none'; return; }
+  if (!frontHit) { brushCursorEl.style.display = 'none'; canvas.style.cursor = ''; return; }
+  canvas.style.cursor = 'none';
 
   const hitPt = frontHit.point;
   const cam   = getCamera();
@@ -2494,42 +3984,23 @@ function updateBrushHover(e) {
   const hit = getFrontFaceHit(hits, mesh);
   if (!hit) { _lastHoverTriIdx = -1; setHoverPreview(null); return; }
 
-  // Use raw face index for cache when precision is active (small faces → frequent updates)
-  const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
-  let triIdx = hit.faceIndex;
-  if (!usePrecision) {
-    if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
-      triIdx = dispPreviewParentMap[triIdx];
-    }
+  // The Precision brush shows its footprint as the cursor ring. Standard
+  // marks whole triangles, so it highlights the ones a click would mark.
+  if (brushIsRadius) {
+    if (brushPrecision || !paintTree) { _lastHoverTriIdx = -1; setHoverPreview(null); return; }
+    const seed = _baseFaceOf(hit.faceIndex, mesh.geometry);
+    const faces = paintTree.facesUnderBrush(seed, hit.point, brushRadius, _viewDirFor(hit.point)).sort((a, b) => a - b);
+    const key = (eraseMode ? 'e' : 'p') + faces.join(',');
+    if (_lastHoverTriIdx !== -1 && key === _lastHoverKey) return;
+    _lastHoverTriIdx = seed;
+    _lastHoverKey = key;
+    setHoverPreview(buildExclusionOverlayGeo(currentGeometry, new Set(faces)), eraseMode ? 0x999999 : 0xffee00);
+    return;
   }
+  const triIdx = _baseFaceOf(hit.faceIndex, mesh.geometry);
   if (triIdx === _lastHoverTriIdx) return;
   _lastHoverTriIdx = triIdx;
-
-  const hoverGeo = usePrecision ? precisionGeometry : currentGeometry;
-  const hoverColor = eraseMode ? 0x999999 : 0xffee00;
-  if (brushIsRadius) {
-    const r2 = brushRadius * brushRadius;
-    const hovered = new Set();
-    // Hover seed must be in the same index space as bfsBrushSelect uses.
-    // In precision mode that's hit.faceIndex (precision); in disp-preview
-    // mode it's the parent-mapped index; otherwise it's the raw faceIndex.
-    let seed = hit.faceIndex;
-    if (!usePrecision && dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
-      seed = dispPreviewParentMap[seed];
-    }
-    bfsBrushSelect(seed, hit.point, r2, _viewDirFor(hit.point), t => hovered.add(t));
-    setHoverPreview(buildExclusionOverlayGeo(hoverGeo, hovered), hoverColor);
-  } else {
-    // For single mode with precision, find the refined face index for the hover highlight
-    if (usePrecision) {
-      const rawIdx = hit.faceIndex;
-      const hovered = new Set([rawIdx]);
-      setHoverPreview(buildExclusionOverlayGeo(precisionGeometry, hovered), hoverColor);
-    } else {
-      const hovered = new Set([triIdx]);
-      setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), hoverColor);
-    }
-  }
+  setHoverPreview(buildExclusionOverlayGeo(currentGeometry, new Set([triIdx])), eraseMode ? 0x999999 : 0xffee00);
 }
 
 function updateBucketHover(e) {
@@ -2541,18 +4012,7 @@ function updateBucketHover(e) {
     return;
   }
   const hovered = bucketFill(triIdx, triangleAdjacency, bucketThreshold);
-  const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
-  if (usePrecision) {
-    // Map original face indices to precision face indices for overlay
-    const refinedHover = new Set();
-    const len = precisionParentMap.length;
-    for (let i = 0; i < len; i++) {
-      if (hovered.has(precisionParentMap[i])) refinedHover.add(i);
-    }
-    setHoverPreview(buildExclusionOverlayGeo(precisionGeometry, refinedHover), eraseMode ? 0x999999 : 0xffee00);
-  } else {
-    setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), eraseMode ? 0x999999 : 0xffee00);
-  }
+  setHoverPreview(buildExclusionOverlayGeo(currentGeometry, hovered), eraseMode ? 0x999999 : 0xffee00);
 }
 
 // ── Slider helper ─────────────────────────────────────────────────────────────
@@ -2681,13 +4141,15 @@ function loadDefaultCube() {
   geo.computeVertexNormals();
 
   // Invalidate any in-flight async operations tied to the previous model
-  precisionToken++;
-  dispPreviewToken++;
+  cancelDisplacementPreviewBuild();
   exportToken++;
 
   currentGeometry = geo;
   currentBounds   = computeBounds(geo);
+  currentPoseRot   = new THREE.Quaternion(); // authored at the origin — nothing to restore
+  currentPoseTrans = new THREE.Vector3();
   currentStlName  = 'cube_50x50x50';
+  currentStlExt   = '.stl';
   checkAmplitudeWarning();
 
   loadGeometry(geo);
@@ -2698,19 +4160,27 @@ function loadDefaultCube() {
   settings.useDisplacement = false;
   dispPreviewToggle.checked = false;
 
-  // Reset exclusion state
-  excludedFaces     = new Set();
+  // Reset the paint (every layer's strokes indexed the previous mesh)
+  _dropPaintGeometry();
+  paintTree         = null;
   exclusionTool     = null;
   eraseMode         = false;
   isPainting        = false;
+  // Exclude reverts to the neutral (unhighlighted) default; include-only
+  // persists across loads and stays highlighted.
+  maskModeChosen    = selectionMode;
+  updateMaskModeButtons();
   if (placeOnFaceActive) togglePlaceOnFace(false);
   if (rotateActive) toggleRotateMode(false);
+  if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
   rotateAngles = { x: 0, y: 0, z: 0 };
   rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
   exclBrushBtn.classList.remove('active');
   exclBucketBtn.classList.remove('active');
   exclBrushTypeRow.classList.add('hidden');
+  exclBrushModeRow.classList.add('hidden');
   exclRadiusRow.classList.add('hidden');
+  exclHardnessRow.classList.add('hidden');
   exclThresholdRow.classList.add('hidden');
   canvas.style.cursor = '';
   setExclusionOverlay(null);
@@ -2722,9 +4192,13 @@ function loadDefaultCube() {
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids;
   triangleFaceNormals = adjData.faceNormals;
+  _createPaintTree(adjData);
 
-  settings.scaleU  = 0.5; scaleUSlider.value = scaleToPos(0.5); scaleUVal.value = 0.5;
-  settings.scaleV  = 0.5; scaleVSlider.value = scaleToPos(0.5); scaleVVal.value = 0.5;
+  // Pre-calculate an initial tile size that looks nice on this model; from
+  // here on the value is absolute (mm) and independent of the model bounds.
+  const tileMm = _defaultTileMm();
+  settings.scaleU  = tileMm; scaleUSlider.value = scaleToPos(tileMm); scaleUVal.value = fmtScaleVal(tileMm);
+  settings.scaleV  = tileMm; scaleVSlider.value = scaleToPos(tileMm); scaleVVal.value = fmtScaleVal(tileMm);
   settings.offsetU = 0; offsetUSlider.value = 0; offsetUVal.value = 0;
   settings.offsetV = 0; offsetVSlider.value = 0; offsetVVal.value = 0;
   triLimitWarning.classList.add('hidden');
@@ -2741,30 +4215,121 @@ function loadDefaultCube() {
   const sx = currentBounds.size.x.toFixed(2);
   const sy = currentBounds.size.y.toFixed(2);
   const sz = currentBounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
-  exportBtn.disabled = (activeMapEntry === null);
-  export3mfBtn.disabled = (activeMapEntry === null);
-  bakeBtn.disabled = (activeMapEntry === null);
+  exportBtn.disabled = !_hasTexturedLayer();
+  export3mfBtn.disabled = !_hasTexturedLayer();
+  bakeBtn.disabled = !_hasTexturedLayer();
   updateSmartResBtnState();
   updatePreview();
 }
 
-async function handleModelFile(file) {
+// Import-progress bar (STEP tessellation runs in a worker and can take a
+// while on real CAD parts; every other format parses too fast to need this).
+function _setImportProgress(stage, fraction) {
+  const pct = Math.round(fraction * 100);
+  importProgBar.style.width = `${pct}%`;
+  importProgPct.textContent = `${pct}%`;
+  importProgLbl.textContent = t(stage === 'parse' ? 'progress.stepParse' : 'progress.stepTessellate');
+}
+
+// ── STEP import dialog ──────────────────────────────────────────────────────
+// Dropping a .step file opens a settings popup first: quality presets that
+// scale meshStep's size-adaptive auto tolerances, or Custom with the three
+// main tolerances exposed (Fusion-style naming). To change the settings
+// later, reload the file — the dialog opens on every STEP import.
+
+let _stepDialogFile = null; // File pending import while the dialog is open
+let _stepAutoTol    = null; // { surfaceDeviation, maxEdge } from the worker's size estimate
+let _stepEstimateSeq = 0;   // ignores stale estimate responses after reopen/close
+
+function _stepSelectedPreset() {
+  return document.querySelector('input[name="step-preset"]:checked').value;
+}
+
+// Reflect the effective tolerances into the fields; editable only for Custom.
+function _stepUpdateFields() {
+  const preset = _stepSelectedPreset();
+  const custom = preset === 'custom';
+  stepSurfaceDev.disabled = stepNormalDev.disabled = stepMaxEdge.disabled = !custom;
+  if (!custom) {
+    const tol = resolveStepSettings(_stepAutoTol, { preset });
+    stepSurfaceDev.value = +tol.surfaceDeviation.toPrecision(3);
+    stepNormalDev.value  = +tol.normalDeviation.toPrecision(3);
+    stepMaxEdge.value    = +tol.maxEdge.toPrecision(3);
+  }
+}
+
+function openStepDialog(file) {
+  _stepDialogFile = file;
+  _stepAutoTol = null;
+  stepModelSize.textContent = '';
+  document.querySelector('input[name="step-preset"][value="standard"]').checked = true;
+  _stepUpdateFields();
+  stepOverlay.classList.remove('hidden');
+  trapFocus(stepOverlay);
+
+  // Probe the model size in the worker (also warms it up for the import) and
+  // fill in the real auto tolerances once known.
+  const mySeq = ++_stepEstimateSeq;
+  file.text()
+    .then((text) => estimateStep(text))
+    .then((r) => {
+      if (mySeq !== _stepEstimateSeq || !r) return;
+      _stepAutoTol = r.auto;
+      if (r.est) stepModelSize.textContent = t('step.modelSize', { d: r.est.diag.toFixed(1) });
+      if (_stepSelectedPreset() !== 'custom') _stepUpdateFields();
+    })
+    .catch(() => {});
+}
+
+function closeStepDialog() {
+  _stepEstimateSeq++;
+  _stepDialogFile = null;
+  stepOverlay.classList.add('hidden');
+}
+
+let _importSeq = 0; // guards the shared progress bar against superseded imports
+
+async function handleModelFile(file, stepSettings = null) {
+  const isStep = /\.(step|stp)$/i.test(file.name);
+  // A STEP file without chosen settings goes through the import dialog first;
+  // the dialog's Import button re-enters here with settings resolved.
+  if (isStep && !stepSettings) {
+    openStepDialog(file);
+    return;
+  }
   _undoApplyDepth++;
+  const mySeq = ++_importSeq;
+  if (isStep) {
+    _setImportProgress('parse', 0);
+    importProgress.classList.remove('hidden');
+  }
   try {
-    const { geometry, bounds, nanCount, degenerateCount } = await loadModelFile(file);
+    const { geometry, bounds, nanCount, degenerateCount, originOffset, step } =
+      await loadModelFile(file, { settings: stepSettings, onProgress: _setImportProgress });
 
     // Invalidate any in-flight async operations tied to the previous model
-    precisionToken++;
-    dispPreviewToken++;
+    cancelDisplacementPreviewBuild();
     exportToken++;
     diagToken++;
 
     currentGeometry = geometry;
     currentBounds   = bounds;
-    currentStlName  = file.name.replace(/\.(stl|obj|3mf)$/i, '');
+    currentPoseRot   = new THREE.Quaternion();
+    currentPoseTrans = originOffset ? originOffset.clone().negate() : new THREE.Vector3(); // mem = orig − centre
+    currentStlName  = file.name.replace(/\.(stl|obj|3mf|step|stp)$/i, '');
+    const _extMatch = file.name.match(/\.(stl|obj|3mf|step|stp)$/i);
+    currentStlExt   = _extMatch ? _extMatch[0].toLowerCase() : '';
     checkAmplitudeWarning();
+
+    // Surface the STEP conversion verdict without blocking the user.
+    if (step && step.diagnostics && !step.diagnostics.ok) {
+      const d = step.diagnostics;
+      console.warn(
+        `STEP conversion imperfect: ${d.openEdges} open edges, ${d.nonManifoldEdges} non-manifold edges, ` +
+        `${d.facesDropped} faces dropped, ${d.facesSkipped} faces skipped`, d.warnings);
+    }
 
     // Log (but don't block the user with an alert) if bad triangles were
     // silently removed during load — this is non-critical; the all-invalid
@@ -2780,13 +4345,11 @@ async function handleModelFile(file) {
       previewMaterial = null;
     }
 
-    // Auto-select first preset on first load
-    if (!activeMapEntry && PRESETS.length > 0) {
-      const idx = PRESETS.findIndex(p => p != null);
-      if (idx >= 0) {
-        const swatches = document.querySelectorAll('.preset-swatch');
-        if (swatches[idx]) selectPreset(idx, swatches[idx]);
-      }
+    // Auto-select the default preset on first load, unless a preset is already picked (its
+    // texture may still be loading) or a custom map is active.
+    if (!activeMapEntry && _activePresetIdx < 0) {
+      const idx = IMAGE_PRESETS.findIndex(p => p.name === DEFAULT_PRESET_NAME);
+      if (idx >= 0) selectPreset(idx);
     }
     mappingSelect.value = String(settings.mappingMode);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
@@ -2797,6 +4360,8 @@ async function handleModelFile(file) {
     settings.cylinderCenterX = null;
     settings.cylinderCenterY = null;
     settings.cylinderRadius  = null;
+    settings.stampCenterX = settings.stampCenterY = settings.stampCenterZ = null;  // same for the stamp centre
+    settings.stampNormalX = settings.stampNormalY = settings.stampNormalZ = null;
     _cylSilhouetteCanvas = null;
     _cylSilhouetteGeometry = null;
     _cylSilhouetteAnchor = null;
@@ -2813,21 +4378,6 @@ async function handleModelFile(file) {
     settings.useDisplacement = false;
     dispPreviewToggle.checked = false;
 
-    // Reset precision masking for the new mesh
-    if (precisionGeometry) { precisionGeometry.dispose(); precisionGeometry = null; }
-    precisionParentMap  = null;
-    precisionEdgeLength = null;
-    precisionCentroids  = null;
-    precisionFaceNormals = null;
-    precisionAdjacency  = null;
-    precisionMaskingEnabled = false;
-    precisionMaskingToggle.checked = false;
-    precisionStatus.textContent = '';
-    precisionOutdated.classList.add('hidden');
-    precisionRefreshBtn.classList.add('hidden');
-    precisionWarning.classList.add('hidden');
-    precisionMaskingRow.classList.add('hidden');
-
     // Reset mesh diagnostics for the new mesh
     meshDiagnostics.classList.add('hidden');
     meshDiagAdvanced.classList.add('hidden');
@@ -2835,20 +4385,27 @@ async function handleModelFile(file) {
     lastAdvancedDiag = null;
     clearDiagHighlight();
 
-    // Reset exclusion state for the new mesh
-    excludedFaces     = new Set();
-    precisionExcludedFaces = new Set();
+    // Reset the paint for the new mesh (every layer's strokes indexed the previous one)
+    _dropPaintGeometry();
+    paintTree         = null;
     exclusionTool     = null;
     eraseMode         = false;
     isPainting        = false;
+    // Exclude reverts to the neutral (unhighlighted) default; include-only
+    // persists across loads and stays highlighted.
+    maskModeChosen    = selectionMode;
+    updateMaskModeButtons();
     if (placeOnFaceActive) togglePlaceOnFace(false);
     if (rotateActive) toggleRotateMode(false);
+    if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
     rotateAngles = { x: 0, y: 0, z: 0 };
     rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
     exclBrushBtn.classList.remove('active');
     exclBucketBtn.classList.remove('active');
     exclBrushTypeRow.classList.add('hidden');
+    exclBrushModeRow.classList.add('hidden');
     exclRadiusRow.classList.add('hidden');
+    exclHardnessRow.classList.add('hidden');
     exclThresholdRow.classList.add('hidden');
     canvas.style.cursor = '';
     setExclusionOverlay(null);
@@ -2861,38 +4418,39 @@ async function handleModelFile(file) {
     triangleAdjacency = adjData.adjacency;
     triangleCentroids = adjData.centroids;
     triangleFaceNormals = adjData.faceNormals;
+    _createPaintTree(adjData);
     updateMeshDiagnostics(adjData, currentGeometry.attributes.position.count / 3);
 
     // Carry scale, offset, rotation, and all other tuning across model swaps —
     // they're normalized to the bounding box so they apply meaningfully to the
-    // new mesh. Output resolution is the one exception: it's recomputed below
-    // from the new model's diagonal so a default-sized edge length still makes
-    // sense whether the user just loaded a thumb-sized part or a 1m piece.
+    // new mesh. Output resolution is recomputed from the new model's diagonal
+    // (so a default edge length suits a thumb-sized part and a 1m piece alike)
+    // unless the user has set it themselves — then their value is kept.
     triLimitWarning.classList.add('hidden');
 
     // Default edge length = 1/250 of the bounding box diagonal
-    const diag = Math.sqrt(bounds.size.x ** 2 + bounds.size.y ** 2 + bounds.size.z ** 2);
-    const defaultEdge = Math.max(0.05, Math.min(5.0, +(diag / 250).toFixed(2)));
-    settings.refineLength = defaultEdge;
-    refineLenSlider.value = defaultEdge;
-    refineLenVal.value = defaultEdge;
-    checkResolutionWarning();
+    _applyDefaultRefineLength(bounds, 250);
 
     const triCount = getTriangleCount(currentGeometry);
     const mb = ((currentGeometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
     const sx = bounds.size.x.toFixed(2);
     const sy = bounds.size.y.toFixed(2);
     const sz = bounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+    _setMeshInfo(triCount, mb, sx, sy, sz);
 
-    exportBtn.disabled = (activeMapEntry === null);
-    export3mfBtn.disabled = (activeMapEntry === null);
+    exportBtn.disabled = !_hasTexturedLayer();
+    export3mfBtn.disabled = !_hasTexturedLayer();
     updateSmartResBtnState();
     updatePreview();
   } catch (err) {
-    console.error('Failed to load model:', err);
-    alert(t('alerts.loadFailed', { msg: err.message }));
+    // A superseded STEP import (user dropped another file mid-tessellation)
+    // is not a failure — the newer load owns the UI now.
+    if (!err || !err.stepCancelled) {
+      console.error('Failed to load model:', err);
+      alert(t('alerts.loadFailed', { msg: err.message }));
+    }
   } finally {
+    if (isStep && mySeq === _importSeq) importProgress.classList.add('hidden');
     _undoApplyDepth--;
     // Mask indices reference the freshly-loaded triangle set, so any prior
     // history is meaningless for the new geometry.
@@ -2920,9 +4478,10 @@ const SHELL_COLORS = [0xe6194b, 0x3cb44b, 0x4363d8, 0xf58231, 0x911eb4, 0x42d4f4
  */
 function applyDiagSeverity() {
   let severity = 'ok';
+  // Several shells / bodies touching each other are normal for multi-part
+  // files, so they're informational and don't raise the severity (#125).
   if (lastFastDiag) {
     if (lastFastDiag.openEdges > 0 || lastFastDiag.nonManifoldEdges > 0) severity = 'error';
-    else if (lastFastDiag.shellCount > 1 && severity !== 'error') severity = 'warn';
   }
   if (lastAdvancedDiag) {
     if (lastAdvancedDiag.intersectingPairs > 0) severity = 'error';
@@ -2962,11 +4521,13 @@ function toggleDiagHighlight(kind) {
     const positions = kind === 'openEdges' ? edgeData.open : edgeData.nonManifold;
     setDiagEdges(positions, 0xff0000);
   } else if (kind === 'shells') {
-    const shellIds = getShellAssignments(triangleAdjacency, currentGeometry.attributes.position.count / 3);
-    const shellCount = lastFastDiag ? lastFastDiag.shellCount : 0;
     const srcPos = currentGeometry.attributes.position.array;
     const srcNrm = currentGeometry.attributes.normal ? currentGeometry.attributes.normal.array : null;
     const triCount = srcPos.length / 9;
+    // Shell ids come from the diagnostics run, so they match the reported
+    // count; skip if the mesh has been swapped since.
+    if (!lastFastDiag || lastFastDiag.triCount !== triCount) return;
+    const { shellIds, shellCount } = lastFastDiag;
 
     for (let s = 0; s < shellCount; s++) {
       // Count triangles in this shell
@@ -2990,6 +4551,9 @@ function toggleDiagHighlight(kind) {
   } else if (kind === 'intersects' && lastAdvancedDiag && lastAdvancedDiag.intersectFaces) {
     const geo = buildExclusionOverlayGeo(currentGeometry, lastAdvancedDiag.intersectFaces);
     addDiagFaces(geo, 0xff0000, 0.7, true);
+  } else if (kind === 'bodyIntersects' && lastAdvancedDiag && lastAdvancedDiag.bodyIntersectFaces) {
+    const geo = buildExclusionOverlayGeo(currentGeometry, lastAdvancedDiag.bodyIntersectFaces);
+    addDiagFaces(geo, 0xf59e0b, 0.7, true);
   } else if (kind === 'overlaps' && lastAdvancedDiag && lastAdvancedDiag.overlapFaces) {
     const geo = buildExclusionOverlayGeo(currentGeometry, lastAdvancedDiag.overlapFaces);
     addDiagFaces(geo, 0xf59e0b, 0.7);
@@ -3020,18 +4584,18 @@ function makeDiagLine(text, kind) {
 function renderFastDiag(diag) {
   meshDiagFast.innerHTML = '';
 
-  if (diag.openEdges === 0 && diag.nonManifoldEdges === 0 && diag.shellCount <= 1) {
-    meshDiagFast.textContent = t('diag.meshOk');
-  } else {
-    if (diag.openEdges > 0)
-      meshDiagFast.appendChild(makeDiagLine(t('diag.openEdges', { n: diag.openEdges }), 'openEdges'));
-    if (diag.nonManifoldEdges > 0)
-      meshDiagFast.appendChild(makeDiagLine(t('diag.nonManifoldEdges', { n: diag.nonManifoldEdges }), 'nonManifold'));
-    if (diag.shellCount > 1)
-      meshDiagFast.appendChild(makeDiagLine(t('diag.multipleShells', { n: diag.shellCount }), 'shells'));
+  const defects = diag.openEdges > 0 || diag.nonManifoldEdges > 0;
+  if (!defects) meshDiagFast.textContent = t('diag.meshOk');
+  if (diag.openEdges > 0)
+    meshDiagFast.appendChild(makeDiagLine(t('diag.openEdges', { n: diag.openEdges }), 'openEdges'));
+  if (diag.nonManifoldEdges > 0)
+    meshDiagFast.appendChild(makeDiagLine(t('diag.nonManifoldEdges', { n: diag.nonManifoldEdges }), 'nonManifold'));
+  if (diag.shellCount > 1)
+    meshDiagFast.appendChild(makeDiagLine(t('diag.multipleShells', { n: diag.shellCount }), 'shells'));
+  if (defects) {
     const tip = document.createElement('div');
     tip.style.cssText = 'margin-top:4px;opacity:0.8;font-size:10px';
-    tip.innerHTML = t('diag.recommendFix');
+    tip.innerHTML = tHtml('diag.recommendFix');
     meshDiagFast.appendChild(tip);
   }
   applyDiagSeverity();
@@ -3040,16 +4604,20 @@ function renderFastDiag(diag) {
 function renderAdvancedDiag(results) {
   meshDiagAdvanced.innerHTML = '';
 
-  if (results.intersectingPairs === 0 && results.overlappingPairs === 0) {
-    meshDiagAdvanced.textContent = t('diag.advancedOk');
-  } else {
-    if (results.intersectingPairs > 0)
-      meshDiagAdvanced.appendChild(makeDiagLine(t('diag.intersectingTris', { n: results.intersectingPairs }), 'intersects'));
-    if (results.overlappingPairs > 0)
-      meshDiagAdvanced.appendChild(makeDiagLine(t('diag.overlappingTris', { n: results.overlappingPairs }), 'overlaps'));
+  const defects = results.intersectingPairs > 0 || results.overlappingPairs > 0;
+  if (!defects) meshDiagAdvanced.textContent = t('diag.advancedOk');
+  if (results.intersectingPairs > 0)
+    meshDiagAdvanced.appendChild(makeDiagLine(t('diag.intersectingTris', { n: results.intersectingPairs }), 'intersects'));
+  if (results.overlappingPairs > 0)
+    meshDiagAdvanced.appendChild(makeDiagLine(t('diag.overlappingTris', { n: results.overlappingPairs }), 'overlaps'));
+  // Separate parts that touch intersect where each side was tessellated on
+  // its own — harmless for printing, so informational (#125).
+  if (results.bodyIntersectingPairs > 0)
+    meshDiagAdvanced.appendChild(makeDiagLine(t('diag.intersectingBodies', { n: results.bodyIntersectingPairs }), 'bodyIntersects'));
+  if (defects) {
     const tip = document.createElement('div');
     tip.style.cssText = 'margin-top:4px;opacity:0.8;font-size:10px';
-    tip.innerHTML = t('diag.recommendFix');
+    tip.innerHTML = tHtml('diag.recommendFix');
     meshDiagAdvanced.appendChild(tip);
   }
   applyDiagSeverity();
@@ -3064,6 +4632,22 @@ function updateMeshDiagnostics(adjData, triCount) {
   meshDiagnostics.classList.remove('hidden');
   meshDiagAdvanced.classList.add('hidden');
   meshDiagRunBtn.disabled = false;
+}
+
+/**
+ * Seed the output resolution from the model size (1/divisor of the bounding-box
+ * diagonal, clamped to [0.05, 5.0] mm) — unless the user already picked one,
+ * which then carries over to the next model like every other setting.
+ */
+function _applyDefaultRefineLength(bounds, divisor) {
+  if (!refineLengthUserSet) {
+    const diag = Math.sqrt(bounds.size.x ** 2 + bounds.size.y ** 2 + bounds.size.z ** 2);
+    const defaultEdge = Math.max(0.05, Math.min(5.0, +(diag / divisor).toFixed(2)));
+    settings.refineLength = defaultEdge;
+    refineLenSlider.value = defaultEdge;
+    refineLenVal.value = defaultEdge;
+  }
+  checkResolutionWarning();
 }
 
 function checkResolutionWarning() {
@@ -3104,10 +4688,12 @@ function applySmartResolution() {
   // chosen edge assumes decimation will land near `recommendedMaxTri`.
   // Setting them in lockstep means clicking Smart twice is idempotent.
   const d = result.diagnostics;
+  refineLengthUserSet = true;
   settings.refineLength = result.edge;
   refineLenSlider.value = result.edge;
   refineLenVal.value    = result.edge;
   checkResolutionWarning();
+  scheduleDisplacementPreviewResolutionRefresh();
 
   // Set max-tri via the slider's existing input event so settings.maxTriangles
   // and the displayed label stay consistent with all other slider drag paths.
@@ -3118,7 +4704,7 @@ function applySmartResolution() {
   const clampedNote = d.budgetClamped
     ? ` <span class="clamped">[${t('ui.smartResBudgetCapped')}]</span>`
     : '';
-  smartResInfo.innerHTML = t('ui.smartResInfo', {
+  smartResInfo.innerHTML = tHtml('ui.smartResInfo', {
     edge: result.edge.toFixed(2),
     ppe:  d.pixelsPerEdge.toFixed(1),
     pix:  d.pixMm.toFixed(3),
@@ -3136,51 +4722,45 @@ function updateSmartResBtnState() {
 if (smartResBtn) smartResBtn.addEventListener('click', applySmartResolution);
 
 /**
- * Set (or update) the `faceMask` vertex attribute on a geometry.
- * 1.0 = textured, 0.0 = user-excluded.  Angle masking stays in the shader.
+ * Refresh the per-vertex layer attributes the preview shader reads on a
+ * geometry: `layerMask` (vec4, one channel per layer slot — 1 = textured,
+ * 0 = user-excluded, between = soft brush), `layerFalloff` (vec4, boundary
+ * falloff per slot) and `boundaryMaskTypeAttr` (active layer's boundary
+ * type: 0 = user mask, 1 = angle mask). Angle masking stays in the shader.
  *
- * Always creates a fresh Float32BufferAttribute so that Three.js allocates a
- * new WebGL buffer and uploads the current data.  This avoids subtle buffer-
- * caching issues where in-place array edits + needsUpdate could keep stale
- * GPU data on some drivers.
+ * Attributes are created fresh when the geometry's size differs (so Three.js
+ * allocates a new WebGL buffer) and flagged needsUpdate otherwise.
+ *
+ * forceFalloff: recompute the boundary falloff even while a masking tool is
+ * active (a freshly built display mesh needs it for its initial state).
  */
-function updateFaceMask(geometry) {
+function updateFaceMask(geometry, { forceFalloff = false } = {}) {
   if (!geometry) return;
   const posCount = geometry.attributes.position.count;
-  const triCount = posCount / 3;
+  const slots = _layerSlots();
 
-  // Reuse existing buffer if length matches exactly, otherwise allocate new
-  const existing = geometry.getAttribute('faceMask');
-  const reuseBuffer = existing && existing.array.length === posCount;
-  const maskArr = reuseBuffer ? existing.array : new Float32Array(posCount);
+  // Per-slot coverage on this geometry's corners (null = fully textured) and
+  // per-face user-mask flags (null = none) for the falloff passes.
+  const covers = [], hards = [];
+  let activeSlot = -1;
+  for (const { index, isActive } of slots) {
+    if (isActive) activeSlot = covers.length;
+    const r = _layerCoverOn(index, geometry);
+    covers.push(r.cover);
+    hards.push(r.hardMasked);
+  }
 
-  // Determine which face set to check
-  const isPrecision = (geometry === precisionGeometry && precisionMaskingEnabled);
-  const faceSet = isPrecision ? precisionExcludedFaces : excludedFaces;
-
-  // Fast path: no user exclusion active
-  if (faceSet.size === 0 && !selectionMode) {
-    maskArr.fill(1.0);
-  } else {
-    const isDisp = (geometry === dispPreviewGeometry && dispPreviewParentMap);
-    for (let t = 0; t < triCount; t++) {
-      // For precision geometry, t is already a precision face index.
-      // For disp preview, map through dispPreviewParentMap to original.
-      // Otherwise t is already an original face index.
-      const faceIdx = isDisp ? dispPreviewParentMap[t] : t;
-      const excluded = selectionMode ? !faceSet.has(faceIdx) : faceSet.has(faceIdx);
-      const val = excluded ? 0.0 : 1.0;
-      maskArr[t * 3]     = val;
-      maskArr[t * 3 + 1] = val;
-      maskArr[t * 3 + 2] = val;
+  const maskAttr = _ensureAttr(geometry, 'layerMask', posCount, 4, 0.0);
+  const m = maskAttr.array;
+  const nSlots = covers.length;
+  for (let i = 0; i < posCount; i++) {
+    const o = i * 4;
+    for (let k = 0; k < 4; k++) {
+      const c = covers[k];
+      m[o + k] = k < nSlots ? (c ? c[i] : 1) : 0;
     }
   }
-
-  if (reuseBuffer) {
-    existing.needsUpdate = true;
-  } else {
-    geometry.setAttribute('faceMask', new THREE.Float32BufferAttribute(maskArr, 1));
-  }
+  maskAttr.needsUpdate = true;
 
   // Ensure faceNormal attribute exists (needed by shader for angle masking).
   // For the original geometry normal == faceNormal; for subdivided geometry
@@ -3191,27 +4771,33 @@ function updateFaceMask(geometry) {
   }
 
   // Ensure falloff attributes exist so the shader doesn't read 0.0 for missing
-  // attributes (which would make totalMask = 0 → entire model appears masked).
+  // attributes (which would make every weight 0 → entire model appears masked).
   // This matters when a fresh geometry is displayed while the masking tool is
-  // active (e.g. entering precision mode) because the expensive recomputation
+  // active (e.g. a freshly flattened paint mesh) because the expensive recomputation
   // below is intentionally skipped during active masking.
-  if (!geometry.attributes.boundaryFalloffAttr) {
-    const arr = new Float32Array(posCount);
-    arr.fill(1.0);
-    geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(arr, 1));
-  }
-  if (!geometry.attributes.boundaryMaskTypeAttr) {
-    const arr = new Float32Array(posCount);
-    arr.fill(1.0);
-    geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(arr, 1));
-  }
+  const falloffAttr = _ensureAttr(geometry, 'layerFalloff', posCount, 4, 1.0);
+  const typeAttr    = _ensureAttr(geometry, 'boundaryMaskTypeAttr', posCount, 1, 1.0);
 
   // Skip expensive per-vertex falloff and boundary edge recomputation while
   // actively masking; both will be recalculated when the masking tool is
   // deactivated (in setExclusionTool → updateFaceMask with exclusionTool=null).
-  if (!exclusionTool && (_falloffDirty || geometry !== _falloffGeometry)) {
-    computeBoundaryFalloffAttr(geometry, maskArr);
-    computeBoundaryEdges(geometry, maskArr);
+  if (forceFalloff || (!exclusionTool && (_falloffDirty || geometry !== _falloffGeometry))) {
+    const f = falloffAttr.array;
+    f.fill(1.0);
+    typeAttr.array.fill(1.0);
+    for (let k = 0; k < slots.length; k++) {
+      const { index, isActive } = slots[k];
+      const ls = isActive ? settings : layers[index].settings;
+      const dist = ls.boundaryFalloff ?? 0;
+      if (dist <= 0) continue;
+      const r = computeBoundaryFalloff(geometry, hards[k], dist, ls.boundaryFalloffCurve);
+      if (!r) continue;
+      for (let i = 0; i < posCount; i++) f[i * 4 + k] = r.falloff[i];
+      if (isActive) typeAttr.array.set(r.maskType);
+    }
+    falloffAttr.needsUpdate = true;
+    typeAttr.needsUpdate = true;
+    if (!exclusionTool) computeBoundaryEdges(geometry, activeSlot >= 0 ? hards[activeSlot] : null, settings.boundaryFalloff ?? 0);
     _falloffDirty = false;
     _falloffGeometry = geometry;
   }
@@ -3219,41 +4805,59 @@ function updateFaceMask(geometry) {
   requestRender();
 }
 
+/** Get a Float32 attribute of the given item size, (re)creating it (filled with `fill`) when the size doesn't match. */
+function _ensureAttr(geometry, name, posCount, itemSize, fill) {
+  const existing = geometry.getAttribute(name);
+  if (existing && existing.itemSize === itemSize && existing.array.length === posCount * itemSize) return existing;
+  const arr = new Float32Array(posCount * itemSize);
+  if (fill) arr.fill(fill);
+  const attr = new THREE.Float32BufferAttribute(arr, itemSize);
+  geometry.setAttribute(name, attr);
+  return attr;
+}
+
 /**
- * Compute a per-vertex `boundaryFalloffAttr` float attribute on the geometry.
- * Vertices near the boundary between masked and non-masked regions get values
- * ramping from 0 (at boundary) to 1 (at or beyond boundaryFalloff distance).
- * The shader multiplies displacement/bump by this attribute.
+ * Set the boundary-falloff transition curve, sync the segmented buttons, and
+ * refresh the preview. Mirrors displacement.js and the fragment shader in
+ * previewMaterial.js — all three must use the same curve definitions.
+ */
+function setFalloffCurve(mode) {
+  if (!(mode in falloffCurveButtons)) mode = 'linear';
+  settings.boundaryFalloffCurve = mode;
+  for (const [m, btn] of Object.entries(falloffCurveButtons)) {
+    btn.classList.toggle('active', m === mode);
+    btn.setAttribute('aria-pressed', String(m === mode));
+  }
+  _falloffDirty = true;
+  updatePreview();
+}
+
+/** Shape the linear 0→1 falloff ramp per the given curve (default: the active layer's). */
+function applyFalloffCurve(t, mode = settings.boundaryFalloffCurve) {
+  if (mode === 'scurve') return t * t * (3 - 2 * t);
+  if (mode === 'ease')   return t * t;
+  return t;
+}
+
+/**
+ * Per-vertex boundary falloff for one layer on `geometry`. Vertices near the
+ * boundary between masked and non-masked regions get values ramping from 0
+ * (at boundary) to 1 (at or beyond `falloff` mm); the shader multiplies the
+ * layer's weight by it.
  *
  * @param {THREE.BufferGeometry} geometry
- * @param {Float32Array}         userMaskArr – per-vertex user-exclusion mask from updateFaceMask
+ * @param {Uint8Array|null} userMaskedFaces  per-face user-mask flag (1 = masked), null = none
+ * @param {number} falloff   falloff distance (mm), > 0
+ * @param {string} curve     'linear' | 'scurve' | 'ease'
+ * @returns {{ falloff: Float32Array, maskType: Float32Array } | null}
+ *   per-corner ramp and boundary type (0 = user mask, 1 = angle mask); null
+ *   when the layer has no boundary on this geometry
  */
-function computeBoundaryFalloffAttr(geometry, userMaskArr) {
+function computeBoundaryFalloff(geometry, userMaskedFaces, falloff, curve) {
   const posAttr = geometry.attributes.position;
   const posCount = posAttr.count;
   const triCount = posCount / 3;
-  const falloff = settings.boundaryFalloff ?? 0;
-
-  // Reuse existing attribute buffers when sizes match to avoid Three.js
-  // WebGL binding state cache issues when replacing attribute objects on
-  // a geometry that is already attached to a rendered mesh.
-  const existingFalloff = geometry.getAttribute('boundaryFalloffAttr');
-  const reuseFalloff = existingFalloff && existingFalloff.array.length === posCount;
-  const falloffArr = reuseFalloff ? existingFalloff.array : new Float32Array(posCount);
-  falloffArr.fill(1.0);
-
-  const existingType = geometry.getAttribute('boundaryMaskTypeAttr');
-  const reuseType = existingType && existingType.array.length === posCount;
-  const maskTypeArr = reuseType ? existingType.array : new Float32Array(posCount);
-  maskTypeArr.fill(1.0);
-
-  if (falloff <= 0) {
-    if (reuseFalloff) existingFalloff.needsUpdate = true;
-    else geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
-    if (reuseType) existingType.needsUpdate = true;
-    else geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
-    return;
-  }
+  if (!(falloff > 0)) return null;
 
   // Compute per-face combined mask (angle masking + user exclusion).
   // Mirrors the vertex shader logic so the preview boundary matches export.
@@ -3261,8 +4865,7 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   const faceMask = new Float32Array(triCount); // 0 = masked, 1 = textured
   const isUserMasked = new Uint8Array(triCount); // 1 if user-excluded
   for (let t = 0; t < triCount; t++) {
-    const userVal = userMaskArr[t * 3]; // same for all 3 verts of this face
-    if (userVal < 0.5) { faceMask[t] = 0; isUserMasked[t] = 1; continue; }
+    if (userMaskedFaces && userMaskedFaces[t]) { faceMask[t] = 0; isUserMasked[t] = 1; continue; }
 
     let angleMask = 1.0;
     if (faceNrmAttr) {
@@ -3280,15 +4883,19 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
     faceMask[t] = angleMask;
   }
 
-  // Build per-unique-position map and identify boundary positions.
+  // Weld vertices to unique-position ids and accumulate per-id areas.
+  // Arrays are pre-sized to posCount (upper bound on unique count); extra
+  // tail slots stay unused — same pattern as displacement.js.
   const QUANT = 1e4;
-  const posKey = (x, y, z) =>
-    `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
-
-  const posFromKey = new Map();  // posKey → [x, y, z]
-  // Per-position: [maskedArea, totalArea] to find boundary vertices
-  const maskFracMap = new Map();
-  const userMaskAreaMap = new Map(); // posKey → area of user-masked faces
+  const weldMap = new QuantizedPointMap(QUANT, Math.min(posCount, 1 << 22));
+  let nUnique = 0;
+  const vertId = new Uint32Array(posCount);
+  const idPosX = new Float64Array(posCount);  // first-occurrence position per id
+  const idPosY = new Float64Array(posCount);
+  const idPosZ = new Float64Array(posCount);
+  const maskedArea   = new Float64Array(posCount);
+  const totalArea    = new Float64Array(posCount);
+  const userMaskArea = new Float64Array(posCount);
   const tmpV = new THREE.Vector3();
   const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
   const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
@@ -3305,42 +4912,30 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
 
     for (let v = 0; v < 3; v++) {
       tmpV.fromBufferAttribute(posAttr, t * 3 + v);
-      const k = posKey(tmpV.x, tmpV.y, tmpV.z);
-      if (!posFromKey.has(k)) posFromKey.set(k, [tmpV.x, tmpV.y, tmpV.z]);
-      const mf = maskFracMap.get(k);
-      if (mf) {
-        if (masked) mf[0] += area;
-        mf[1] += area;
-      } else {
-        maskFracMap.set(k, [masked ? area : 0, area]);
+      const id = weldMap.getOrSet(tmpV.x, tmpV.y, tmpV.z, nUnique);
+      if (weldMap.inserted) {
+        nUnique++;
+        idPosX[id] = tmpV.x; idPosY[id] = tmpV.y; idPosZ[id] = tmpV.z;
       }
+      vertId[t * 3 + v] = id;
+      if (masked) maskedArea[id] += area;
+      totalArea[id] += area;
       // Track user-mask area per position to classify boundary type
-      if (isUserMasked[t]) {
-        const prev = userMaskAreaMap.get(k) || 0;
-        userMaskAreaMap.set(k, prev + area);
-      }
+      if (isUserMasked[t]) userMaskArea[id] += area;
     }
   }
 
   // Boundary positions: shared between masked and non-masked faces.
   // Each entry: [x, y, z, maskType] where maskType 0 = user, 1 = angle.
   const boundaryPositions = [];
-  for (const [k, pos] of posFromKey) {
-    const mf = maskFracMap.get(k);
-    const frac = mf[1] > 0 ? mf[0] / mf[1] : 0;
+  for (let id = 0; id < nUnique; id++) {
+    const frac = totalArea[id] > 0 ? maskedArea[id] / totalArea[id] : 0;
     if (frac > 0 && frac < 1) {
-      const userArea = userMaskAreaMap.get(k) || 0;
-      boundaryPositions.push([pos[0], pos[1], pos[2], userArea > 0 ? 0 : 1]);
+      boundaryPositions.push([idPosX[id], idPosY[id], idPosZ[id], userMaskArea[id] > 0 ? 0 : 1]);
     }
   }
 
-  if (boundaryPositions.length === 0) {
-    if (reuseFalloff) existingFalloff.needsUpdate = true;
-    else geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
-    if (reuseType) existingType.needsUpdate = true;
-    else geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
-    return;
-  }
+  if (boundaryPositions.length === 0) return null;
 
   // Spatial grid of boundary positions for fast nearest-neighbor search
   let gMinX = Infinity, gMinY = Infinity, gMinZ = Infinity;
@@ -3374,23 +4969,22 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   const searchY = Math.ceil(falloff / gDy);
   const searchZ = Math.ceil(falloff / gDz);
 
-  // Compute per-unique-position falloff factor and mask type
-  const falloffCache = new Map(); // posKey → factor [0,1]
-  const maskTypeCache = new Map(); // posKey → 0 (user mask) or 1 (angle mask)
-  for (const [k, pos] of posFromKey) {
-    const mf = maskFracMap.get(k);
-    const frac = mf[1] > 0 ? mf[0] / mf[1] : 0;
+  // Compute per-unique-position falloff factor and mask type.
+  // -1 = unset (keep the 1.0 default written into the attribute arrays).
+  const falloffById  = new Float32Array(nUnique).fill(-1);
+  const maskTypeById = new Float32Array(nUnique).fill(-1);
+  for (let id = 0; id < nUnique; id++) {
+    const frac = totalArea[id] > 0 ? maskedArea[id] / totalArea[id] : 0;
     if (frac >= 1) continue; // fully masked vertex — keep 1.0 (mask zeroes it anyway)
     // Boundary vertices (shared between masked and unmasked faces) are AT
     // the boundary → distance 0 → falloff factor 0.
     if (frac > 0) {
-      falloffCache.set(k, 0);
-      const userArea = userMaskAreaMap.get(k) || 0;
-      maskTypeCache.set(k, userArea > 0 ? 0 : 1);
+      falloffById[id] = 0;
+      maskTypeById[id] = userMaskArea[id] > 0 ? 0 : 1;
       continue;
     }
 
-    const px = pos[0], py = pos[1], pz = pos[2];
+    const px = idPosX[id], py = idPosY[id], pz = idPosZ[id];
     const cix = Math.max(0, Math.min(gRes - 1, Math.floor((px - gMinX) / gDx)));
     const ciy = Math.max(0, Math.min(gRes - 1, Math.floor((py - gMinY) / gDy)));
     const ciz = Math.max(0, Math.min(gRes - 1, Math.floor((pz - gMinZ) / gDz)));
@@ -3419,45 +5013,41 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
     const dist = Math.sqrt(minDist2);
     const factor = Math.min(1, dist / falloff);
     if (factor < 1) {
-      falloffCache.set(k, factor);
-      maskTypeCache.set(k, nearestType);
+      falloffById[id] = applyFalloffCurve(factor, curve);
+      maskTypeById[id] = nearestType;
     }
   }
 
-  // Write per-vertex attributes
+  // Write per-corner results via the welded id (no re-keying pass)
+  const falloffArr  = new Float32Array(posCount).fill(1.0);
+  const maskTypeArr = new Float32Array(posCount).fill(1.0);
   for (let i = 0; i < posCount; i++) {
-    tmpV.fromBufferAttribute(posAttr, i);
-    const k = posKey(tmpV.x, tmpV.y, tmpV.z);
-    if (falloffCache.has(k)) falloffArr[i] = falloffCache.get(k);
-    if (maskTypeCache.has(k)) maskTypeArr[i] = maskTypeCache.get(k);
+    const id = vertId[i];
+    if (falloffById[id] >= 0) falloffArr[i] = falloffById[id];
+    if (maskTypeById[id] >= 0) maskTypeArr[i] = maskTypeById[id];
   }
-
-  if (reuseFalloff) existingFalloff.needsUpdate = true;
-  else geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
-  if (reuseType) existingType.needsUpdate = true;
-  else geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
+  return { falloff: falloffArr, maskType: maskTypeArr };
 }
 
 /**
- * Compute boundary edge segments between masked and non-masked faces and
- * pack them into a DataTexture for per-fragment distance queries in the
- * bump-only preview shader.  Each edge is stored as two RGBA texels
+ * Compute boundary edge segments between masked and non-masked faces (active
+ * layer) and pack them into a DataTexture for per-fragment distance queries
+ * in the bump-only preview shader.  Each edge is stored as two RGBA texels
  * (endpoint A xyz, endpoint B xyz).
  */
-function computeBoundaryEdges(geometry, userMaskArr) {
+function computeBoundaryEdges(geometry, userMaskedFaces, falloff) {
   const posAttr = geometry.attributes.position;
   const posCount = posAttr.count;
   const triCount = posCount / 3;
-  const falloff = settings.boundaryFalloff ?? 0;
 
   if (_boundaryEdgeTex) { _boundaryEdgeTex.dispose(); _boundaryEdgeTex = null; }
   _boundaryEdgeCount = 0;
-  if (falloff <= 0) return;
+  if (!(falloff > 0)) return;
 
   const faceNrmAttr = geometry.attributes.faceNormal;
   const faceMaskBool = new Uint8Array(triCount);
   for (let t = 0; t < triCount; t++) {
-    if (userMaskArr[t * 3] < 0.5) { faceMaskBool[t] = 0; continue; }
+    if (userMaskedFaces && userMaskedFaces[t]) { faceMaskBool[t] = 0; continue; }
     let angleMask = 1.0;
     if (faceNrmAttr) {
       const fnx = faceNrmAttr.getX(t * 3);
@@ -3475,28 +5065,34 @@ function computeBoundaryEdges(geometry, userMaskArr) {
   }
 
   const QUANT = 1e4;
-  const pk = (x, y, z) =>
-    `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
-  const ek = (k1, k2) => k1 < k2 ? k1 + '|' + k2 : k2 + '|' + k1;
+  const weldMap = new QuantizedPointMap(QUANT, Math.min(posCount, 1 << 22));
+  let nUnique = 0;
   const tmpV = new THREE.Vector3();
 
-  const edgeFaces = new Map();
-  const edgePos   = new Map();
+  const edgeFaces = new Map();   // numeric edge key → [face, ...]
+  const edgePos   = new Map();   // numeric edge key → [[x,y,z], [x,y,z]]
+  // ids < posCount, so a*posCount+b is collision-free below ~94M vertices
+  // (same bound as exclusion.js numEdgeKey).
+  const EKM = posCount;
+  const ids = new Uint32Array(3);
+  const ptx = new Float64Array(3), pty = new Float64Array(3), ptz = new Float64Array(3);
 
   for (let t = 0; t < triCount; t++) {
-    const keys = [], pts = [];
     for (let v = 0; v < 3; v++) {
       tmpV.fromBufferAttribute(posAttr, t * 3 + v);
-      keys.push(pk(tmpV.x, tmpV.y, tmpV.z));
-      pts.push([tmpV.x, tmpV.y, tmpV.z]);
+      const id = weldMap.getOrSet(tmpV.x, tmpV.y, tmpV.z, nUnique);
+      if (weldMap.inserted) nUnique++;
+      ids[v] = id; ptx[v] = tmpV.x; pty[v] = tmpV.y; ptz[v] = tmpV.z;
     }
     for (let e = 0; e < 3; e++) {
-      const edgeKey = ek(keys[e], keys[(e + 1) % 3]);
+      const e2 = (e + 1) % 3;
+      const a = ids[e], b = ids[e2];
+      const edgeKey = a < b ? a * EKM + b : b * EKM + a;
       const list = edgeFaces.get(edgeKey);
       if (list) list.push(t);
       else {
         edgeFaces.set(edgeKey, [t]);
-        edgePos.set(edgeKey, [pts[e], pts[(e + 1) % 3]]);
+        edgePos.set(edgeKey, [[ptx[e], pty[e], ptz[e]], [ptx[e2], pty[e2], ptz[e2]]]);
       }
     }
   }
@@ -3543,175 +5139,98 @@ function syncBoundaryEdgeUniforms() {
   u.boundaryFalloffDist.value = settings.boundaryFalloff ?? 0;
 }
 
-/**
- * Build a mapping from each subdivided face to its nearest original face
- * using a grid-accelerated nearest-centroid lookup, with face normal
- * tiebreaking to prevent boundary faces from being mapped to the wrong
- * original face (e.g. a subdivided face on a cube edge mapped to the
- * adjacent face instead of the correct one).
- */
-function buildParentFaceMap(subdivGeo) {
-  if (!triangleCentroids || !currentGeometry) return null;
-
-  const origPos = currentGeometry.attributes.position.array;
-  const origTriCount = currentGeometry.attributes.position.count / 3;
-  const subPos = subdivGeo.attributes.position.array;
-  const subTriCount = subdivGeo.attributes.position.count / 3;
-
-  // Precompute original face normals
-  const origNormals = new Float32Array(origTriCount * 3);
-  const _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3(), _fn = new THREE.Vector3();
-  for (let t = 0; t < origTriCount; t++) {
-    const b = t * 9;
-    _e1.set(origPos[b + 3] - origPos[b], origPos[b + 4] - origPos[b + 1], origPos[b + 5] - origPos[b + 2]);
-    _e2.set(origPos[b + 6] - origPos[b], origPos[b + 7] - origPos[b + 1], origPos[b + 8] - origPos[b + 2]);
-    _fn.crossVectors(_e1, _e2).normalize();
-    origNormals[t * 3] = _fn.x; origNormals[t * 3 + 1] = _fn.y; origNormals[t * 3 + 2] = _fn.z;
-  }
-
-  // Bounding box of original centroids
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-  for (let i = 0; i < origTriCount; i++) {
-    const cx = triangleCentroids[i * 3], cy = triangleCentroids[i * 3 + 1], cz = triangleCentroids[i * 3 + 2];
-    if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
-    if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
-    if (cz < minZ) minZ = cz; if (cz > maxZ) maxZ = cz;
-  }
-  const pad = 1e-3;
-  minX -= pad; minY -= pad; minZ -= pad;
-  maxX += pad; maxY += pad; maxZ += pad;
-
-  const res = Math.max(4, Math.min(128, Math.ceil(Math.cbrt(origTriCount) * 2)));
-  const dx = (maxX - minX) / res || 1;
-  const dy = (maxY - minY) / res || 1;
-  const dz = (maxZ - minZ) / res || 1;
-
-  // Build spatial grid of original centroids
-  const grid = new Map();
-  const cellKey = (ix, iy, iz) => (ix * res + iy) * res + iz;
-  for (let i = 0; i < origTriCount; i++) {
-    const cx = triangleCentroids[i * 3], cy = triangleCentroids[i * 3 + 1], cz = triangleCentroids[i * 3 + 2];
-    const ix = Math.max(0, Math.min(res - 1, Math.floor((cx - minX) / dx)));
-    const iy = Math.max(0, Math.min(res - 1, Math.floor((cy - minY) / dy)));
-    const iz = Math.max(0, Math.min(res - 1, Math.floor((cz - minZ) / dz)));
-    const k = cellKey(ix, iy, iz);
-    const cell = grid.get(k);
-    if (cell) cell.push(i); else grid.set(k, [i]);
-  }
-
-  // For each subdivided face, find nearest original face by centroid distance
-  // with face-normal tiebreaking to resolve boundary ambiguity.
-  const parentMap = new Int32Array(subTriCount);
-  for (let st = 0; st < subTriCount; st++) {
-    const base = st * 9;
-    const sx = (subPos[base] + subPos[base + 3] + subPos[base + 6]) / 3;
-    const sy = (subPos[base + 1] + subPos[base + 4] + subPos[base + 7]) / 3;
-    const sz = (subPos[base + 2] + subPos[base + 5] + subPos[base + 8]) / 3;
-
-    // Subdivided face normal
-    _e1.set(subPos[base + 3] - subPos[base], subPos[base + 4] - subPos[base + 1], subPos[base + 5] - subPos[base + 2]);
-    _e2.set(subPos[base + 6] - subPos[base], subPos[base + 7] - subPos[base + 1], subPos[base + 8] - subPos[base + 2]);
-    _fn.crossVectors(_e1, _e2).normalize();
-    const snx = _fn.x, sny = _fn.y, snz = _fn.z;
-
-    const ix = Math.max(0, Math.min(res - 1, Math.floor((sx - minX) / dx)));
-    const iy = Math.max(0, Math.min(res - 1, Math.floor((sy - minY) / dy)));
-    const iz = Math.max(0, Math.min(res - 1, Math.floor((sz - minZ) / dz)));
-
-    let bestDist = Infinity, bestIdx = 0;
-    // Two-pass: prefer original faces whose normal aligns with the subdivided
-    // face (dot > 0.4 ≈ within ~66°), then among those pick the nearest
-    // centroid.  This prevents boundary faces at sharp seams (cube edges etc.)
-    // from being mapped to the adjacent face even when that face's centroid
-    // happens to be closer.  Falls back to pure nearest-centroid if no
-    // normal-matching candidate is found.
-    let bestDistAligned = Infinity, bestIdxAligned = -1;
-    for (let dix = -1; dix <= 1; dix++) {
-      for (let diy = -1; diy <= 1; diy++) {
-        for (let diz = -1; diz <= 1; diz++) {
-          const nix = ix + dix, niy = iy + diy, niz = iz + diz;
-          if (nix < 0 || nix >= res || niy < 0 || niy >= res || niz < 0 || niz >= res) continue;
-          const cell = grid.get(cellKey(nix, niy, niz));
-          if (!cell) continue;
-          for (const oi of cell) {
-            const cdx = sx - triangleCentroids[oi * 3];
-            const cdy = sy - triangleCentroids[oi * 3 + 1];
-            const cdz = sz - triangleCentroids[oi * 3 + 2];
-            const centroidDist = cdx * cdx + cdy * cdy + cdz * cdz;
-            if (centroidDist < bestDist) { bestDist = centroidDist; bestIdx = oi; }
-            const dot = snx * origNormals[oi * 3] + sny * origNormals[oi * 3 + 1] + snz * origNormals[oi * 3 + 2];
-            if (dot > 0.4 && centroidDist < bestDistAligned) {
-              bestDistAligned = centroidDist; bestIdxAligned = oi;
-            }
-          }
-        }
-      }
-    }
-
-    // If the local grid search didn't find a normal-aligned original face
-    // (common for sparse original meshes like cubes where face centroids
-    // are far from the grid cell of a corner-adjacent subdivided face),
-    // fall back to a brute-force scan over ALL original faces.
-    if (bestIdxAligned < 0) {
-      for (let oi = 0; oi < origTriCount; oi++) {
-        const cdx = sx - triangleCentroids[oi * 3];
-        const cdy = sy - triangleCentroids[oi * 3 + 1];
-        const cdz = sz - triangleCentroids[oi * 3 + 2];
-        const centroidDist = cdx * cdx + cdy * cdy + cdz * cdz;
-        if (centroidDist < bestDist) { bestDist = centroidDist; bestIdx = oi; }
-        const dot = snx * origNormals[oi * 3] + sny * origNormals[oi * 3 + 1] + snz * origNormals[oi * 3 + 2];
-        if (dot > 0.4 && centroidDist < bestDistAligned) {
-          bestDistAligned = centroidDist; bestIdxAligned = oi;
-        }
-      }
-    }
-    parentMap[st] = bestIdxAligned >= 0 ? bestIdxAligned : bestIdx;
-  }
-
-  return parentMap;
+/** The active layer's map after texture smoothing / inversion (see _effectiveMapFor). */
+function getEffectiveMapEntry() {
+  return _effectiveMapFor(activeMapEntry, settings.textureSmoothing, settings.invertTexture);
 }
 
-function getEffectiveMapEntry() {
-  if (!activeMapEntry || settings.textureSmoothing === 0) {
-    _effectiveMapCache    = null;
-    _effectiveMapCacheKey = null;
-    return activeMapEntry;
+// Processed-map cache: one entry per (map, smoothing, invert) combination in
+// use. Several layers can share a map with different processing, so keep a
+// few entries and drop the least recently used beyond that.
+const _effectiveMapCache = new Map();   // cacheKey → { entry, fullCanvas }
+const EFFECTIVE_MAP_CACHE_MAX = MAX_LAYERS + 2;
+
+/**
+ * A map entry with `textureSmoothing` (px of a 512 px map) and `invert`
+ * applied — the pixels BOTH the GPU preview and the CPU bake/export consume.
+ * Returns the raw entry when nothing needs processing, null for no map.
+ */
+function _effectiveMapFor(mapEntry, textureSmoothing, invert) {
+  if (!mapEntry) return null;
+  if (!mapEntry.texture) return null;   // still loading
+  if ((textureSmoothing ?? 0) === 0 && !invert) return mapEntry;
+  const { fullCanvas, width, height, name } = mapEntry;
+  const cacheKey = `${name}_${width}_${height}_${textureSmoothing}_${!!invert}_${mapEntry.customId ?? ''}`;
+  // Two uploads can share a file name and size, so also check it was derived from this very map.
+  const hit = _effectiveMapCache.get(cacheKey);
+  if (hit && hit.fullCanvas === fullCanvas) {
+    _effectiveMapCache.delete(cacheKey);   // refresh LRU order
+    _effectiveMapCache.set(cacheKey, hit);
+    return hit.entry;
   }
-  const { fullCanvas, width, height, name } = activeMapEntry;
-  const cacheKey = `${name}_${width}_${height}_${settings.textureSmoothing}`;
-  if (_effectiveMapCacheKey === cacheKey && _effectiveMapCache) {
-    return _effectiveMapCache;
-  }
-  // Tile the source 3×3 before blurring so edge pixels have correct
-  // neighbours and the blurred centre tile is seamlessly tileable.
-  const tiled = document.createElement('canvas');
-  tiled.width  = width  * 3;
-  tiled.height = height * 3;
-  const tc = tiled.getContext('2d');
-  for (let row = 0; row < 3; row++) {
-    for (let col = 0; col < 3; col++) {
-      tc.drawImage(fullCanvas, col * width, row * height);
-    }
-  }
-  // Blur the 3×3 canvas, then crop out only the centre tile.
-  const blurred = document.createElement('canvas');
-  blurred.width  = width  * 3;
-  blurred.height = height * 3;
-  blurred.getContext('2d').drawImage(tiled, 0, 0);
-  blurCanvas(blurred, settings.textureSmoothing);
   const offscreen = document.createElement('canvas');
   offscreen.width  = width;
   offscreen.height = height;
-  offscreen.getContext('2d').drawImage(blurred, width, height, width, height, 0, 0, width, height);
-  const imageData = offscreen.getContext('2d').getImageData(0, 0, width, height);
+  const ctx = offscreen.getContext('2d');
+  if (textureSmoothing > 0) {
+    // The slider is in pixels of a 512 px map; custom maps can be up to
+    // 2048 px (#89), so scale the radius to blur the same share of the tile.
+    const sigma = textureSmoothing * Math.max(1, Math.max(width, height) / REF_TEXTURE_SIZE);
+    // Surround the tile with wrapped copies of itself before blurring so edge
+    // pixels have correct neighbours and the blurred centre tile is seamlessly
+    // tileable. A 4σ margin covers the blur kernel; capping it (instead of a
+    // full 3×3 tiling) keeps a 2048 px map under iOS's ~16.7 Mpx canvas limit.
+    const padX = Math.min(width,  Math.ceil(4 * sigma) + 2);
+    const padY = Math.min(height, Math.ceil(4 * sigma) + 2);
+    const tiled = document.createElement('canvas');
+    tiled.width  = width  + 2 * padX;
+    tiled.height = height + 2 * padY;
+    const tc = tiled.getContext('2d');
+    for (let row = -1; row <= 1; row++) {
+      for (let col = -1; col <= 1; col++) {
+        tc.drawImage(fullCanvas, padX + col * width, padY + row * height);
+      }
+    }
+    // Blur the padded canvas, then crop out only the centre tile.
+    blurCanvas(tiled, sigma);
+    ctx.drawImage(tiled, padX, padY, width, height, 0, 0, width, height);
+  } else {
+    ctx.drawImage(fullCanvas, 0, 0);
+  }
+  const imageData = ctx.getImageData(0, 0, width, height);
+  if (invert) {
+    // Invert the height map itself; amplitude still controls push/pull direction.
+    // Both the GPU preview and CPU bake/export consume these same pixels.
+    const pixels = imageData.data;
+    for (let i = 0; i < pixels.length; i += 4) {
+      pixels[i]     = 255 - pixels[i];
+      pixels[i + 1] = 255 - pixels[i + 1];
+      pixels[i + 2] = 255 - pixels[i + 2];
+      // Height sampling ignores alpha. Keep the processed map opaque so
+      // Canvas2D preserves the same RGB values used by CPU bake/export.
+      pixels[i + 3] = 255;
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
   const texture   = new THREE.CanvasTexture(offscreen);
   texture.wrapS   = texture.wrapT = THREE.RepeatWrapping;
-  if (_lastEffectiveTexture) _lastEffectiveTexture.dispose();
-  _lastEffectiveTexture = texture;
-  _effectiveMapCache    = { ...activeMapEntry, imageData, texture };
-  _effectiveMapCacheKey = cacheKey;
-  return _effectiveMapCache;
+  const entry = { ...mapEntry, imageData, texture };
+  _effectiveMapCache.set(cacheKey, { entry, fullCanvas });
+  while (_effectiveMapCache.size > EFFECTIVE_MAP_CACHE_MAX) {
+    const oldestKey = _effectiveMapCache.keys().next().value;
+    const old = _effectiveMapCache.get(oldestKey);
+    _effectiveMapCache.delete(oldestKey);
+    if (old && old.entry.texture && previewMaterial) {
+      // Don't yank a texture the material still samples; it'll be replaced
+      // on the next updatePreview and disposed with the material.
+      const u = previewMaterial.uniforms;
+      const bound = [u.map0, u.map1, u.map2, u.map3].some(m => m && m.value === old.entry.texture);
+      if (!bound) old.entry.texture.dispose();
+    } else if (old && old.entry.texture) {
+      old.entry.texture.dispose();
+    }
+  }
+  return entry;
 }
 
 // Build the regularize.js opts object from current settings.  Centralised so
@@ -3724,26 +5243,47 @@ function _regularizeOpts() {
     extremeSliverAspect:       settings.regularizeExtremeAspect,
     maxNormalDeltaCos:         Math.cos(settings.regularizeNormalDeg          * Math.PI / 180),
     aggressiveNormalDeltaCos:  Math.cos(settings.regularizeAggressiveNormalDeg * Math.PI / 180),
+    // Preserve-untextured beta: freezes excludeWeight-marked faces. Inert on
+    // geometry without the attribute (e.g. the displacement-preview path).
+    preserveExcluded:          settings.preserveUntextured,
   };
+}
+
+// Global settings for the preview material's uniforms (per-layer parameters
+// come from _previewLayers).
+function _materialSettings(preview) {
+  return {
+    bounds: currentBounds,
+    bottomAngleLimit: settings.bottomAngleLimit,
+    topAngleLimit:    settings.topAngleLimit,
+    noDownwardZ:      settings.noDownwardZ,
+    // The displaced mesh exists only once its async build finishes; until
+    // then the base mesh keeps bump-only shading.
+    useDisplacement: settings.useDisplacement && !!dispPreviewGeometry,
+    activeLayer: preview.activeIdx,
+    // Per-fragment edge falloff (bump-only mode) follows the active layer.
+    boundaryFalloff:      settings.boundaryFalloff,
+    boundaryFalloffCurve: settings.boundaryFalloffCurve,
+    // With several layers, surfaces the active layer does not cover are
+    // shown in neutral grey instead of the single-layer orange/dark grey.
+    layeredTint: preview.count > 1,
+    // Outline wrap: the shader maps it as cylindrical until the mesh on screen has its places.
+    outlineWrapReady: _owReadyOn(_displayGeometry()),
+    outlineWrapMean:  _owWrap ? _owWrap.meanLength : 1,
+  };
+}
+
+/** Rebuild the preview material's per-layer uniforms and global settings. */
+function _syncPreviewMaterial() {
+  if (!previewMaterial) return;
+  const preview = _previewLayers();
+  updateMaterial(previewMaterial, preview.list, _materialSettings(preview));
 }
 
 function updatePreview() {
   if (!currentGeometry || !currentBounds) return;
 
-  // Texture aspect correction so non-square textures keep their proportions.
-  // A 512×279 texture needs aspectV = 512/279 ≈ 1.84 so V tiles faster (more
-  // repetitions), making each tile shorter in world-space to match the texture's
-  // wider-than-tall content.  The wider axis gets aspect = 1 (unchanged).
-  const tw = activeMapEntry?.width ?? 1, th = activeMapEntry?.height ?? 1;
-  const tmax = Math.max(tw, th, 1);
-  const fullSettings = {
-    ...settings,
-    bounds: currentBounds,
-    textureAspectU: tmax / Math.max(tw, 1),
-    textureAspectV: tmax / Math.max(th, 1),
-  };
-
-  if (!activeMapEntry) {
+  if (!_hasTexturedLayer()) {
     // No map yet — plain material
     if (previewMaterial) {
       setMeshMaterial(null);
@@ -3754,26 +5294,24 @@ function updatePreview() {
     export3mfBtn.disabled = true;
     bakeBtn.disabled = true;
     updateSmartResBtnState();
+    _renderLayerStrip();
     return;
   }
 
-  // Choose geometry: precision mode → subdivided preview → original
-  const activeGeo = (precisionMaskingEnabled && precisionGeometry)
-    ? precisionGeometry
-    : (settings.useDisplacement && dispPreviewGeometry)
-      ? dispPreviewGeometry
-      : currentGeometry;
+  // Choose geometry: 3D preview → painted (flattened tree) → original
+  _refreshPaintGeometry();
+  const activeGeo = _displayGeometry();
 
-  // Ensure faceMask attribute is current before rendering
+  // Ensure the per-layer mask attributes are current before rendering
   updateFaceMask(activeGeo);
+  _syncOutlineWrap(activeGeo);
 
-  const effectiveEntry = getEffectiveMapEntry();
-
+  const preview = _previewLayers();
   if (!previewMaterial) {
-    previewMaterial = createPreviewMaterial(effectiveEntry.texture, fullSettings);
+    previewMaterial = createPreviewMaterial(preview.list, _materialSettings(preview));
     loadGeometry(activeGeo, previewMaterial);
   } else {
-    updateMaterial(previewMaterial, effectiveEntry.texture, fullSettings);
+    updateMaterial(previewMaterial, preview.list, _materialSettings(preview));
   }
 
   syncBoundaryEdgeUniforms();
@@ -3781,333 +5319,25 @@ function updatePreview() {
   export3mfBtn.disabled = false;
   bakeBtn.disabled = isBaking;
   updateSmartResBtnState();
+  _renderLayerStrip();
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
 
 /**
- * Compute and set flat geometric face normals as a `faceNormal` attribute.
- * Unlike the `normal` attribute (which may be smooth/interpolated after
- * subdivision), `faceNormal` is always the true per-triangle normal computed
- * from the cross product of the triangle's edges.  The shader uses this for
- * angle-based masking so that smooth normals at edges don't cause mask bleeding.
+ * Set flat geometric face normals as a `faceNormal` attribute (the shader's
+ * angle masking reads them — see computeFaceNormals in previewPipeline.js).
  */
 function addFaceNormals(geometry) {
-  const pos   = geometry.attributes.position.array;
-  const count = geometry.attributes.position.count;
-  const fn    = new Float32Array(count * 3);
-  const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
-  const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), n  = new THREE.Vector3();
-  for (let i = 0; i < count; i += 3) {
-    vA.set(pos[i * 3],       pos[i * 3 + 1],       pos[i * 3 + 2]);
-    vB.set(pos[(i+1) * 3],   pos[(i+1) * 3 + 1],   pos[(i+1) * 3 + 2]);
-    vC.set(pos[(i+2) * 3],   pos[(i+2) * 3 + 1],   pos[(i+2) * 3 + 2]);
-    e1.subVectors(vB, vA);
-    e2.subVectors(vC, vA);
-    n.crossVectors(e1, e2).normalize();
-    for (let v = 0; v < 3; v++) {
-      fn[(i + v) * 3]     = n.x;
-      fn[(i + v) * 3 + 1] = n.y;
-      fn[(i + v) * 3 + 2] = n.z;
-    }
-  }
+  const fn = computeFaceNormals(geometry.attributes.position.array);
   geometry.setAttribute('faceNormal', new THREE.Float32BufferAttribute(fn, 3));
 }
 
 /**
- * Compute area-weighted smooth normals for a non-indexed geometry and store
- * them as a `smoothNormal` vec3 attribute.  Every copy of the same position
- * gets the same averaged normal so vertex-shader displacement is watertight.
- */
-function addSmoothNormals(geometry) {
-  const pos   = geometry.attributes.position.array;
-  const count = geometry.attributes.position.count;
-  const nrm   = geometry.attributes.normal.array;
-
-  // Vertex-dedup pass: assign a numeric ID to each unique quantised position.
-  const QUANT = 1e4;
-  const dedupMap = new Map();
-  let nextId = 0;
-  const vertId = new Uint32Array(count);
-  for (let i = 0; i < count; i++) {
-    const key = `${Math.round(pos[i*3]*QUANT)}_${Math.round(pos[i*3+1]*QUANT)}_${Math.round(pos[i*3+2]*QUANT)}`;
-    let id = dedupMap.get(key);
-    if (id === undefined) { id = nextId++; dedupMap.set(key, id); }
-    vertId[i] = id;
-  }
-
-  // Accumulate area-weighted buffer normals per unique position into flat arrays.
-  // The subdivision pipeline splits indexed vertices at sharp dihedral edges
-  // (>30 deg) so the interpolated buffer normals are smooth across soft edges
-  // (cylinder, sphere) but sharp across hard edges (cube).  Using these buffer
-  // normals instead of geometric face normals eliminates visible faceting steps
-  // on round surfaces while still preserving hard edges.
-  const uc = nextId;
-  const snx = new Float64Array(uc), sny = new Float64Array(uc), snz = new Float64Array(uc);
-  const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
-  const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
-
-  for (let i = 0; i < count; i += 3) {
-    vA.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
-    vB.set(pos[(i + 1) * 3], pos[(i + 1) * 3 + 1], pos[(i + 1) * 3 + 2]);
-    vC.set(pos[(i + 2) * 3], pos[(i + 2) * 3 + 1], pos[(i + 2) * 3 + 2]);
-    e1.subVectors(vB, vA);
-    e2.subVectors(vC, vA);
-    fn.crossVectors(e1, e2);
-    const area = fn.length();
-    if (area < 1e-12) continue;
-    for (let v = 0; v < 3; v++) {
-      const vi = i + v;
-      const id = vertId[vi];
-      snx[id] += nrm[vi * 3]     * area;
-      sny[id] += nrm[vi * 3 + 1] * area;
-      snz[id] += nrm[vi * 3 + 2] * area;
-    }
-  }
-
-  // Normalize accumulated normals
-  for (let id = 0; id < uc; id++) {
-    const len = Math.sqrt(snx[id] * snx[id] + sny[id] * sny[id] + snz[id] * snz[id]) || 1;
-    snx[id] /= len; sny[id] /= len; snz[id] /= len;
-  }
-
-  // Write smoothNormal attribute via vertId lookup
-  const sn = new Float32Array(count * 3);
-  for (let i = 0; i < count; i++) {
-    const id = vertId[i];
-    sn[i * 3] = snx[id]; sn[i * 3 + 1] = sny[id]; sn[i * 3 + 2] = snz[id];
-  }
-  geometry.setAttribute('smoothNormal', new THREE.Float32BufferAttribute(sn, 3));
-}
-
-// ── Precision masking ─────────────────────────────────────────────────────────
-
-/** Compute the target max edge length from the brush diameter. */
-function computePrecisionEdgeLength(brushDiameter) {
-  // ~20 edge segments around the brush circumference, clamped to a sane floor
-  return Math.max(0.05, Math.PI * brushDiameter / 20);
-}
-
-/**
- * Estimate how many triangles subdivision will produce for a given edge length.
- * Uses a sample of existing edges to compute average edge length, then
- * assumes area-proportional subdivision: triCount × (avgEdge / target)².
- */
-function estimateSubdivisionTriCount(geometry, targetEdge) {
-  const pos = geometry.attributes.position;
-  const triCount = pos.count / 3;
-  // Sample up to 3000 edges (1000 triangles × 3 edges)
-  const sampleTris = Math.min(triCount, 1000);
-  let totalEdgeLen = 0;
-  let edgeCount = 0;
-  for (let t = 0; t < sampleTris; t++) {
-    const i = t * 3;
-    for (let e = 0; e < 3; e++) {
-      const a = i + e, b = i + (e + 1) % 3;
-      const dx = pos.getX(a) - pos.getX(b);
-      const dy = pos.getY(a) - pos.getY(b);
-      const dz = pos.getZ(a) - pos.getZ(b);
-      totalEdgeLen += Math.sqrt(dx * dx + dy * dy + dz * dz);
-      edgeCount++;
-    }
-  }
-  if (edgeCount === 0) return triCount;
-  const avgEdge = totalEdgeLen / edgeCount;
-  const ratio = avgEdge / targetEdge;
-  return Math.max(triCount, Math.round(triCount * ratio * ratio));
-}
-
-/** Deactivate precision masking and bake the refined mesh as the new base geometry. */
-function deactivatePrecisionMasking() {
-  if (precisionGeometry) {
-    // Bake: the precision geometry becomes the new currentGeometry
-    if (currentGeometry && currentGeometry !== precisionGeometry) {
-      currentGeometry.dispose();
-    }
-    currentGeometry = precisionGeometry;
-
-    // Promote precision adjacency data to the base adjacency
-    triangleAdjacency   = precisionAdjacency;
-    triangleCentroids   = precisionCentroids;
-    triangleFaceNormals = precisionFaceNormals;
-
-    // Promote precision excluded faces to the base set
-    excludedFaces = precisionExcludedFaces;
-
-    // Update mesh info display
-    const mb = ((currentGeometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
-    const sx = currentBounds.size.x.toFixed(2);
-    const sy = currentBounds.size.y.toFixed(2);
-    const sz = currentBounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
-  } else if (precisionExcludedFaces.size > 0 && precisionParentMap) {
-    // No precision geometry but have selections — map back to original
-    excludedFaces = new Set();
-    for (const pf of precisionExcludedFaces) {
-      excludedFaces.add(precisionParentMap[pf]);
-    }
-  }
-
-  // Clear all precision state
-  precisionExcludedFaces = new Set();
-  precisionGeometry   = null;
-  precisionParentMap  = null;
-  precisionEdgeLength = null;
-  precisionCentroids  = null;
-  precisionFaceNormals = null;
-  precisionAdjacency  = null;
-  precisionMaskingEnabled = false;
-  precisionMaskingToggle.checked = false;
-  precisionStatus.textContent = '';
-  precisionOutdated.classList.add('hidden');
-  precisionRefreshBtn.classList.add('hidden');
-  precisionWarning.classList.add('hidden');
-  if (currentGeometry) {
-    setMeshGeometry(currentGeometry);
-    updateFaceMask(currentGeometry);
-    if (excludedFaces.size > 0) refreshExclusionOverlay();
-    else setExclusionOverlay(null);
-  }
-}
-
-/** Refresh (or initially build) the precision mesh from current brush size. */
-async function refreshPrecisionMesh() {
-  if (!currentGeometry || precisionBusy) return;
-
-  const brushDiameter = parseFloat(exclBrushRadiusSlider.value);
-  const targetEdge = computePrecisionEdgeLength(brushDiameter);
-
-  // Estimate triangle count and warn if > 5M
-  const estimated = estimateSubdivisionTriCount(currentGeometry, targetEdge);
-  if (estimated > 5_000_000) {
-    const estLabel = (estimated / 1_000_000).toFixed(1) + 'M';
-    const msg = t('precision.warningBody', { n: estLabel });
-    if (!confirm(msg)) return;
-  }
-
-  const myToken = ++precisionToken;
-  precisionBusy = true;
-  precisionStatus.textContent = t('precision.refining');
-  precisionOutdated.classList.add('hidden');
-  precisionRefreshBtn.classList.add('hidden');
-  precisionWarning.classList.add('hidden');
-
-  try {
-    await yieldFrame();
-    if (precisionToken !== myToken) return;
-
-    const { geometry: subdivided, safetyCapHit, faceParentId } = await subdivide(
-      currentGeometry, targetEdge, null, null, { fast: true }
-    );
-    if (precisionToken !== myToken) { subdivided.dispose(); return; }
-
-    // Dispose previous precision geometry if any
-    if (precisionGeometry) precisionGeometry.dispose();
-    precisionGeometry  = subdivided;
-    precisionParentMap = faceParentId;
-    precisionEdgeLength = targetEdge;
-
-    // Build adjacency data for the refined mesh
-    const adjData = buildAdjacency(precisionGeometry);
-    precisionAdjacency   = adjData.adjacency;
-    precisionCentroids   = adjData.centroids;
-    precisionFaceNormals = adjData.faceNormals;
-
-    // Seed precisionExcludedFaces from existing excludedFaces
-    precisionExcludedFaces = new Set();
-    if (excludedFaces.size > 0) {
-      const len = precisionParentMap.length;
-      for (let i = 0; i < len; i++) {
-        if (excludedFaces.has(precisionParentMap[i])) precisionExcludedFaces.add(i);
-      }
-    }
-
-    // Swap display mesh to refined geometry
-    setMeshGeometry(precisionGeometry);
-    updateFaceMask(precisionGeometry);
-    // Force per-vertex falloff computation on the fresh geometry even though
-    // the masking tool is still active – updateFaceMask only computes boundary
-    // edges during painting; the full vertex-level falloff is deferred until
-    // the tool is deactivated, but we need it now for the initial state.
-    {
-      const maskAttr = precisionGeometry.getAttribute('faceMask');
-      if (maskAttr) {
-        computeBoundaryFalloffAttr(precisionGeometry, maskAttr.array);
-        _falloffDirty = false;
-        _falloffGeometry = precisionGeometry;
-      }
-    }
-    if (precisionExcludedFaces.size > 0) refreshExclusionOverlay();
-    else setExclusionOverlay(null);
-
-    // Update status label
-    const triCount = precisionGeometry.attributes.position.count / 3;
-    const triLabel = triCount >= 1_000_000
-      ? (triCount / 1_000_000).toFixed(1) + 'M'
-      : triCount >= 1_000
-        ? (triCount / 1_000).toFixed(0) + 'k'
-        : String(triCount);
-    precisionStatus.textContent = t('precision.triCount', { n: triLabel });
-
-    // Update mesh info in the lower-left corner
-    const mb = ((precisionGeometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
-    const sx = currentBounds.size.x.toFixed(2);
-    const sy = currentBounds.size.y.toFixed(2);
-    const sz = currentBounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
-
-    if (safetyCapHit) {
-      triLimitWarning.classList.remove('hidden');
-    }
-  } catch (err) {
-    console.error('Precision masking subdivision failed:', err);
-    deactivatePrecisionMasking();
-  } finally {
-    precisionBusy = false;
-  }
-}
-
-/** Toggle precision masking on/off. */
-async function togglePrecisionMasking(enable) {
-  if (enable) {
-    // Mutually exclusive with displacement preview
-    if (settings.useDisplacement) {
-      settings.useDisplacement = false;
-      dispPreviewToggle.checked = false;
-      await toggleDisplacementPreview(false);
-    }
-    precisionMaskingEnabled = true;
-    await refreshPrecisionMesh();
-    // If refresh was cancelled (e.g. user declined warning), revert
-    if (!precisionGeometry) {
-      precisionMaskingEnabled = false;
-      precisionMaskingToggle.checked = false;
-    }
-  } else {
-    deactivatePrecisionMasking();
-  }
-}
-
-/** Show/hide the "outdated" badge when brush size changes while precision is active. */
-function checkPrecisionOutdated() {
-  if (!precisionMaskingEnabled || !precisionEdgeLength) return;
-  const neededEdge = computePrecisionEdgeLength(parseFloat(exclBrushRadiusSlider.value));
-  // Show outdated if the needed edge is significantly smaller than current
-  // (brush shrank → mesh too coarse for the new brush size)
-  if (neededEdge < precisionEdgeLength * 0.8) {
-    precisionOutdated.classList.remove('hidden');
-    precisionRefreshBtn.classList.remove('hidden');
-  } else {
-    precisionOutdated.classList.add('hidden');
-    precisionRefreshBtn.classList.add('hidden');
-  }
-}
-
-/**
  * Toggle displacement preview on/off.
- * When enabled: subdivides the current geometry to a moderate resolution,
- * computes smooth normals, and switches the viewer to the subdivided
- * geometry with vertex-shader displacement.
+ * When enabled: builds a refined copy of the current geometry in the preview
+ * worker (previewPipeline.js) and switches the viewer to it with vertex-
+ * shader displacement.  The bump-only preview stays interactive meanwhile.
  * When disabled: reverts to the original geometry with bump-only preview.
  */
 async function toggleDisplacementPreview(enable) {
@@ -4118,17 +5348,16 @@ async function toggleDisplacementPreview(enable) {
     setExclusionTool(null);
   }
 
-  // Deactivate precision masking when displacement preview is activated
-  if (enable && precisionMaskingEnabled) {
-    deactivatePrecisionMasking();
-  }
+  // Supersede any in-flight build (a re-enable restarts it).
+  cancelDisplacementPreviewBuild();
 
   if (!enable) {
-    // Revert to original geometry with bump-only shading.
+    // Revert to the painted / original geometry with bump-only shading.
     if (currentGeometry && previewMaterial) {
-      updateMaterial(previewMaterial, getEffectiveMapEntry()?.texture, { ...settings, bounds: currentBounds });
-      updateFaceMask(currentGeometry);
-      setMeshGeometry(currentGeometry);
+      _refreshPaintGeometry();
+      updateFaceMask(_paintDisplayGeometry());
+      _syncPreviewMaterial();
+      setMeshGeometry(_paintDisplayGeometry());
     }
     // Dispose the subdivided preview geometry (no longer on the mesh)
     if (dispPreviewGeometry) {
@@ -4136,127 +5365,128 @@ async function toggleDisplacementPreview(enable) {
       dispPreviewGeometry = null;
     }
     dispPreviewParentMap = null;
+    dispPreviewEdgeInfo = null;
     return;
   }
 
   // Need a model and texture to subdivide
-  if (!currentGeometry || !currentBounds || !activeMapEntry) {
+  if (!currentGeometry || !currentBounds || !_hasTexturedLayer()) {
     dispPreviewToggle.checked = false;
     settings.useDisplacement = false;
     return;
   }
 
-  if (dispPreviewBusy) return;
-  const myToken = ++dispPreviewToken;
-  dispPreviewBusy = true;
+  const myToken = dispPreviewToken;
+  dispPreviewSpinner.classList.remove('hidden');
 
   try {
-    // Choose a preview edge length: coarser than export for performance.
-    // Target ~maxDim/80 so a 50 mm cube gets ~0.6 mm edges → ~100 k triangles.
+    // Edge length: as fine as the export resolution, coarsened to fit the
+    // triangle budget, never coarser than the legacy maxDim/80 (which gave
+    // a 50 mm cube ~0.6 mm edges).
     const maxDim = Math.max(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
-    const previewEdge = Math.max(0.1, maxDim / 80);
+    const maxEdge = Math.max(0.1, maxDim / 80);
+    const floorEdge = settings.refineLength;
+    dispPreviewEdgeInfo = { floorEdge, maxEdge, edge: null };
 
-    await yieldFrame();
-    if (dispPreviewToken !== myToken) return;
+    const result = await runPreviewBuild({
+      positions:      currentGeometry.attributes.position.array,
+      normals:        currentGeometry.attributes.normal?.array ?? null,
+      floorEdge, maxEdge, triBudget: PREVIEW_TRI_BUDGET,
+      regularize:     settings.regularizeEnabled,
+      regularizeOpts: _regularizeOpts(),
+      secondPassMul:  settings.regularizeSecondPassMul,
+      excludedFaces:  _previewExcludedFaces(),
+    }, () => dispPreviewToken !== myToken);
+    if (!result || dispPreviewToken !== myToken) return;
 
-    const { geometry: subdivided, faceParentId } = await subdivide(
-      currentGeometry, previewEdge, null, null, { fast: true }
-    );
-    if (dispPreviewToken !== myToken) { subdivided.dispose(); return; }
-
-    // Pipeline: subdivide → regularize → subdivide.  The first subdivide
-    // brings edges down to previewEdge but creates sliver chains from any
-    // CAD-tessellation needles in the input (laserPlate-style fans).  The
-    // regularize collapses those slivers, possibly stretching a few edges
-    // along the way.  The second subdivide brings those stretched edges
-    // back to ≤ previewEdge × secondPassMul for clean displacement sampling.
-    // The whole regularize+resub block can be disabled from the Advanced panel.
-    let activeGeo, activeParents;
-    if (settings.regularizeEnabled) {
-      // Build exclusion mask for regularize: when regularizeFullModel is off,
-      // only regularize textured areas; untextured/masked regions pass through.
-      let regOpts = _regularizeOpts();
-      if (!settings.regularizeFullModel && (excludedFaces.size > 0 || selectionMode)) {
-        const triCount = subdivided.attributes.position.count / 3;
-        const excludedTris = new Uint8Array(triCount);
-        for (let i = 0; i < triCount; i++) {
-          const origFace = faceParentId[i];
-          let isExcluded = excludedFaces.has(origFace);
-          if (selectionMode) isExcluded = !isExcluded;
-          if (isExcluded) excludedTris[i] = 1;
-        }
-        regOpts = { ...regOpts, excludedTris };
-      }
-      const regPrev = regularizeMesh(subdivided, faceParentId, previewEdge, regOpts);
-      subdivided.dispose();
-      if (dispPreviewToken !== myToken) { regPrev.geometry.dispose(); return; }
-
-      // Build per-face exclusion weights for the second subdivide so masked
-      // surfaces don't get refined (they won't be displaced anyway).  Preview's
-      // first subdivide doesn't bake mask into geometry (shader handles it),
-      // so we derive it here from app state mapped through regPrev.faceParentId.
-      let secondPassWeightsPrev = null;
-      if (excludedFaces.size > 0 || selectionMode) {
-        const triCount = regPrev.geometry.attributes.position.count / 3;
-        secondPassWeightsPrev = new Float32Array(triCount * 3);
-        for (let i = 0; i < triCount; i++) {
-          const origFace = regPrev.faceParentId[i];
-          let isExcluded = excludedFaces.has(origFace);
-          if (selectionMode) isExcluded = !isExcluded;
-          if (isExcluded) {
-            secondPassWeightsPrev[i*3]     = 1.0;
-            secondPassWeightsPrev[i*3 + 1] = 1.0;
-            secondPassWeightsPrev[i*3 + 2] = 1.0;
-          }
-        }
-      }
-      const { geometry: resubPrev, faceParentId: resubParentsPrev } = await subdivide(
-        regPrev.geometry, previewEdge * settings.regularizeSecondPassMul, null, secondPassWeightsPrev, { fast: true }
-      );
-      regPrev.geometry.dispose();
-      if (dispPreviewToken !== myToken) { resubPrev.dispose(); return; }
-
-      // Compose parent maps: resubParents → regularize-faces → original-mesh faces.
-      const composedParentsPrev = new Int32Array(resubParentsPrev.length);
-      for (let i = 0; i < resubParentsPrev.length; i++) {
-        composedParentsPrev[i] = regPrev.faceParentId[resubParentsPrev[i]];
-      }
-      activeGeo = resubPrev;
-      activeParents = composedParentsPrev;
-    } else {
-      activeGeo = subdivided;
-      activeParents = faceParentId;
-    }
-
-    addSmoothNormals(activeGeo);
-    addFaceNormals(activeGeo);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position',     new THREE.BufferAttribute(result.positions, 3));
+    geo.setAttribute('normal',       new THREE.BufferAttribute(result.normals, 3));
+    geo.setAttribute('smoothNormal', new THREE.BufferAttribute(result.smoothNormals, 3));
+    geo.setAttribute('faceNormal',   new THREE.BufferAttribute(result.faceNormals, 3));
 
     // Dispose previous preview geometry if any
     if (dispPreviewGeometry) dispPreviewGeometry.dispose();
-    dispPreviewGeometry = activeGeo;
+    dispPreviewGeometry = geo;
+    dispPreviewEdgeInfo.edge = result.edge;
 
     // Use the face parent IDs tracked through subdivision (O(n) instead of spatial search)
-    dispPreviewParentMap = activeParents;
-    updateFaceMask(activeGeo);
+    dispPreviewParentMap = result.faceParentId;
+    updateFaceMask(geo);
 
     // Force material recreation so it binds the new geometry with smoothNormal
     if (previewMaterial) {
       previewMaterial.dispose();
       previewMaterial = null;
     }
-    const fullSettings = { ...settings, bounds: currentBounds };
-    previewMaterial = createPreviewMaterial(getEffectiveMapEntry().texture, fullSettings);
+    {
+      const preview = _previewLayers();
+      previewMaterial = createPreviewMaterial(preview.list, _materialSettings(preview));
+    }
     setMeshGeometry(dispPreviewGeometry);
     setMeshMaterial(previewMaterial);
-
-
+    // Its places (outline wrap) come from the worker; the redraw follows them.
+    _syncOutlineWrap(dispPreviewGeometry);
   } catch (err) {
+    if (dispPreviewToken !== myToken) return;
     console.error('Displacement preview failed:', err);
     dispPreviewToggle.checked = false;
     settings.useDisplacement = false;
+    dispPreviewEdgeInfo = null;
   } finally {
-    dispPreviewBusy = false;
+    if (dispPreviewToken === myToken) dispPreviewSpinner.classList.add('hidden');
   }
+}
+
+/**
+ * Invalidate any in-flight 3D-preview build: bump the token so its result is
+ * dropped, and terminate the worker so it stops burning CPU on it.
+ */
+function cancelDisplacementPreviewBuild() {
+  dispPreviewToken++;
+  if (_previewWorkerAbort) _previewWorkerAbort();
+  dispPreviewSpinner.classList.add('hidden');
+}
+
+/**
+ * Per-source-face flags (1 = untextured) for the preview's second subdivide,
+ * so masked surfaces aren't refined — they won't be displaced anyway.  The
+ * shader handles the mask itself, so this is only an optimisation.
+ */
+function _previewExcludedFaces() {
+  if (!paintTree) return null;
+  const hardFlags = [];
+  for (const { index, isActive } of _layerSlots()) {
+    if (!layers[index].visible) continue;
+    const includeOnly = isActive ? selectionMode : !!layers[index].includeOnly;
+    const hard = paintTree.baseFaceUntextured(_slotOf(index), includeOnly);
+    if (!hard) return null;   // a layer textures everything → nothing to skip
+    hardFlags.push(hard);
+  }
+  if (!hardFlags.length) return null;
+  const excluded = _unionFaceWeights(hardFlags, currentGeometry, false);
+  if (excluded.size === 0) return null;
+  const triCount = currentGeometry.attributes.position.count / 3;
+  const flags = new Uint8Array(triCount);
+  for (const f of excluded) flags[f] = 1;
+  return flags;
+}
+
+// The preview edge follows the export resolution (see toggleDisplacementPreview),
+// so rebuild an active 3D preview once the resolution settles on a value that
+// would change it.  Debounced: slider drags and wheel steps fire per step.
+function scheduleDisplacementPreviewResolutionRefresh() {
+  clearTimeout(_dispPreviewResolutionTimer);
+  _dispPreviewResolutionTimer = setTimeout(() => {
+    const info = dispPreviewEdgeInfo;
+    if (!settings.useDisplacement || !info) return;
+    const newFloor = settings.refineLength;
+    if (Math.min(newFloor, info.maxEdge) === Math.min(info.floorEdge, info.maxEdge)) return;
+    // A finished build that the budget (not the resolution) limited only
+    // changes if the new resolution is coarser than the edge it used.
+    if (info.edge !== null && info.edge > info.floorEdge && newFloor <= info.edge) return;
+    toggleDisplacementPreview(true);
+  }, 400);
 }
 
 // ── Export pipeline ───────────────────────────────────────────────────────────
@@ -4265,8 +5495,8 @@ async function toggleDisplacementPreview(enable) {
  * Builds per-non-indexed-vertex weights (1.0 = excluded from subdivision/displacement)
  * that combine the user-painted exclusion set AND the top/bottom angle mask.
  */
-function buildCombinedFaceWeights(geometry, excludedFaces, invert, settings) {
-  const weights = buildFaceWeights(geometry, excludedFaces, invert);
+function buildCombinedFaceWeights(geometry, excludedFaces, invert, settings, softFaces = null) {
+  const weights = buildFaceWeights(geometry, excludedFaces, invert, softFaces);
 
   const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
   if (!hasAngleMask) return weights;
@@ -4303,22 +5533,51 @@ function buildCombinedFaceWeights(geometry, excludedFaces, invert, settings) {
   return weights;
 }
 
+/**
+ * Map flat position/normal arrays from the in-app working space back to the
+ * model's original file pose: orig = poseRot⁻¹ · (mem − poseTrans). Undoes
+ * both the import centering and any in-app rotation, so exports align with
+ * the untouched source file (issue #82). Normals get the rotation only.
+ */
+function _restoreOriginalPose(positions, normals = null) {
+  const t = currentPoseTrans;
+  // Unit quaternion with |w| ≈ 1 is the identity rotation (either cover) —
+  // pure-translation fast path, and normals stay untouched.
+  if (Math.abs(currentPoseRot.w) > 1 - 1e-12) {
+    if (t.x === 0 && t.y === 0 && t.z === 0) return;
+    for (let i = 0; i < positions.length; i += 3) {
+      positions[i]     -= t.x;
+      positions[i + 1] -= t.y;
+      positions[i + 2] -= t.z;
+    }
+    return;
+  }
+  const rotInv = currentPoseRot.clone().invert();
+  const v = new THREE.Vector3();
+  for (let i = 0; i < positions.length; i += 3) {
+    v.set(positions[i] - t.x, positions[i + 1] - t.y, positions[i + 2] - t.z).applyQuaternion(rotInv);
+    positions[i]     = v.x;
+    positions[i + 1] = v.y;
+    positions[i + 2] = v.z;
+  }
+  if (normals) {
+    for (let i = 0; i < normals.length; i += 3) {
+      v.set(normals[i], normals[i + 1], normals[i + 2]).applyQuaternion(rotInv);
+      normals[i]     = v.x;
+      normals[i + 1] = v.y;
+      normals[i + 2] = v.z;
+    }
+  }
+}
+
 async function handleExport(format = 'stl') {
-  if (!currentGeometry || !activeMapEntry || isExporting || isBaking) return;
+  if (!currentGeometry || !_hasTexturedLayer() || isExporting || isBaking) return;
   const myToken = ++exportToken;
   isExporting = true;
   exportBtn.classList.add('busy');
   export3mfBtn.classList.add('busy');
   exportProgress.classList.remove('hidden');
 
-  // If precision masking is active, bake the refined mesh before exporting
-  if (precisionMaskingEnabled) {
-    deactivatePrecisionMasking();
-  }
-
-  // Hoist intermediate geometries so the finally block can always dispose them
-  let subdivided      = null;
-  let displaced       = null;
   let finalGeometry   = null;
   let exportSucceeded = false; // set true only after exportSTL so finally can clean up on abort/error
 
@@ -4330,159 +5589,77 @@ async function handleExport(format = 'stl') {
     // Build per-vertex exclusion weights combining user-painted exclusion + angle masking.
     // Faces masked by top/bottom angle limits are treated the same as user-excluded faces
     // so subdivision skips their interior edges too, saving triangles where no
-    // displacement will be applied.
-    const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
-    const faceWeights = (excludedFaces.size > 0 || selectionMode || hasAngleMask)
-      ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
-      : null;
-
-    let safetyCapHit;
-    ({ geometry: subdivided, safetyCapHit } = await subdivide(
-      currentGeometry, settings.refineLength,
-      (p, triCount, longestEdge) => {
-        const label = triCount != null
-          ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
-          : t('progress.subdividing');
-        setProgress(0.02 + p * 0.28, label);
-      },
-      faceWeights
-    ));
+    // displacement will be applied. Soft-brush paint rides along separately.
+    // With several visible layers the pipeline composites them per vertex
+    // (exportPipeline.js `layers`).
+    await _owTablesForExport();
     if (exportToken !== myToken) return;
+    const inputs = _pipelineInputs();
 
-    // Regularize sub-slivers, then re-subdivide stretched edges — see preview
-    // pipeline for rationale.  Skipped entirely when the Advanced toggle is
-    // off.  Faceweight mapping isn't propagated through regularize on this
-    // branch because user-painted exclusions were already baked into the
-    // first subdivide via faceWeights → excludeWeight, which regularize then
-    // copies through and we can pass straight to the second subdivide.
-    if (settings.regularizeEnabled) {
-      setProgress(0.30, t('progress.regularizing'));
-      await yieldFrame();
-      let regOpts = _regularizeOpts();
-      if (!settings.regularizeFullModel) {
-        const exclAttr = subdivided.attributes.excludeWeight;
-        if (exclAttr) {
-          const triCount = subdivided.attributes.position.count / 3;
-          const excludedTris = new Uint8Array(triCount);
-          for (let i = 0; i < triCount; i++) {
-            if (exclAttr.getX(i * 3) > 0.5) excludedTris[i] = 1;
-          }
-          regOpts = { ...regOpts, excludedTris };
-        }
-      }
-      const reg = regularizeMesh(subdivided, new Int32Array(subdivided.attributes.position.count / 3), settings.refineLength, regOpts);
-      subdivided.dispose();
-      const exclAttr = reg.geometry.attributes.excludeWeight;
-      const secondPassWeights = exclAttr ? exclAttr.array : null;
-      const { geometry: resub } = await subdivide(
-        reg.geometry, settings.refineLength * settings.regularizeSecondPassMul,
-        (p, triCount, longestEdge) => {
-          const label = triCount != null
-            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
-            : t('progress.subdividing');
-          setProgress(0.32 + p * 0.06, label);
-        },
-        secondPassWeights, { fast: false }
+    // Run the heavy pipeline (subdivide → regularize → displace → decimate →
+    // bottom snaps → repair), preferably in the export worker so the UI stays
+    // responsive and background-tab throttling can't stall it. Falls back to
+    // running inline if the worker can't initialise. See exportPipeline.js.
+    const isStale = () => exportToken !== myToken;
+    const result = await runPipeline({
+      positions: inputs.positions,
+      faceWeights: inputs.faceWeights,
+      softExclude: inputs.softExclude,
+      imageData: inputs.imageData,
+      imgWidth: inputs.imgWidth,
+      imgHeight: inputs.imgHeight,
+      layers: inputs.layers,
+      settings: _owSettings(settings),
+      bounds: currentBounds,
+      regularizeOpts: _regularizeOpts(),
+      mode: 'export',
+    }, _onExportPipelineEvent, isStale);
+    if (!result || isStale()) return;
+
+    const exportWarnings = [];
+    if (result.safetyCapHit) exportWarnings.push(t('warnings.safetyCapHit'));
+    if (result.lockedOverBudget) exportWarnings.push(t('warnings.preserveOverBudget'));
+    triLimitWarning.classList.toggle('hidden', exportWarnings.length === 0);
+    triLimitWarning.textContent = exportWarnings.join(' ');
+
+    // Map the pipeline output back to the model's original position and
+    // orientation (issue #82) — in-app rotation is a texturing aid and is
+    // reverted here. The pipeline itself runs in the working space, so this
+    // must stay after runPipeline — and outside of it, keeping the
+    // bench-pipeline fingerprint valid. result arrays are fresh; mutating is safe.
+    _restoreOriginalPose(result.positions, result.normals);
+
+    finalGeometry = new THREE.BufferGeometry();
+    finalGeometry.setAttribute('position', new THREE.BufferAttribute(result.positions, 3));
+    if (result.normals) finalGeometry.setAttribute('normal', new THREE.BufferAttribute(result.normals, 3));
+
+    if (result.repairStats) {
+      const rs = result.repairStats;
+      // Ground-truth readout. The decisive number is `slivers`: zero-area
+      // "needle" triangles read as watertight here but every slicer (and our
+      // own importer) deletes them, punching a hole at each — that was the
+      // real cause of the open-edge warning on re-imported files. After
+      // repair both `slivers` and `open` must be 0.
+      console.log(
+        `%c[stlTexturizer] mesh repair (build 2026-06-10w): ` +
+        `removed ${rs.beforeSlivers.toLocaleString()} zero-area slivers; ` +
+        `final open=${rs.open}, non-manifold=${rs.nonManifold}, slivers=${rs.slivers} ` +
+        `(${rs.tris.toLocaleString()} tris)`,
+        'color:#0a0;font-weight:bold'
       );
-      reg.geometry.dispose();
-      subdivided = resub;
     }
 
-    const subTriCount = subdivided.attributes.position.count / 3;
-    setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
-
-    const exportEntry = getEffectiveMapEntry();
-    displaced = await runAsync(() =>
-      applyDisplacement(
-        subdivided,
-        exportEntry.imageData,
-        exportEntry.width,
-        exportEntry.height,
-        settings,
-        currentBounds,
-        (p) => setProgress(0.38 + p * 0.32, t('progress.displacingVertices'))
-      )
-    );
-    if (exportToken !== myToken) return;
-
-    // Free subdivided geometry — displacement created a separate copy
-    subdivided.dispose();
-
-    const dispTriCount = displaced.attributes.position.count / 3;
-    const needsDecimation = dispTriCount > settings.maxTriangles;
-    triLimitWarning.classList.toggle('hidden', !safetyCapHit);
-    triLimitWarning.textContent = t('warnings.safetyCapHit');
-
-    finalGeometry = displaced;
-    if (needsDecimation) {
-      setProgress(0.71, t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
-      finalGeometry = await runAsync(() =>
-        decimate(
-          displaced,
-          settings.maxTriangles,
-          (p) => {
-            const cur = Math.round(dispTriCount - (dispTriCount - settings.maxTriangles) * p);
-            setProgress(
-              0.71 + p * 0.25,
-              t('progress.decimating', { cur: cur.toLocaleString(), to: settings.maxTriangles.toLocaleString() })
-            );
-          }
-        )
-      );
-      // Free pre-decimation geometry — decimate created a separate copy
-      displaced.dispose();
-	  if (exportToken !== myToken) return;
-    }
-
-    // Flat-bottom clamp: when bottom faces are masked (bottomAngleLimit > 0),
-    // any vertex that ended up below the original model's bottom layer gets
-    // snapped back up to that Z. Single pass with selective normal recomputation.
-    if (settings.bottomAngleLimit > 0) {
-      const bottomZ = currentBounds.min.z;
-      const pa = finalGeometry.attributes.position.array;
-      const na = finalGeometry.attributes.normal ? finalGeometry.attributes.normal.array : new Float32Array(pa.length);
-
-      for (let i = 0; i < pa.length; i += 9) {
-        let dirty = false;
-        if (pa[i+2] < bottomZ) { pa[i+2] = bottomZ; dirty = true; }
-        if (pa[i+5] < bottomZ) { pa[i+5] = bottomZ; dirty = true; }
-        if (pa[i+8] < bottomZ) { pa[i+8] = bottomZ; dirty = true; }
-
-        if (dirty) {
-          const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
-          const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
-          const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
-          const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
-          na[i]   = na[i+3] = na[i+6] = nx/len;
-          na[i+1] = na[i+4] = na[i+7] = ny/len;
-          na[i+2] = na[i+5] = na[i+8] = nz/len;
-        }
-      }
-
-      finalGeometry.attributes.position.needsUpdate = true;
-      if (!finalGeometry.attributes.normal) finalGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
-      else finalGeometry.attributes.normal.needsUpdate = true;
-    }
-
-    // Smooth Bottom: snap any vertex within 0.1 mm of the bottom plane onto
-    // it so the bed-contact surface is perfectly flat. Catches the residual
-    // height drift on bottom slivers that the in-displacement clamp can't
-    // touch (e.g. fillet vertices a few µm above bottomZ that get tilted
-    // by texture sampling). Runs after the bottomAngleLimit clamp so the
-    // two complement each other when both are active.
-    if (settings.smoothBottom) {
-      snapBottomToFlat(finalGeometry, currentBounds.min.z, 0.1);
-    }
-
-    const texLabel = activeMapEntry.isCustom ? 'custom' : activeMapEntry.name.replace(/\s+/g, '-');
+    const texLabel = inputs.label;
     const ampLabel = settings.amplitude.toFixed(2).replace('.', 'p');
-    const baseName = `${currentStlName}_${texLabel}_amp${ampLabel}`;
+    const baseName = inputs.layers
+      ? `${currentStlName}_${texLabel}`
+      : `${currentStlName}_${texLabel}_amp${ampLabel}`;
 
     if (format === '3mf') {
       setProgress(0.97, t('progress.writing3mf'));
       await yieldFrame();
       if (exportToken !== myToken) return;
-      export3MF(finalGeometry, `${baseName}.3mf`);
+      await export3MF(finalGeometry, `${baseName}.3mf`, () => exportToken !== myToken);
     } else {
       setProgress(0.97, t('progress.writingStl'));
       await yieldFrame();
@@ -4497,6 +5674,7 @@ async function handleExport(format = 'stl') {
       setProgress(0, '');
     }, 1500);
   } catch (err) {
+    if (exportToken !== myToken) return;
     console.error('Export failed:', err);
     if (/maximum size|out of memory|alloc/i.test(err.message)) {
       alert(t('alerts.exportOOM'));
@@ -4504,17 +5682,411 @@ async function handleExport(format = 'stl') {
       alert(t('alerts.exportFailed', { msg: err.message }));
     }
   } finally {
-    // Dispose all intermediate geometries regardless of success, failure, or abort.
-    // finalGeometry may alias displaced (no decimation) — avoid double-dispose.
-    if (subdivided) subdivided.dispose();
-    if (displaced && displaced !== subdivided) displaced.dispose();
-    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) finalGeometry.dispose();
+    // Intermediate geometries live inside the pipeline (worker or inline) and
+    // are disposed there; only the reconstructed output remains on this side.
+    if (finalGeometry) finalGeometry.dispose();
     // Hide progress immediately on error or stale abort; success hides it after 1500 ms.
     if (!exportSucceeded) exportProgress.classList.add('hidden');
     isExporting = false;
     exportBtn.classList.remove('busy');
     export3mfBtn.classList.remove('busy');
   }
+}
+
+// ── Pipeline progress mapping (worker events → progress bar) ────────────────
+// Same fractions and labels as the old inline pipeline.
+
+function _onExportPipelineEvent(stage, p, info) {
+  switch (stage) {
+    case 'subdivide1': {
+      const label = info && info.triCount != null
+        ? t('progress.refining', { cur: info.triCount.toLocaleString(), edge: info.longestEdge.toFixed(2) })
+        : t('progress.subdividing');
+      setProgress(0.02 + p * 0.28, label);
+      break;
+    }
+    case 'regularize':
+      setProgress(0.30, t('progress.regularizing'));
+      break;
+    case 'subdivide2': {
+      const label = info && info.triCount != null
+        ? t('progress.refining', { cur: info.triCount.toLocaleString(), edge: info.longestEdge.toFixed(2) })
+        : t('progress.subdividing');
+      setProgress(0.32 + p * 0.06, label);
+      break;
+    }
+    case 'displace':
+      if (p === 0) setProgress(0.38, t('progress.applyingDisplacement', { n: info.triCount.toLocaleString() }));
+      else setProgress(0.38 + p * 0.32, t('progress.displacingVertices'));
+      break;
+    case 'decimate':
+      if (info.needsDecimation) {
+        if (p === 0) {
+          setProgress(0.71, t('progress.decimatingTo', { from: info.from.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
+        } else {
+          const cur = Math.round(info.from - (info.from - settings.maxTriangles) * p);
+          setProgress(0.71 + p * 0.25, t('progress.decimating', { cur: cur.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
+        }
+      } else {
+        setProgress(0.71 + p * 0.25, t('progress.harvestingFlat'));
+      }
+      break;
+    case 'repair':
+      setProgress(0.96, t('progress.repairingMesh'));
+      break;
+  }
+}
+
+function _onBakePipelineEvent(stage, p, info) {
+  switch (stage) {
+    case 'subdivide1': {
+      const label = info && info.triCount != null
+        ? t('progress.refining', { cur: info.triCount.toLocaleString(), edge: info.longestEdge.toFixed(2) })
+        : t('progress.subdividing');
+      setBakeProgress(0.02 + p * 0.34, label);
+      break;
+    }
+    case 'regularize':
+      setBakeProgress(0.36, t('progress.regularizing'));
+      break;
+    case 'subdivide2': {
+      const label = info && info.triCount != null
+        ? t('progress.refining', { cur: info.triCount.toLocaleString(), edge: info.longestEdge.toFixed(2) })
+        : t('progress.subdividing');
+      setBakeProgress(0.38 + p * 0.09, label);
+      break;
+    }
+    case 'displace':
+      if (p === 0) setBakeProgress(0.47, t('progress.applyingDisplacement', { n: info.triCount.toLocaleString() }));
+      else setBakeProgress(0.47 + p * 0.40, t('progress.displacingVertices'));
+      break;
+  }
+}
+
+// ── Export worker management ─────────────────────────────────────────────────
+// One persistent module worker runs the export/bake pipeline off the main
+// thread. If it can't initialise (very old browser, CDN unreachable from the
+// worker) the pipeline runs inline exactly as before — same module, same code.
+
+let _pipelineWorker = null;
+let _pipelineWorkerFailed = false; // hard init failure → stop retrying
+let _pipelineWorkerInit = null;    // in-flight init promise (warmup + export may race)
+
+// Resolve the cached worker, initialising it at most once. Returns null when
+// the worker can't run here (the caller then uses the inline pipeline).
+function ensurePipelineWorker() {
+  if (_pipelineWorkerFailed) return Promise.resolve(null);
+  if (_pipelineWorker) return Promise.resolve(_pipelineWorker);
+  if (!_pipelineWorkerInit) {
+    _pipelineWorkerInit = _initWorker(new URL('./exportWorker.js', import.meta.url)).then(
+      (w) => { _pipelineWorker = w; _pipelineWorkerInit = null; return w; },
+      (err) => {
+        _pipelineWorkerFailed = true;
+        _pipelineWorkerInit = null;
+        console.warn('[stlTexturizer] export worker unavailable — running pipeline on the main thread:', err.message);
+        return null;
+      }
+    );
+  }
+  return _pipelineWorkerInit;
+}
+
+// Warm the worker up during idle time after load: the worker boot includes
+// fetching three.js (workers ignore the page import map), and doing that now
+// keeps it off the first export's critical path.
+{
+  const warm = () => { ensurePipelineWorker(); };
+  const schedule = () => {
+    if ('requestIdleCallback' in window) requestIdleCallback(warm, { timeout: 8000 });
+    else setTimeout(warm, 3000);
+  };
+  if (document.readyState === 'complete') schedule();
+  else window.addEventListener('load', schedule, { once: true });
+}
+
+// Start a module worker and resolve once it posts {type:'ready'} (its static
+// imports, incl. three.js, have loaded). Shared by the export and preview workers.
+function _initWorker(url) {
+  return new Promise((resolve, reject) => {
+    let w;
+    try {
+      w = new Worker(url, { type: 'module' });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const fail = (msg) => { try { w.terminate(); } catch {} reject(new Error(msg)); };
+    const timer = setTimeout(() => fail('worker init timeout'), 20000);
+    w.onmessage = (e) => {
+      if (e.data && e.data.type === 'ready') {
+        clearTimeout(timer);
+        w.onmessage = null;
+        w.onerror = null;
+        resolve(w);
+      }
+    };
+    w.onerror = (e) => { clearTimeout(timer); fail((e && e.message) || 'worker failed to load'); };
+  });
+}
+
+async function runPipeline(input, onEvent, isStale) {
+  // Prefer the worker. Fall back to inline ONLY on init failure — a pipeline
+  // error inside the worker (e.g. OOM) must propagate to the caller's alert,
+  // not silently re-run the same doomed job on the main thread.
+  const w = await ensurePipelineWorker();
+  if (isStale()) return null;
+  if (!w) {
+    return runExportPipeline(input, onEvent, isStale);
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { w.onmessage = null; w.onerror = null; };
+    const kill = () => { cleanup(); try { w.terminate(); } catch {} _pipelineWorker = null; };
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (isStale()) { kill(); resolve(null); return; } // aborted → stop the worker's CPU burn
+      if (m.type === 'progress') onEvent(m.stage, m.p, m.info);
+      else if (m.type === 'done') { cleanup(); resolve(m.result); }
+      else if (m.type === 'error') { cleanup(); reject(new Error(m.message)); }
+    };
+    w.onerror = (e) => { kill(); reject(new Error((e && e.message) || 'export worker crashed')); };
+    w.postMessage({ cmd: 'run', input });
+  });
+}
+
+// ── Outline wrap (projection mode 8) ───────────────────────────────────────
+// The tables of the base mesh (outlineWrap.js), built in outlineWrapWorker.js
+// once a layer on screen uses the outline wrap, and the per-vertex places of
+// the mesh on screen (the preview's `outlineWrap` attribute). Keyed on the base
+// geometry's uuid and position version, so Rotate and Place on Face (which
+// move the vertices in place) and a new model rebuild them. When the outline
+// wrap cannot follow the mesh, it maps as cylindrical (mapping.js) and a note
+// under the Projection select says so.
+let _owWorker = null;
+let _owWorkerFailed = false;
+let _owWorkerInit = null;
+let _owSeq = 0;
+const _owWaiting = new Map();   // request id → { resolve, reject }
+let _owKey = null;              // the base mesh the tables (or the error) belong to
+let _owWrap = null;             // its tables, or null
+let _owError = null;            // why the outline wrap cannot follow it, or null
+let _owBuild = null;            // the build in flight for _owKey
+
+const _owKeyOf = (geo) => geo ? `${geo.uuid}:${geo.attributes.position.version}` : null;
+
+/** Whether a layer on screen uses the outline wrap. */
+function _owUsed() {
+  return _layerSlots().some(({ index, isActive }) =>
+    (isActive ? settings : layers[index].settings).mappingMode === MODE_OUTLINE_WRAP);
+}
+
+/** Whether `geo` holds the places of the current tables (the shader may use the outline wrap on it). */
+function _owReadyOn(geo) {
+  return !!(_owWrap && geo && _owKey === _owKeyOf(currentGeometry) && geo.userData.outlineWrapKey === _owKey);
+}
+
+/** `s` with the tables of the current mesh, for computeUV; as it is without them (it then maps as cylindrical). */
+function _owSettings(s) {
+  return _owWrap && _owKey === _owKeyOf(currentGeometry) ? { ...s, outlineWrap: _owWrap } : s;
+}
+
+function ensureOutlineWrapWorker() {
+  if (_owWorkerFailed) return Promise.resolve(null);
+  if (_owWorker) return Promise.resolve(_owWorker);
+  if (!_owWorkerInit) {
+    _owWorkerInit = _initWorker(new URL('./outlineWrapWorker.js', import.meta.url)).then(
+      (w) => {
+        w.onmessage = (e) => {
+          const m = e.data;
+          const asked = m && _owWaiting.get(m.id);
+          if (!asked) return;
+          _owWaiting.delete(m.id);
+          if (m.type === 'done') asked.resolve(m);
+          else asked.reject(new Error(m.message));
+        };
+        w.onerror = (e) => {
+          for (const asked of _owWaiting.values()) asked.reject(new Error((e && e.message) || 'outline wrap worker crashed'));
+          _owWaiting.clear();
+          try { w.terminate(); } catch {}
+          if (_owWorker === w) _owWorker = null;
+        };
+        _owWorker = w;
+        _owWorkerInit = null;
+        return w;
+      },
+      (err) => {
+        _owWorkerFailed = true;
+        _owWorkerInit = null;
+        console.warn('[stlTexturizer] outline wrap worker unavailable — building it on the main thread:', err.message);
+        return null;
+      }
+    );
+  }
+  return _owWorkerInit;
+}
+
+/**
+ * Run a build (tables and places of `positions`) or a places request (on the
+ * tables `wrap`) in the worker, or inline when the worker is unavailable.
+ */
+async function _owRun(cmd, positions, wrap = null) {
+  const w = await ensureOutlineWrapWorker();
+  if (!w) {
+    const tables = cmd === 'build' ? buildOutlineWrap(positions) : wrap;
+    return { wrap: tables, places: outlineWrapPlaces(tables, positions) };
+  }
+  const id = ++_owSeq;
+  return new Promise((resolve, reject) => {
+    _owWaiting.set(id, { resolve, reject });
+    w.postMessage({ cmd, id, positions, wrap }, [positions.buffer]);
+  });
+}
+
+/** The tables of the base mesh: built once per mesh; null when the outline wrap cannot follow it. */
+function _owTables() {
+  const geo = currentGeometry;
+  const key = _owKeyOf(geo);
+  if (!key) return Promise.resolve(null);
+  if (_owKey === key && _owBuild) return _owBuild;
+  if (_owKey === key && (_owWrap || _owError)) return Promise.resolve(_owWrap);
+  _owKey = key;
+  _owWrap = null;
+  _owError = null;
+  _owBuild = _owRun('build', geo.attributes.position.array.slice()).then(
+    (r) => {
+      if (_owKey !== key) return null;
+      _owWrap = r.wrap;
+      _owBuild = null;
+      if (_owKeyOf(geo) === key) _owSetPlaces(geo, r.places, key);
+      return _owWrap;
+    },
+    (err) => {
+      if (_owKey !== key) return null;
+      _owError = err.message;
+      _owBuild = null;
+      console.warn('[stlTexturizer] outline wrap maps as cylindrical:', err.message);
+      return null;
+    }
+  );
+  return _owBuild;
+}
+
+function _owSetPlaces(geo, places, key) {
+  geo.setAttribute('outlineWrap', new THREE.Float32BufferAttribute(places, 2));
+  geo.userData.outlineWrapKey = key;
+}
+
+/**
+ * A paint split's mesh (each leaf in its base face's plane, `faceParentId`)
+ * takes the places of its base faces' corners at each leaf corner's
+ * barycentric weights: what the GPU interpolated across the base face, so the
+ * preview does not change, and with no request to the worker.
+ */
+function _owCarryPlaces(geo, faceParentId) {
+  const base = currentGeometry;
+  const from = base && base.getAttribute('outlineWrap');
+  if (!from || !_owWrap || base.userData.outlineWrapKey !== _owKeyOf(base)) return;
+  const bp = base.attributes.position.array;
+  const lp = geo.attributes.position.array;
+  const out = new Float32Array((lp.length / 3) * 2);
+  for (let c = 0; c < lp.length / 3; c++) {
+    const f = faceParentId[Math.floor(c / 3)];
+    const a = 9 * f;
+    // Barycentric weights of the leaf corner in the base face (a, b, c).
+    const e0x = bp[a + 3] - bp[a], e0y = bp[a + 4] - bp[a + 1], e0z = bp[a + 5] - bp[a + 2];
+    const e1x = bp[a + 6] - bp[a], e1y = bp[a + 7] - bp[a + 1], e1z = bp[a + 8] - bp[a + 2];
+    const px = lp[3 * c] - bp[a], py = lp[3 * c + 1] - bp[a + 1], pz = lp[3 * c + 2] - bp[a + 2];
+    const d00 = e0x * e0x + e0y * e0y + e0z * e0z, d01 = e0x * e1x + e0y * e1y + e0z * e1z, d11 = e1x * e1x + e1y * e1y + e1z * e1z;
+    const d20 = px * e0x + py * e0y + pz * e0z, d21 = px * e1x + py * e1y + pz * e1z;
+    const den = d00 * d11 - d01 * d01;
+    const v = den > 0 ? (d11 * d20 - d01 * d21) / den : 0;
+    const w = den > 0 ? (d00 * d21 - d01 * d20) / den : 0;
+    const u = 1 - v - w;
+    for (let k = 0; k < 2; k++) {
+      out[2 * c + k] = u * from.array[6 * f + k] + v * from.array[6 * f + 2 + k] + w * from.array[6 * f + 4 + k];
+    }
+  }
+  _owSetPlaces(geo, out, base.userData.outlineWrapKey);
+}
+
+/** Before an export or a bake: wait for the tables when a layer uses the outline wrap. */
+async function _owTablesForExport() {
+  if (_owUsed()) await _owTables();
+}
+
+/**
+ * From updatePreview, with the mesh on screen: start the tables' build, put
+ * the places on the mesh on screen once they exist, show the fallback note,
+ * and redraw when each step lands.
+ */
+function _syncOutlineWrap(activeGeo) {
+  const used = _owUsed();
+  const key = _owKeyOf(currentGeometry);
+  // The note sits under the active layer's Projection select.
+  outlineWrapNote.classList.toggle('hidden', !(settings.mappingMode === MODE_OUTLINE_WRAP && _owError && _owKey === key));
+  if (!used || !key) return;
+  if (_owKey !== key || (!_owWrap && !_owError && !_owBuild)) {
+    _owTables().then(() => { if (_owKeyOf(currentGeometry) === key) updatePreview(); });
+    return;
+  }
+  if (!_owWrap || activeGeo.userData.outlineWrapKey === key || activeGeo.userData.outlineWrapPending === key) return;
+  activeGeo.userData.outlineWrapPending = key;
+  _owRun('places', activeGeo.attributes.position.array.slice(), _owWrap).then(
+    (r) => {
+      if (_owKey !== key) return;
+      _owSetPlaces(activeGeo, r.places, key);
+      updatePreview();
+    },
+    (err) => console.warn('[stlTexturizer] outline wrap places failed:', err.message)
+  ).finally(() => {
+    if (activeGeo.userData.outlineWrapPending === key) delete activeGeo.userData.outlineWrapPending;
+  });
+}
+
+// ── 3D-preview worker ──────────────────────────────────────────────────────
+// Its own worker (previewWorker.js) so a preview build never queues behind or
+// gets killed with an export. Started lazily on the first preview build.
+let _previewWorker = null;
+let _previewWorkerFailed = false;
+let _previewWorkerInit = null;
+
+function ensurePreviewWorker() {
+  if (_previewWorkerFailed) return Promise.resolve(null);
+  if (_previewWorker) return Promise.resolve(_previewWorker);
+  if (!_previewWorkerInit) {
+    _previewWorkerInit = _initWorker(new URL('./previewWorker.js', import.meta.url)).then(
+      (w) => { _previewWorker = w; _previewWorkerInit = null; return w; },
+      (err) => {
+        _previewWorkerFailed = true;
+        _previewWorkerInit = null;
+        console.warn('[stlTexturizer] preview worker unavailable — building the 3D preview on the main thread:', err.message);
+        return null;
+      }
+    );
+  }
+  return _previewWorkerInit;
+}
+
+async function runPreviewBuild(input, isStale) {
+  const w = await ensurePreviewWorker();
+  if (isStale()) return null;
+  if (!w) {
+    // The main-thread fallback freezes the UI for the whole build, so keep
+    // the legacy coarse edge there.
+    return runPreviewPipeline({ ...input, floorEdge: input.maxEdge }, undefined, isStale);
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { w.onmessage = null; w.onerror = null; _previewWorkerAbort = null; };
+    const kill = () => { cleanup(); try { w.terminate(); } catch {} if (_previewWorker === w) _previewWorker = null; };
+    _previewWorkerAbort = () => { kill(); resolve(null); };
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (isStale()) { kill(); resolve(null); return; }
+      if (m.type === 'done') { cleanup(); resolve(m.result); }
+      else if (m.type === 'error') { cleanup(); reject(new Error(m.message)); }
+    };
+    w.onerror = (e) => { kill(); reject(new Error((e && e.message) || 'preview worker crashed')); };
+    w.postMessage({ cmd: 'run', input });
+  });
 }
 
 function setProgress(fraction, label) {
@@ -4526,50 +6098,8 @@ function setProgress(fraction, label) {
 
 // ── Smooth Bottom (advanced feature) ────────────────────────────────────────
 // Snaps every vertex within `tol` of the bottom plane onto it, so the bed-
-// contact surface comes out perfectly flat regardless of any tiny per-vertex
-// height drift introduced by sliver triangles, displacement noise, or
-// near-horizontal smooth normals tilting the bottom face during texturing.
-// Recomputes face normals on triangles whose vertices moved so slicers shade
-// the now-planar surface uniformly.
-//
-// Threshold default 0.1 mm is well above float-precision noise but below
-// any printer's resolution, so legitimate above-bottom geometry (side
-// fillets, the rest of the model) is left alone. Caller passes `bottomZ`
-// explicitly so this function works on any geometry / coordinate system.
-function snapBottomToFlat(geometry, bottomZ, tol = 0.1) {
-  const pa = geometry.attributes.position.array;
-  const na = geometry.attributes.normal
-    ? geometry.attributes.normal.array
-    : new Float32Array(pa.length);
-  let dirtyTris = 0;
-
-  for (let i = 0; i < pa.length; i += 9) {
-    let dirty = false;
-    if (Math.abs(pa[i+2] - bottomZ) <= tol) { pa[i+2] = bottomZ; dirty = true; }
-    if (Math.abs(pa[i+5] - bottomZ) <= tol) { pa[i+5] = bottomZ; dirty = true; }
-    if (Math.abs(pa[i+8] - bottomZ) <= tol) { pa[i+8] = bottomZ; dirty = true; }
-    if (dirty) {
-      dirtyTris++;
-      const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
-      const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
-      const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
-      const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
-      na[i]   = na[i+3] = na[i+6] = nx/len;
-      na[i+1] = na[i+4] = na[i+7] = ny/len;
-      na[i+2] = na[i+5] = na[i+8] = nz/len;
-    }
-  }
-
-  if (dirtyTris > 0) {
-    geometry.attributes.position.needsUpdate = true;
-    if (!geometry.attributes.normal) {
-      geometry.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
-    } else {
-      geometry.attributes.normal.needsUpdate = true;
-    }
-  }
-  return dirtyTris;
-}
+// contact surface comes out perfectly flat — implementation lives in
+// exportPipeline.js (snapBottomToFlat) so it runs inside the worker.
 
 function setBakeProgress(fraction, label) {
   const pct = Math.round(fraction * 100);
@@ -4588,15 +6118,12 @@ function setBakeProgress(fraction, label) {
 // mapping needed to translate "which input faces were textured" into the new
 // mesh's triangle indices. Final decimation still happens on Export.
 async function bakeTextures() {
-  if (!currentGeometry || !activeMapEntry || isBaking || isExporting) return;
+  if (!currentGeometry || !_hasTexturedLayer() || isBaking || isExporting) return;
   isBaking = true;
   bakeBtn.classList.add('busy');
   bakeBtn.disabled = true;
   bakeProgress.classList.remove('hidden');
 
-  if (precisionMaskingEnabled) deactivatePrecisionMasking();
-
-  let subdivided = null;
   let displaced  = null;
   let succeeded  = false;
 
@@ -4605,119 +6132,35 @@ async function bakeTextures() {
     await yieldFrame();
 
     // Mirror handleExport's pre-flight: combine user mask + angle masking
-    // into per-vertex weights for subdivision.
-    const hasAngleMask = settings.bottomAngleLimit > 0 || settings.topAngleLimit > 0;
-    const faceWeights = (excludedFaces.size > 0 || selectionMode || hasAngleMask)
-      ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
-      : null;
+    // into per-vertex weights for subdivision, plus soft-brush paint (or the
+    // per-layer masks when several layers are visible).
+    await _owTablesForExport();
+    const inputs = _pipelineInputs();
+    const faceWeights = inputs.faceWeights;
 
-    let faceParentId;
-    ({ geometry: subdivided, faceParentId } = await subdivide(
-      currentGeometry, settings.refineLength,
-      (p, triCount, longestEdge) => {
-        const label = triCount != null
-          ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
-          : t('progress.subdividing');
-        setBakeProgress(0.02 + p * 0.34, label);
-      },
-      faceWeights
-    ));
+    // Run the bake pipeline (subdivide → regularize → displace → bottom
+    // snaps; no decimation — it would drop the per-face parent mapping needed
+    // to remap user exclusions onto the baked output). Worker-first with
+    // inline fallback, same as handleExport.
+    const result = await runPipeline({
+      positions: inputs.positions,
+      faceWeights,
+      softExclude: inputs.softExclude,
+      imageData: inputs.imageData,
+      imgWidth: inputs.imgWidth,
+      imgHeight: inputs.imgHeight,
+      layers: inputs.layers,
+      settings: _owSettings(settings),
+      bounds: currentBounds,
+      regularizeOpts: _regularizeOpts(),
+      mode: 'bake',
+    }, _onBakePipelineEvent, () => false);
+    if (!result) throw new Error('bake pipeline aborted');
 
-    // Regularize sub-slivers, then re-subdivide stretched edges — see preview
-    // pipeline for rationale.  Skipped entirely when the Advanced toggle is
-    // off.  Compose the two parent maps so faceParentId still points at
-    // original-mesh faces (used below to remap user exclusions onto baked output).
-    if (settings.regularizeEnabled) {
-      setBakeProgress(0.36, t('progress.regularizing'));
-      await yieldFrame();
-      let regOpts = _regularizeOpts();
-      if (!settings.regularizeFullModel) {
-        const exclAttr = subdivided.attributes.excludeWeight;
-        if (exclAttr) {
-          const triCount = subdivided.attributes.position.count / 3;
-          const excludedTris = new Uint8Array(triCount);
-          for (let i = 0; i < triCount; i++) {
-            if (exclAttr.getX(i * 3) > 0.5) excludedTris[i] = 1;
-          }
-          regOpts = { ...regOpts, excludedTris };
-        }
-      }
-      const reg = regularizeMesh(subdivided, faceParentId, settings.refineLength, regOpts);
-      subdivided.dispose();
-      const exclAttr = reg.geometry.attributes.excludeWeight;
-      const secondPassWeights = exclAttr ? exclAttr.array : null;
-      const { geometry: resub, faceParentId: resubParents } = await subdivide(
-        reg.geometry, settings.refineLength * settings.regularizeSecondPassMul,
-        (p, triCount, longestEdge) => {
-          const label = triCount != null
-            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
-            : t('progress.subdividing');
-          setBakeProgress(0.38 + p * 0.09, label);
-        },
-        secondPassWeights, { fast: false }
-      );
-      reg.geometry.dispose();
-      const composed = new Int32Array(resubParents.length);
-      for (let i = 0; i < resubParents.length; i++) {
-        composed[i] = reg.faceParentId[resubParents[i]];
-      }
-      subdivided = resub;
-      faceParentId = composed;
-    }
-
-    const subTriCount = subdivided.attributes.position.count / 3;
-    setBakeProgress(0.47, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
-
-    const exportEntry = getEffectiveMapEntry();
-    displaced = await runAsync(() =>
-      applyDisplacement(
-        subdivided,
-        exportEntry.imageData,
-        exportEntry.width,
-        exportEntry.height,
-        settings,
-        currentBounds,
-        (p) => setBakeProgress(0.47 + p * 0.40, t('progress.displacingVertices'))
-      )
-    );
-
-    // Free pre-displacement subdivision — applyDisplacement returns a separate copy.
-    subdivided.dispose();
-    subdivided = null;
-
-    // Mirror the export-side flat-bottom clamp.
-    if (settings.bottomAngleLimit > 0) {
-      const bottomZ = currentBounds.min.z;
-      const pa = displaced.attributes.position.array;
-      const na = displaced.attributes.normal ? displaced.attributes.normal.array : new Float32Array(pa.length);
-
-      for (let i = 0; i < pa.length; i += 9) {
-        let dirty = false;
-        if (pa[i+2] < bottomZ) { pa[i+2] = bottomZ; dirty = true; }
-        if (pa[i+5] < bottomZ) { pa[i+5] = bottomZ; dirty = true; }
-        if (pa[i+8] < bottomZ) { pa[i+8] = bottomZ; dirty = true; }
-
-        if (dirty) {
-          const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
-          const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
-          const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
-          const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
-          na[i]   = na[i+3] = na[i+6] = nx/len;
-          na[i+1] = na[i+4] = na[i+7] = ny/len;
-          na[i+2] = na[i+5] = na[i+8] = nz/len;
-        }
-      }
-
-      displaced.attributes.position.needsUpdate = true;
-      if (!displaced.attributes.normal) displaced.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
-      else displaced.attributes.normal.needsUpdate = true;
-    }
-
-    // Smooth Bottom — same post-process as the export pipeline so a baked
-    // model and an exported one have an identical bed-contact surface.
-    if (settings.smoothBottom) {
-      snapBottomToFlat(displaced, currentBounds.min.z, 0.1);
-    }
+    const faceParentId = result.faceParentId;
+    displaced = new THREE.BufferGeometry();
+    displaced.setAttribute('position', new THREE.BufferAttribute(result.positions, 3));
+    if (result.normals) displaced.setAttribute('normal', new THREE.BufferAttribute(result.normals, 3));
 
     setBakeProgress(0.90, t('progress.finalizing'));
     await yieldFrame();
@@ -4765,23 +6208,21 @@ async function bakeTextures() {
       alert(t('alerts.bakeFailed', { msg: err.message }));
     }
   } finally {
-    if (subdivided) subdivided.dispose();
-    if (displaced)  displaced.dispose();
+    if (displaced) displaced.dispose();
     if (!succeeded) bakeProgress.classList.add('hidden');
     isBaking = false;
     bakeBtn.classList.remove('busy');
-    bakeBtn.disabled = (activeMapEntry === null);
+    bakeBtn.disabled = !_hasTexturedLayer();
   }
 }
 
 // Replace currentGeometry with `geometry` and reset per-model state without
 // touching the user's texture/settings. Mirrors the relevant subset of
 // handleModelFile but keeps activeMapEntry, settings, and refineLength as-is,
-// and seeds excludedFaces from opts.preExcludedFaces.
+// and seeds the exclusion paint from opts.preExcludedFaces.
 function adoptBakedGeometry(geometry, bounds, opts = {}) {
   // Invalidate any in-flight async operations tied to the previous mesh.
-  precisionToken++;
-  dispPreviewToken++;
+  cancelDisplacementPreviewBuild();
   exportToken++;
   diagToken++;
 
@@ -4813,21 +6254,6 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   settings.useDisplacement = false;
   dispPreviewToggle.checked = false;
 
-  // Reset precision masking — its mesh referenced the pre-bake mesh.
-  if (precisionGeometry) { precisionGeometry.dispose(); precisionGeometry = null; }
-  precisionParentMap  = null;
-  precisionEdgeLength = null;
-  precisionCentroids  = null;
-  precisionFaceNormals = null;
-  precisionAdjacency  = null;
-  precisionMaskingEnabled = false;
-  precisionMaskingToggle.checked = false;
-  precisionStatus.textContent = '';
-  precisionOutdated.classList.add('hidden');
-  precisionRefreshBtn.classList.add('hidden');
-  precisionWarning.classList.add('hidden');
-  precisionMaskingRow.classList.add('hidden');
-
   // Reset mesh diagnostics — they referenced the pre-bake mesh.
   meshDiagnostics.classList.add('hidden');
   meshDiagAdvanced.classList.add('hidden');
@@ -4838,24 +6264,32 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   // The seeded mask carries exclude-mode semantics ("don't re-texture these
   // faces"). If the user was in include-only mode pre-bake, that mode would
   // invert the meaning to "only texture these faces" — exactly backwards. So
-  // force exclude mode before seeding. setSelectionMode also clears
-  // excludedFaces as a side effect, which is fine — we re-seed below.
-  if (selectionMode) setSelectionMode(false);
+  // force exclude mode (the old paint is gone with the old mesh anyway).
+  _dropPaintGeometry();
+  paintTree = null;
+  if (selectionMode) setSelectionMode(false, { clear: false });
 
-  // Seed exclusion mask, exit any active painting/place/rotate modes.
-  excludedFaces = new Set(opts.preExcludedFaces || []);
-  precisionExcludedFaces = new Set();
+  // The bake flattened every layer into the geometry: continue with a single
+  // fresh layer that keeps the active layer's texture and settings.
+  layers = [_newLayer()];
+  activeLayer = 0;
+  _renderLayerStrip();
+
+  // Exit any active painting/place/rotate modes.
   exclusionTool = null;
   eraseMode     = false;
   isPainting    = false;
   if (placeOnFaceActive) togglePlaceOnFace(false);
   if (rotateActive) toggleRotateMode(false);
+  if (stampPlaceActive || _stampWheelArmed) toggleStampPlace(false);
   rotateAngles = { x: 0, y: 0, z: 0 };
   rotateXInput.value = '0'; rotateYInput.value = '0'; rotateZInput.value = '0';
   exclBrushBtn.classList.remove('active');
   exclBucketBtn.classList.remove('active');
   exclBrushTypeRow.classList.add('hidden');
+  exclBrushModeRow.classList.add('hidden');
   exclRadiusRow.classList.add('hidden');
+  exclHardnessRow.classList.add('hidden');
   exclThresholdRow.classList.add('hidden');
   canvas.style.cursor = '';
   setHoverPreview(null);
@@ -4867,17 +6301,19 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids;
   triangleFaceNormals = adjData.faceNormals;
+  _createPaintTree(adjData);
   updateMeshDiagnostics(adjData, geometry.attributes.position.count / 3);
 
-  // Refresh exclusion overlay using the new geometry + new mask.
-  if (excludedFaces.size > 0) refreshExclusionOverlay();
-  else setExclusionOverlay(null);
-  const maskCount = excludedFaces.size;
-  exclCount.textContent = maskCount === 0
-    ? t('excl.initExcluded')
-    : (maskCount === 1
-      ? (selectionMode ? t('excl.faceSelected', { n: 1 }) : t('excl.faceExcluded', { n: 1 }))
-      : (selectionMode ? t('excl.facesSelected', { n: maskCount }) : t('excl.facesExcluded', { n: maskCount })));
+  // Seed the exclusion mask with the just-baked faces so a follow-up texture
+  // pass won't double up. Soft paint doesn't carry over: the baked faces it
+  // touched are in the seed.
+  const seed = opts.preExcludedFaces || [];
+  if (seed.length) paintTree.paintFaces(_activeSlot(), seed, false);
+  // A seeded post-bake mask means masking is actively in play (exclude mode
+  // was forced above); no seed = back to the neutral default.
+  maskModeChosen = seed.length > 0;
+  updateMaskModeButtons();
+  refreshExclusionOverlay();
 
   // Update mesh info display.
   triLimitWarning.classList.add('hidden');
@@ -4886,11 +6322,11 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   const sx = bounds.size.x.toFixed(2);
   const sy = bounds.size.y.toFixed(2);
   const sz = bounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
-  exportBtn.disabled = (activeMapEntry === null);
-  export3mfBtn.disabled = (activeMapEntry === null);
-  bakeBtn.disabled = (activeMapEntry === null);
+  exportBtn.disabled = !_hasTexturedLayer();
+  export3mfBtn.disabled = !_hasTexturedLayer();
+  bakeBtn.disabled = !_hasTexturedLayer();
   updateSmartResBtnState();
 
   updatePreview();
@@ -4898,19 +6334,6 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   // Bake is a destructive transform — undo history references the pre-bake
   // triangle set, so it's no longer meaningful.
   _clearUndoStacks();
-}
-
-/**
- * Yield to the browser event loop, then run fn.
- * Uses setTimeout instead of rAF so it fires even in background tabs.
- */
-function runAsync(fn) {
-  return new Promise((resolve, reject) => {
-    setTimeout(() => {
-      try { resolve(fn()); }
-      catch (e) { reject(e); }
-    }, 0);
-  });
 }
 
 /** Yield to the browser event loop (for progress bar paints etc.). */
@@ -4933,32 +6356,190 @@ try { localStorage.removeItem(PROJECT_STORAGE_KEY); } catch { /* ignore */ }
 // Persisted setting keys — excludes `useDisplacement` (transient UI state).
 const PERSISTED_KEYS = [
   'mappingMode', 'scaleU', 'scaleV', 'lockScale',
-  'offsetU', 'offsetV', 'rotation',
+  'offsetU', 'offsetV', 'rotation', 'rotateAroundZ',
   'amplitude', 'textureHeight', 'invertDisplacement',
-  'symmetricDisplacement', 'noDownwardZ', 'smoothBottom', 'textureSmoothing',
-  'mappingBlend', 'seamBandWidth', 'capAngle', 'boundaryFalloff',
+  'invertTexture',
+  'symmetricDisplacement', 'noDownwardZ', 'smoothBottom', 'harvestFlatFaces', 'harvestTol', 'preserveUntextured', 'textureSmoothing',
+  'mappingBlend', 'seamBandWidth', 'capAngle', 'boundaryFalloff', 'boundaryFalloffCurve',
   'bottomAngleLimit', 'topAngleLimit',
   'refineLength', 'maxTriangles',
   // Cylindrical-mode controls. cylinderCenterX/Y/radius are nullable —
   // null means "fall back to AABB defaults", which is what fresh loads get.
   'snapSeamlessWrap', 'cylinderCenterX', 'cylinderCenterY', 'cylinderRadius',
   'cylinderPanelMinimized',
+  // Stamp placement; the centre, side and normal are nullable like the cylinder axis.
+  'stampOnce', 'stampCenterX', 'stampCenterY', 'stampCenterZ', 'stampSide',
+  'stampNormalX', 'stampNormalY', 'stampNormalZ',
 ];
 
+// Settings that are NOT per layer (see LAYER_KEYS): resolution, triangle
+// limit, angle masks, bottom handling, and the panel state.
+const GLOBAL_KEYS = PERSISTED_KEYS.filter(k => !LAYER_KEYS.includes(k));
+
+function _globalSettingsSnapshot() {
+  const snap = {};
+  for (const k of GLOBAL_KEYS) snap[k] = settings[k];
+  return snap;
+}
+
+/**
+ * Session / project snapshot: the global settings, the ACTIVE layer flattened
+ * to the top level (what every older reader expects), plus `layers` — each
+ * layer's settings, map reference, mode, visibility and blend — and the
+ * active index. The paint is not part of it (see paint.json in the project export).
+ */
 function getSettingsSnapshot() {
   const snap = {};
   for (const k of PERSISTED_KEYS) snap[k] = settings[k];
+  // scaleU/scaleV are absolute mm since July 2026; older snapshots without
+  // this marker carry legacy relative fractions and are converted on apply.
+  snap.scaleUnit = 'mm';
   if (activeMapEntry) {
     snap.activeMapName = activeMapEntry.name;
+    // Library id of a custom map (js/customTextures.js) — only meaningful in this browser.
+    snap.activeCustomId = activeMapEntry.customId || null;
   } else {
     // Thumbnails may not have finished loading yet; preserve any previously
-    // persisted preset name so a mid-load autosave doesn't wipe it.
+    // persisted map so a mid-load autosave doesn't wipe it.
     try {
       const prev = JSON.parse(sessionStorage.getItem(PROJECT_STORAGE_KEY) || 'null');
       snap.activeMapName = (prev && prev.activeMapName) || null;
-    } catch { snap.activeMapName = null; }
+      snap.activeCustomId = (prev && prev.activeCustomId) || null;
+    } catch { snap.activeMapName = snap.activeCustomId = null; }
   }
+  snap.layers = layers.map((L, i) => {
+    const isActive = i === activeLayer;
+    const entry = isActive ? activeMapEntry : L.mapEntry;
+    return {
+      id: L.id,
+      settings: isActive ? _layerSettingsSnapshot() : { ...L.settings },
+      activeMapName:  isActive ? snap.activeMapName  : (entry?.name ?? L.mapName ?? null),
+      activeCustomId: isActive ? snap.activeCustomId : (entry?.customId ?? L.customId ?? null),
+      includeOnly: isActive ? selectionMode : !!L.includeOnly,
+      visible: L.visible,
+      blendAdd: L.blendAdd,
+    };
+  });
+  snap.activeLayer = activeLayer;
   return snap;
+}
+
+/** Per-layer settings from a saved layer record, on top of the live layer's values. */
+function _layerSettingsFrom(saved) {
+  const out = _layerSettingsSnapshot();
+  if (saved && typeof saved === 'object') {
+    for (const k of LAYER_KEYS) if (k in saved) out[k] = saved[k];
+    // Layers saved before stamps existed tile — never inherit the live layer's stamp.
+    if (!('stampOnce' in saved)) {
+      out.stampOnce = false;
+      out.stampCenterX = out.stampCenterY = out.stampCenterZ = out.stampSide = null;
+      out.stampNormalX = out.stampNormalY = out.stampNormalZ = null;
+    }
+    if (out.mappingMode === 7 /* MODE_SURFACE_NORMAL */ && !out.stampOnce) out.mappingMode = 5;   // stamps only
+    if (saved.scaleUnit !== 'mm') {
+      // Legacy relative scale fractions — convert like applySettingsSnapshot would.
+      const m = _migrateSnapshotScaleToMm({ ...out, scaleUnit: saved.scaleUnit });
+      out.scaleU = m.scaleU; out.scaleV = m.scaleV;
+    }
+  }
+  out.scaleUnit = 'mm';
+  return out;
+}
+
+/**
+ * Rebuild `layers` from a snapshot's layer list (session restore or project
+ * import). Maps are resolved afterwards by _loadLayerMaps; masks are the
+ * caller's business. Returns false when the snapshot has no layer list.
+ */
+function _layersFromSnapshot(data) {
+  if (!data || !Array.isArray(data.layers) || data.layers.length === 0) return false;
+  const list = data.layers.slice(0, MAX_LAYERS).map((d) => _newLayer({
+    settings: _layerSettingsFrom(d.settings),
+    mapName:  d.activeMapName || null,
+    customId: d.activeCustomId || null,
+    mapEntry: null,
+    includeOnly: !!d.includeOnly,
+    maskModeChosen: !!d.includeOnly,
+    visible: d.visible !== false,
+    blendAdd: !!d.blendAdd,
+  }));
+  layers = list;
+  activeLayer = Math.max(0, Math.min(list.length - 1, Number(data.activeLayer) || 0));
+  return true;
+}
+
+/** Resolve a map reference (preset name or library id) to a loaded entry, or null. */
+async function _loadMapEntry(name, customId) {
+  if (customId) {
+    try {
+      const file = await getCustomTextureFile(customId);
+      if (file) {
+        const entry = await loadCustomTexture(file);
+        entry.isCustom = true;
+        entry.customId = customId;
+        return entry;
+      }
+    } catch (err) {
+      console.warn('Layer texture unavailable:', err);
+    }
+  }
+  if (name) {
+    const idx = IMAGE_PRESETS.findIndex(p => p.name === name);
+    if (idx >= 0) {
+      if (!PRESETS[idx].texture) {
+        try {
+          const full = await loadFullPreset(idx);
+          if (!PRESETS[idx].texture) PRESETS[idx] = { ...PRESETS[idx], ...full };
+        } catch (err) {
+          console.warn('Layer preset failed to load:', err);
+          return null;
+        }
+      }
+      return PRESETS[idx];
+    }
+  }
+  return null;
+}
+
+/** Load the maps of every inactive layer that doesn't have one yet, then refresh the preview. */
+async function _loadLayerMaps() {
+  const gen = ++_layerLoadGeneration;
+  const pending = layers.filter((L, i) => i !== activeLayer && !(L.mapEntry && L.mapEntry.texture));
+  for (const L of pending) {
+    const entry = await _loadMapEntry(L.mapName, L.customId);
+    if (gen !== _layerLoadGeneration) return;      // layers were replaced meanwhile
+    if (layers.includes(L) && entry) L.mapEntry = entry;
+  }
+  if (pending.length) updatePreview();
+}
+let _layerLoadGeneration = 0;
+
+/**
+ * Convert a legacy snapshot (scaleU/scaleV as fractions of the mode's
+ * reference length) to absolute mm. New snapshots carry scaleUnit:'mm' and
+ * pass through untouched. Uses the currently-loaded model's bounds — for
+ * project files the bundled model is loaded before settings are applied, so
+ * the conversion reproduces the file's original appearance exactly.
+ */
+function _migrateSnapshotScaleToMm(snap) {
+  if (!snap || snap.scaleUnit === 'mm') return snap;
+  if (snap.scaleU == null && snap.scaleV == null) return snap;
+  const out = { ...snap, scaleUnit: 'mm' };
+  const b = currentBounds || { size: { x: 50, y: 50, z: 50 } };
+  const mode = out.mappingMode ?? settings.mappingMode;
+  const { refU, refV } = getScaleReferenceLengths(mode, { cylinderRadius: out.cylinderRadius ?? null }, b);
+  // Short-lived fixed-reference feature (July 2026): its reference overrode
+  // the bbox extent for planar/triplanar/cubic modes.
+  const isAngular = mode === 3 /* CYLINDRICAL */ || mode === 4 /* SPHERICAL */;
+  const legacyRef = !isAngular && out.fixedWorldTextureScale && Number(out.referenceExtentMm) > 0
+    ? Number(out.referenceExtentMm) : null;
+  const rU = legacyRef ?? refU;
+  const rV = legacyRef ?? refV;
+  if (out.scaleU != null) out.scaleU = parseFloat((out.scaleU * rU).toPrecision(4));
+  if (out.scaleV != null) out.scaleV = parseFloat((out.scaleV * rV).toPrecision(4));
+  delete out.fixedWorldTextureScale;
+  delete out.referenceExtentMm;
+  return out;
 }
 
 /**
@@ -4968,12 +6549,20 @@ function getSettingsSnapshot() {
  */
 function applySettingsSnapshot(snap) {
   if (!snap) return;
+  snap = _migrateSnapshotScaleToMm(snap);
 
   // Mapping mode first — changes cap-angle row visibility and triggers preview.
+  // Stamp mode's option limits are re-applied at the end, for this snapshot.
+  for (const opt of mappingSelect.options) opt.disabled = false;
   if (snap.mappingMode != null) {
-    mappingSelect.value = String(snap.mappingMode);
+    // Surface normal only exists for stamps.
+    mappingSelect.value = String(snap.mappingMode === 7 && !snap.stampOnce ? 5 : snap.mappingMode);
     mappingSelect.dispatchEvent(new Event('change', { bubbles: true }));
   }
+
+  // Older projects were created with the original texture polarity.
+  invertTextureCheckbox.checked = snap.invertTexture ?? false;
+  invertTextureCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
 
   // invertDisplacement BEFORE amplitude — the amplitude setter reads the flag.
   if (snap.invertDisplacement != null) {
@@ -4998,12 +6587,19 @@ function applySettingsSnapshot(snap) {
   setLinkedVal(offsetUVal,          snap.offsetU);
   setLinkedVal(offsetVVal,          snap.offsetV);
   setLinkedVal(rotationVal,         snap.rotation);
+  // Older projects predate the option and rotated side faces in-plane.
+  rotateAroundZCheckbox.checked = snap.rotateAroundZ ?? false;
+  rotateAroundZCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
   setLinkedVal(amplitudeVal,        snap.textureHeight);
   setLinkedVal(textureSmoothingVal, snap.textureSmoothing);
   setLinkedVal(seamBlendVal,        snap.mappingBlend);
   setLinkedVal(seamBandWidthVal,    snap.seamBandWidth);
   setLinkedVal(capAngleVal,         snap.capAngle);
   setLinkedVal(boundaryFalloffVal,  snap.boundaryFalloff);
+  // Older snapshots predate the curve setting and were authored with the
+  // then-only linear ramp — fall back to 'linear' rather than keeping the
+  // current UI choice, so loaded projects reproduce their original look.
+  setFalloffCurve(snap.boundaryFalloffCurve ?? 'linear');
   setLinkedVal(bottomAngleLimitVal, snap.bottomAngleLimit);
   setLinkedVal(topAngleLimitVal,    snap.topAngleLimit);
   setLinkedVal(refineLenVal,        snap.refineLength);
@@ -5034,6 +6630,21 @@ function applySettingsSnapshot(snap) {
     smoothBottomChk.checked = snap.smoothBottom;
     smoothBottomChk.dispatchEvent(new Event('change', { bubbles: true }));
   }
+  // The restore above resets the auto-off flag, so re-apply the limit rule —
+  // otherwise a project saved with Bottom faces = 0 re-enables the snap (#126).
+  syncSmoothBottomToLimit();
+  if (snap.harvestFlatFaces != null) {
+    harvestFlatChk.checked = snap.harvestFlatFaces;
+    harvestFlatChk.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (snap.harvestTol != null) {
+    harvestTolInput.value = snap.harvestTol;
+    harvestTolInput.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  if (snap.preserveUntextured != null) {
+    preserveUntexturedChk.checked = snap.preserveUntextured;
+    preserveUntexturedChk.dispatchEvent(new Event('change', { bubbles: true }));
+  }
 
   // Cylindrical-mode state. cylinderCenterX/Y/radius pass through unchanged
   // (null is meaningful — falls back to AABB defaults during projection).
@@ -5049,6 +6660,20 @@ function applySettingsSnapshot(snap) {
     cylinderPanel.classList.toggle('minimized', settings.cylinderPanelMinimized);
   }
   updateCylinderUIVisibility();
+
+  // Stamp: snapshots from before the feature tile, like they always did.
+  settings.stampOnce    = !!snap.stampOnce;
+  settings.stampCenterX = snap.stampCenterX ?? null;
+  settings.stampCenterY = snap.stampCenterY ?? null;
+  settings.stampCenterZ = snap.stampCenterZ ?? null;
+  settings.stampSide    = snap.stampSide ?? null;
+  settings.stampNormalX = snap.stampNormalX ?? null;
+  settings.stampNormalY = snap.stampNormalY ?? null;
+  settings.stampNormalZ = snap.stampNormalZ ?? null;
+  _modeBeforeStamp = null;   // that projection belonged to the previous layer / session
+  if (stampPlaceActive && !isStampActive(settings)) toggleStampPlace(false);
+  _setStampWheelArmed(false);   // e.g. another layer: the wheel zooms again
+  updateStampUIVisibility();
 }
 
 /**
@@ -5060,9 +6685,7 @@ function _selectPresetByName(name, applyDefaults = false) {
   if (!name) return false;
   const idx = IMAGE_PRESETS.findIndex(p => p.name === name);
   if (idx < 0) return false;
-  const swatch = _presetSwatches[idx];
-  if (!swatch) return false;
-  selectPreset(idx, swatch, applyDefaults);
+  selectPreset(idx, applyDefaults);
   return true;
 }
 
@@ -5093,6 +6716,13 @@ function _restoreSessionSettings() {
   // Preset activation is handled by the thumbnail-load auto-select path —
   // it reads activeMapName from sessionStorage and suppresses defaults so
   // the user's saved scaleU / textureSmoothing survive.
+  if (_layersFromSnapshot(data)) {
+    _syncTreeLayers();
+    const L = layers[activeLayer];
+    if (L.includeOnly && !selectionMode) setSelectionMode(true, { clear: false });
+    _renderLayerStrip();
+    _loadLayerMaps();
+  }
 }
 
 // Delegate auto-save to input/change bubbling in the settings panel —
@@ -5104,22 +6734,33 @@ if (_settingsPanel) {
 }
 // The lock-scale button doesn't emit input/change — catch it separately.
 lockScaleBtn.addEventListener('click', _autoSaveSettings);
+// Same for the falloff-curve segmented buttons.
+for (const btn of Object.values(falloffCurveButtons)) {
+  btn.addEventListener('click', _autoSaveSettings);
+}
 
 // ── Reset to defaults ───────────────────────────────────────────────────────
 // Frozen snapshot of the initial `settings` object plus the default preset
 // name, so the reset button restores exactly what a fresh session starts with.
 
+// NOTE: no scaleUnit marker — scaleU/scaleV are deliberately legacy fractions
+// so applySettingsSnapshot's migration turns them into "0.5 × largest bbox
+// edge" mm for whatever model is currently loaded (the per-model default).
 const DEFAULT_SETTINGS_SNAPSHOT = Object.freeze({
   mappingMode: 5, scaleU: 0.5, scaleV: 0.5, lockScale: true,
-  offsetU: 0, offsetV: 0, rotation: 0,
+  offsetU: 0, offsetV: 0, rotation: 0, rotateAroundZ: false,
   amplitude: 0.5, textureHeight: 0.5, invertDisplacement: false,
-  symmetricDisplacement: false, noDownwardZ: false, smoothBottom: true, textureSmoothing: 0,
+  invertTexture: false,
+  symmetricDisplacement: false, noDownwardZ: false, smoothBottom: true, harvestFlatFaces: true, harvestTol: 0.005, preserveUntextured: true, textureSmoothing: 0,
   mappingBlend: 1, seamBandWidth: 0.5, capAngle: 20, boundaryFalloff: 0,
+  boundaryFalloffCurve: 'ease',
   bottomAngleLimit: 5, topAngleLimit: 0,
   refineLength: 1, maxTriangles: 750000,
   snapSeamlessWrap: true,
   cylinderCenterX: null, cylinderCenterY: null, cylinderRadius: null,
   cylinderPanelMinimized: false,
+  stampOnce: false, stampCenterX: null, stampCenterY: null, stampCenterZ: null, stampSide: null,
+  stampNormalX: null, stampNormalY: null, stampNormalZ: null,
   activeMapName: DEFAULT_PRESET_NAME,
 });
 
@@ -5147,20 +6788,25 @@ function resetSettingsToDefaults() {
       snapshot.refineLength = Math.max(0.05, Math.min(5.0, +(diag / 250).toFixed(2)));
     }
     applySettingsSnapshot(snapshot);
+    // A reset hands the resolution back to the per-model default.
+    refineLengthUserSet = false;
 
-    // Clear any painted mask and revert to Exclude mode. setSelectionMode
-    // also clears the face sets, but only when the mode actually changes —
-    // run explicit resets afterwards so we always end up empty.
-    if (selectionMode) setSelectionMode(false);
-    excludedFaces          = new Set();
-    precisionExcludedFaces = new Set();
+    // Back to a single layer with no paint, in Exclude mode.
+    layers = [_newLayer({ includeOnly: false, maskModeChosen: false })];
+    activeLayer = 0;
+    _syncTreeLayers();
+    if (paintTree) paintTree.clearLayer(_activeSlot());
+    if (selectionMode) setSelectionMode(false, { clear: false });
+    maskModeChosen         = false;
+    updateMaskModeButtons();
+    _renderLayerStrip();
     if (currentGeometry) refreshExclusionOverlay();
 
     const defaultIdx = IMAGE_PRESETS.findIndex(p => p.name === DEFAULT_PRESET_NAME);
-    if (defaultIdx >= 0 && _presetSwatches[defaultIdx] && PRESETS[defaultIdx]) {
+    if (defaultIdx >= 0) {
       // applyDefaults=true so the preset's defaultScale overrides whatever
       // scale the user had — matches the "fresh session" intent.
-      selectPreset(defaultIdx, _presetSwatches[defaultIdx], true);
+      selectPreset(defaultIdx, true);
     }
     try { sessionStorage.removeItem(PROJECT_STORAGE_KEY); } catch { /* ignore */ }
   } finally {
@@ -5187,12 +6833,23 @@ const exportModelChk    = document.getElementById('export-model-chk');
 const exportTextureChk  = document.getElementById('export-texture-chk');
 const exportTextureRow  = document.getElementById('export-texture-row');
 const importProjectInput = document.getElementById('import-project-input');
+const loadDialog        = document.getElementById('load-dialog');
+const loadModeAllRadio  = document.getElementById('load-mode-all');
+const loadModeSettingsRadio = document.getElementById('load-mode-settings');
+const loadGoBtn         = document.getElementById('load-go-btn');
+
+/** Map entry of layer i as it currently stands (live for the active layer). */
+function _layerMapEntry(i) {
+  return i === activeLayer ? activeMapEntry : layers[i].mapEntry;
+}
 
 exportProjectBtn.addEventListener('click', (e) => {
   e.stopPropagation();
-  // Offer custom-texture export whenever one has been uploaded this session,
-  // even if a preset is currently active — _lastCustomMap survives preset switches.
-  const hasCustom = !!(_lastCustomMap && _lastCustomMap.fullCanvas);
+  // Offer custom-texture export whenever a layer uses one, or one has been
+  // uploaded this session even if a preset is currently active —
+  // _lastCustomMap survives preset switches.
+  const hasCustom = !!(_lastCustomMap && _lastCustomMap.fullCanvas)
+    || layers.some((L, i) => _layerMapEntry(i)?.isCustom && _layerMapEntry(i)?.fullCanvas);
   exportModelChk.disabled = !currentGeometry;
   if (!currentGeometry) exportModelChk.checked = false;
   exportTextureRow.classList.toggle('hidden', !hasCustom);
@@ -5212,26 +6869,62 @@ exportGoBtn.addEventListener('click', async () => {
   exportDialog.classList.add('hidden');
   try {
     const includeModel   = exportModelChk.checked && !!currentGeometry;
-    const customSource   = (_lastCustomMap && _lastCustomMap.fullCanvas) ? _lastCustomMap : null;
+    const activeCustom   = (activeMapEntry?.isCustom && activeMapEntry.fullCanvas) ? activeMapEntry : null;
+    // Legacy single-texture slot: the active layer's custom map, else the last
+    // upload (older readers activate it through activeMapName).
+    const customSource   = activeCustom || ((_lastCustomMap && _lastCustomMap.fullCanvas) ? _lastCustomMap : null);
     const includeTexture = exportTextureChk.checked && !!customSource;
-
     const payload = { version: PROJECT_VERSION, ...getSettingsSnapshot() };
+    delete payload.activeCustomId;   // a browser-local library id means nothing in another browser
+    for (const d of payload.layers) delete d.activeCustomId;
     // Mark the custom map as the active reference so the importer restores it
     // even if the user has a preset selected at export time.
     if (includeTexture) payload.activeMapName = customSource.name;
-    const zipFiles = { 'settings.json': strToU8(JSON.stringify(payload, null, 2)) };
+    // The bundled model is written in its ORIGINAL pose (issue #82), so the
+    // in-app rotation must ride along in the settings for the importer to
+    // replay — otherwise a saved session would lose its orientation.
+    if (includeModel && Math.abs(currentPoseRot.w) < 1 - 1e-12) {
+      payload.poseRotation = currentPoseRot.toArray();
+    }
+    const zipFiles = {};
 
     if (includeModel) {
-      zipFiles['model.stl'] = _geometryToBinarySTL(currentGeometry);
-      // Mask indices reference the base geometry's triangles, so they only make
-      // sense when shipped alongside the model that produced them.
-      const mask = _collectCurrentMask();
-      if (mask) zipFiles['mask.json'] = strToU8(JSON.stringify(mask));
+      // Written in the original pose (issue #82); re-importing re-centers and
+      // replays poseRotation, so project round-trips stay stable.
+      zipFiles['model.stl'] = _geometryToBinarySTL(currentGeometry, true);
+      // The paint tree indexes the base geometry's triangles, so it only makes
+      // sense alongside the model that produced it. paint.json holds every
+      // layer's strokes; mask.json is the active layer's hard paint as a face
+      // list, what older readers expect.
+      if (paintTree) {
+        // Per-leaf-corner coverage: the import welds the STL's rounded
+        // coordinates afresh, and per-vertex coverage would not survive a
+        // regrouped vertex (#134).
+        const data = paintTree.serialize({ leafCov: true });
+        zipFiles['paint.json'] = strToU8(JSON.stringify(PaintTree.toJSON(data)));
+        payload.paint = 'paint.json';
+        const legacy = _legacyMaskOf(_activeSlot());
+        if (legacy) zipFiles['mask.json'] = strToU8(JSON.stringify(legacy));
+      }
     }
     if (includeTexture) {
       const blob = await new Promise(r => customSource.fullCanvas.toBlob(r, 'image/png'));
       zipFiles['texture.png'] = new Uint8Array(await blob.arrayBuffer());
+      // Per-layer custom maps (the active layer's is the same bytes as texture.png).
+      for (let i = 0; i < layers.length; i++) {
+        const entry = _layerMapEntry(i);
+        if (!(entry?.isCustom && entry.fullCanvas)) continue;
+        const fname = `texture-${i}.png`;
+        if (entry === customSource) zipFiles[fname] = zipFiles['texture.png'];
+        else {
+          const b2 = await new Promise(r => entry.fullCanvas.toBlob(r, 'image/png'));
+          zipFiles[fname] = new Uint8Array(await b2.arrayBuffer());
+        }
+        payload.layers[i].texture = fname;
+        payload.layers[i].activeMapName = entry.name;
+      }
     }
+    zipFiles['settings.json'] = strToU8(JSON.stringify(payload, null, 2));
 
     const zipped = zipSync(zipFiles);
     _downloadBlob(new Blob([zipped], { type: 'application/octet-stream' }),
@@ -5241,8 +6934,14 @@ exportGoBtn.addEventListener('click', async () => {
   }
 });
 
-/** Pack a BufferGeometry into binary-STL bytes (80-byte header, uint32 count, 50 bytes per triangle). */
-function _geometryToBinarySTL(geo) {
+/** Pack a BufferGeometry into binary-STL bytes (80-byte header, uint32 count, 50 bytes per triangle). With restorePose, vertices/normals are mapped back to the model's original file pose (see _restoreOriginalPose) without mutating the geometry. */
+function _geometryToBinarySTL(geo, restorePose = false) {
+  const t = currentPoseTrans;
+  const rotInv = (restorePose && Math.abs(currentPoseRot.w) < 1 - 1e-12)
+    ? currentPoseRot.clone().invert()
+    : null;
+  const ox = restorePose ? t.x : 0, oy = restorePose ? t.y : 0, oz = restorePose ? t.z : 0;
+  const _v = new THREE.Vector3();
   const pos = geo.attributes.position.array;
   const nor = geo.attributes.normal ? geo.attributes.normal.array : null;
   const triCount = (pos.length / 9) | 0;
@@ -5257,70 +6956,36 @@ function _geometryToBinarySTL(geo) {
     const srcPos = i * 9;
     if (nor) {
       const srcNor = i * 9;
-      view.setFloat32(dst,     nor[srcNor],     true);
-      view.setFloat32(dst + 4, nor[srcNor + 1], true);
-      view.setFloat32(dst + 8, nor[srcNor + 2], true);
+      _v.set(nor[srcNor], nor[srcNor + 1], nor[srcNor + 2]);
+      if (rotInv) _v.applyQuaternion(rotInv);
+      view.setFloat32(dst,     _v.x, true);
+      view.setFloat32(dst + 4, _v.y, true);
+      view.setFloat32(dst + 8, _v.z, true);
     }
     for (let v = 0; v < 3; v++) {
       const d = dst + 12 + v * 12;
-      view.setFloat32(d,     pos[srcPos + v * 3],     true);
-      view.setFloat32(d + 4, pos[srcPos + v * 3 + 1], true);
-      view.setFloat32(d + 8, pos[srcPos + v * 3 + 2], true);
+      _v.set(pos[srcPos + v * 3] - ox, pos[srcPos + v * 3 + 1] - oy, pos[srcPos + v * 3 + 2] - oz);
+      if (rotInv) _v.applyQuaternion(rotInv);
+      view.setFloat32(d,     _v.x, true);
+      view.setFloat32(d + 4, _v.y, true);
+      view.setFloat32(d + 8, _v.z, true);
     }
   }
   return bytes;
 }
 
 /**
- * Snapshot the current paint mask (selection mode + excluded face indices into
- * the *base* geometry). Returns null when there's nothing meaningful to save —
- * i.e. exclude-mode with no painted faces.
- *
- * If precision masking is active, collapse `precisionExcludedFaces` back to
- * base-geometry indices via `precisionParentMap`, mirroring the collapse that
- * happens when the user disables precision (line 3193).
+ * The active layer's hard paint as the pre-tree project mask (base faces
+ * whose root is painted whole), or null when there is none. Older versions
+ * read this; strokes finer than a base face are only in paint.json.
  */
-function _collectCurrentMask() {
-  let liveExcluded;
-  if (precisionMaskingEnabled && precisionParentMap && precisionExcludedFaces.size > 0) {
-    liveExcluded = new Set();
-    for (const pf of precisionExcludedFaces) liveExcluded.add(precisionParentMap[pf]);
-  } else {
-    liveExcluded = excludedFaces;
-  }
-  // Include-mode with zero painted = "mask everything" — also worth preserving.
-  if (liveExcluded.size === 0 && !selectionMode) return null;
-  return { selectionMode, excluded: [...liveExcluded] };
-}
-
-/**
- * Apply a saved mask to the currently-loaded geometry. Filters out indices
- * that would be out-of-range for the loaded mesh (defensive — the .bumpmesh
- * file always ships its own model, but we still validate).
- */
-function _restoreMask(mask) {
-  if (!currentGeometry) return;
-  // null mask = exclude-mode with zero painted faces (the implicit default).
-  // Without this branch, undoing back to the empty baseline would leave the
-  // previously-painted mask on screen because the early-return skipped the
-  // clear, making subsequent undo/redo appear broken.
-  if (!mask) {
-    if (selectionMode) setSelectionMode(false); // also clears the face sets
-    excludedFaces = new Set();
-    precisionExcludedFaces = new Set();
-    refreshExclusionOverlay();
-    return;
-  }
-  const triCount = (currentGeometry.attributes.position.count / 3) | 0;
-  // setSelectionMode clears any current paint, so flip mode FIRST then seed.
-  if (mask.selectionMode === true)  setSelectionMode(true);
-  else if (mask.selectionMode === false && selectionMode) setSelectionMode(false);
-
-  const valid = (Array.isArray(mask.excluded) ? mask.excluded : [])
-    .filter(i => Number.isInteger(i) && i >= 0 && i < triCount);
-  excludedFaces = new Set(valid);
-  precisionExcludedFaces = new Set(); // precision rebuilds from this on demand
-  refreshExclusionOverlay();
+function _legacyMaskOf(slot) {
+  if (!paintTree || slot < 0) return null;
+  const tl = paintTree.layers[slot];
+  const excluded = [];
+  for (let f = 0; f < paintTree.baseTriCount; f++) if (tl.state[f]) excluded.push(f);
+  if (excluded.length === 0 && !selectionMode) return null;
+  return { selectionMode, excluded };
 }
 
 function _downloadBlob(blob, filename) {
@@ -5349,65 +7014,244 @@ async function importProject(file) {
   if (file.size > PROJECT_MAX_IMPORT) {
     throw new Error(`File too large (${(file.size / 1024 / 1024).toFixed(1)} MB, max 500 MB)`);
   }
-  _undoApplyDepth++;
-  try {
   const buf = await file.arrayBuffer();
-  const unzipped = unzipSync(new Uint8Array(buf));
+  const bytes = new Uint8Array(buf);
+
+  // A .bumpmesh project is a ZIP (PK\x03\x04). If the user picked a bare model
+  // file here instead — common on macOS Chrome, where the accept=".bumpmesh"
+  // filter doesn't reliably hide .stl/.obj files — route it to the model loader
+  // rather than failing with a cryptic "invalid zip data". A 3MF is also a ZIP,
+  // so trust the extension first and fall back to the magic-byte sniff for
+  // extension-less STLs.
+  const isModelExt = /\.(stl|obj|3mf)$/i.test(file.name);
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4B &&
+                bytes[2] === 0x03 && bytes[3] === 0x04;
+  if (isModelExt || !isZip) {
+    await handleModelFile(file);
+    return;
+  }
+
+  const unzipped = unzipSync(bytes);
 
   const settingsBytes = unzipped['settings.json'];
   const data = settingsBytes ? JSON.parse(strFromU8(settingsBytes)) : null;
-
-  // 1) Load model first — handleModelFile resets scaleU/scaleV/offsets/refineLength
-  //    AND clears any existing paint mask, so applied settings + restored mask
-  //    below will correctly override those resets.
   const hasModel = !!unzipped['model.stl'];
+
+  // Decide what to load. When the file carries a model the user chooses whether
+  // to replace their current model ('all') or keep it and apply settings only
+  // ('settings'). A file without a model is always settings-only — nothing to
+  // ask. The prompt runs BEFORE we touch any state, so dismissing it is a no-op.
+  let loadMode = 'settings';
   if (hasModel) {
-    const stlFile = new File([unzipped['model.stl']], 'model.stl', { type: 'application/octet-stream' });
-    await handleModelFile(stlFile);
+    const choice = await promptLoadMode();
+    if (choice === null) return; // dialog dismissed → load nothing
+    loadMode = choice;
   }
 
-  // 2) Apply settings after any model reset.
-  if (data) applySettingsSnapshot(data);
+  // Flush any pending settings change so it lands as its own undo step, keeping
+  // the pre-load baseline accurate for the settings-only commit below.
+  _flushUndoCapture();
 
-  // 2b) Restore paint mask — only meaningful when the project shipped a model,
-  //     since indices reference that exact triangle set.
-  if (hasModel && unzipped['mask.json']) {
+  _undoApplyDepth++;
+  try {
+    if (loadMode === 'all') {
+      // Load model first — handleModelFile resets scaleU/scaleV/offsets/refineLength
+      // AND clears any existing paint mask, so applied settings + restored mask
+      // below will correctly override those resets.
+      const stlFile = new File([unzipped['model.stl']], 'model.stl', { type: 'application/octet-stream' });
+      await handleModelFile(stlFile);
+
+      // The bundled model is stored in its original pose; replay the saved
+      // in-app rotation so the session resumes exactly as it was exported.
+      // Runs before applySettingsSnapshot so the finalize's cylinder-axis
+      // reset is overridden by the saved settings, not the other way around.
+      if (data && Array.isArray(data.poseRotation) && data.poseRotation.length === 4) {
+        const q = new THREE.Quaternion().fromArray(data.poseRotation).normalize();
+        if (Math.abs(q.w) < 1 - 1e-12) {
+          _rotateGeometry(q);
+          _rotateFinalize();
+        }
+      }
+
+      // Apply settings after the model reset. The mask is restored below,
+      // once the layer it belongs to exists: by _importLayers for a layered
+      // project, by _restoreLegacyProjectMask for a pre-layer one.
+      if (data) applySettingsSnapshot(data);
+    } else {
+      // Settings only: keep the current model and its mask untouched. We skip
+      // model.stl (and never call handleModelFile, so the scale/offset/refine
+      // resets don't fire) and mask.json (its indices belong to the saved
+      // model, not the live one).
+      if (data) applySettingsSnapshot(data);
+    }
+
+    if (data && Array.isArray(data.layers) && data.layers.length) {
+      await _importLayers(unzipped, data, loadMode === 'all');
+    } else {
+      // Pre-layer project: a single layer, described by the top-level fields.
+      // Collapse to that layer and give it a tree slot BEFORE restoring the
+      // mask — restoring first left the paint under a layer id nothing
+      // referenced any more, so it neither showed nor exported (#134).
+      // Settings-only keeps the active layer's id, and with it the paint on
+      // the model that stays loaded.
+      const activeId = layers[activeLayer]?.id;
+      layers = [_newLayer(loadMode === 'settings' && activeId != null ? { id: activeId } : {})];
+      activeLayer = 0;
+      _syncTreeLayers();
+      if (loadMode === 'all') _restoreLegacyProjectMask(unzipped);
+      else if (paintTree) refreshExclusionOverlay();
+      await _applyImportedTexture(unzipped, data);
+      _renderLayerStrip();
+    }
+
+    _autoSaveSettings();
+  } finally {
+    _undoApplyDepth--;
+    if (loadMode === 'all') {
+      // Full import = fresh start; mask indices belong to the imported model.
+      _clearUndoStacks();
+    } else {
+      // Settings-only is an undoable settings change on the unchanged model.
+      _commitUndoCapture();
+    }
+  }
+}
+
+/**
+ * Pre-layer project mask (mask.json: base-face list + soft corners) → the
+ * active layer's paint. Only meaningful right after the bundled model was
+ * loaded, since the indices reference its triangles.
+ */
+function _restoreLegacyProjectMask(unzipped) {
+  if (!unzipped['mask.json'] || !paintTree) return;
+  try {
+    const mask = JSON.parse(strFromU8(unzipped['mask.json']));
+    if (!mask || typeof mask !== 'object') return;
+    if (!!mask.selectionMode !== selectionMode) setSelectionMode(!!mask.selectionMode, { clear: false });
+    _importLegacyMask(_activeSlot(), mask);
+    maskModeChosen = true;
+    updateMaskModeButtons();
+    refreshExclusionOverlay();
+  } catch (err) { console.warn('Could not restore paint mask:', err); }
+}
+
+/**
+ * Rebuild the layers of a layered project: settings, maps (bundled PNGs win
+ * over preset names), modes and — with the bundled model loaded — masks.
+ */
+async function _importLayers(unzipped, data, withMasks) {
+  _layersFromSnapshot(data);
+  _syncTreeLayers();
+  const files = data.layers.slice(0, layers.length);
+  for (let i = 0; i < layers.length; i++) {
+    const L = layers[i], d = files[i] || {};
+    if (d.texture && unzipped[d.texture]) {
+      try {
+        const texName = d.activeMapName || d.texture;
+        const entry = await loadCustomTexture(new File([unzipped[d.texture]], texName, { type: 'image/png' }));
+        entry.isCustom = true;
+        entry.name = texName;
+        L.mapEntry = entry;
+        L.mapName = texName;
+      } catch (err) { console.warn('Layer texture failed to load:', err); }
+    }
+    if (!L.mapEntry) L.mapEntry = await _loadMapEntry(L.mapName, null);
+    // Pre-paint-tree layered projects: one face-list mask per layer.
+    if (withMasks && paintTree && d.mask && unzipped[d.mask]) {
+      try {
+        const m = JSON.parse(strFromU8(unzipped[d.mask]));
+        if (m && typeof m === 'object') {
+          L.includeOnly = !!m.selectionMode;
+          L.maskModeChosen = true;
+          _importLegacyMask(_slotOf(i), m);
+        }
+      } catch (err) { console.warn('Could not restore a layer mask:', err); }
+    }
+  }
+  if (withMasks && paintTree && data.paint && unzipped[data.paint]) {
     try {
-      const mask = JSON.parse(strFromU8(unzipped['mask.json']));
-      _restoreMask(mask);
-    } catch (err) { console.warn('Could not restore paint mask:', err); }
+      const j = JSON.parse(strFromU8(unzipped[data.paint]));
+      const restored = PaintTree.fromJSON(j);
+      if (restored) {
+        // The saved tree names layers by the ids of the saving session; the
+        // rebuilt records have fresh ids, matched up by position.
+        const idMap = new Map();
+        files.forEach((d2, k) => { if (d2 && d2.id != null && layers[k]) idMap.set(d2.id, layers[k].id); });
+        restored.layerIds = restored.layerIds.map(id => idMap.has(id) ? idMap.get(id) : id);
+        if (!paintTree.deserialize(restored)) {
+          // Only a different triangle count gets here now; say so instead of
+          // silently loading the model without its mask (#134).
+          console.warn('Saved paint does not match the loaded model');
+          alert(t('alerts.paintNotRestored'));
+        }
+      }
+      _syncTreeLayers();
+    } catch (err) { console.warn('Could not restore the paint:', err); }
   }
+  _materialiseActiveLayer();
+  _renderLayerStrip();
+  updatePreview();
+}
 
-  // 3) Texture: custom PNG wins over named preset.
+/**
+ * Apply a project's texture: custom PNG wins over a named preset. Shared by
+ * both load modes — the displacement map is part of the saved settings.
+ */
+async function _applyImportedTexture(unzipped, data) {
   if (unzipped['texture.png']) {
     const texName = (data && data.activeMapName) || 'imported-texture.png';
     const texFile = new File([unzipped['texture.png']], texName, { type: 'image/png' });
-    activeMapEntry = await loadCustomTexture(texFile);
-    activeMapEntry.isCustom = true;
-    activeMapEntry.name = texName;
-    _lastCustomMap = activeMapEntry;
-    activeMapName.textContent = texName;
-    document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
-    _showCustomMapThumb(activeMapEntry);
-    customMapSwatch.classList.add('active');
-    updatePreview();
+    const entry = await loadCustomTexture(texFile);
+    entry.isCustom = true;
+    entry.name = texName;
+    _useCustomMap(entry, false);
   } else if (data && data.activeMapName) {
     _selectPresetByName(data.activeMapName);
   }
+}
 
-  _autoSaveSettings();
-  } finally {
-    _undoApplyDepth--;
-    // Imported project = fresh start; mask indices belong to the imported model.
-    _clearUndoStacks();
-  }
+/**
+ * Show the load-mode dialog and resolve to 'all' (model + settings),
+ * 'settings' (settings only), or null if the user dismisses it. Defaults to
+ * 'settings' when a model is already loaded (protect what you're working on),
+ * otherwise 'all' (you need the file's model to see anything).
+ */
+function promptLoadMode() {
+  return new Promise((resolve) => {
+    const keepCurrent = !!currentGeometry;
+    loadModeSettingsRadio.checked = keepCurrent;
+    loadModeAllRadio.checked = !keepCurrent;
+    loadDialog.classList.remove('hidden');
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      loadDialog.classList.add('hidden');
+      loadGoBtn.removeEventListener('click', onGo);
+      document.removeEventListener('click', onOutside, true);
+      document.removeEventListener('keydown', onKey, true);
+      resolve(result);
+    };
+    const onGo = () => finish(loadModeSettingsRadio.checked ? 'settings' : 'all');
+    const onOutside = (e) => { if (!loadDialog.contains(e.target)) finish(null); };
+    const onKey = (e) => { if (e.key === 'Escape') finish(null); };
+
+    loadGoBtn.addEventListener('click', onGo);
+    // Defer the dismiss listeners so the click/change that opened the picker
+    // doesn't immediately close the dialog.
+    setTimeout(() => {
+      document.addEventListener('click', onOutside, true);
+      document.addEventListener('keydown', onKey, true);
+    }, 0);
+  });
 }
 
 // ── Undo / Redo ──────────────────────────────────────────────────────────────
 // Snapshot stack over the same state the project save/load helpers handle:
-// `getSettingsSnapshot()` (PERSISTED_KEYS + activeMapName) and
-// `_collectCurrentMask()` (selectionMode + excluded face indices). Operations
-// are debounced so a slider drag collapses to one undo step.
+// the global settings, the layer list (settings, map, mode, visibility per
+// layer) and the serialized paint tree. Operations are debounced so a slider
+// drag collapses to one undo step.
 
 const UNDO_LIMIT = 50;
 const UNDO_DEBOUNCE_MS = 400;
@@ -5423,31 +7267,45 @@ const redoBtn = document.getElementById('redo-btn');
 
 function _captureUndoSnapshot() {
   return {
-    settings: getSettingsSnapshot(),
-    mask:     _collectCurrentMask(),
+    active: activeLayer,
+    global: _globalSettingsSnapshot(),
+    layers: layers.map((L, i) => (i === activeLayer
+      ? { id: L.id, settings: _layerSettingsSnapshot(), mapName: activeMapEntry?.name ?? null,
+          customId: activeMapEntry?.customId ?? null, mapEntry: activeMapEntry,
+          includeOnly: selectionMode, maskModeChosen, visible: L.visible, blendAdd: L.blendAdd }
+      : { id: L.id, settings: { ...L.settings }, mapName: L.mapName, customId: L.customId,
+          mapEntry: L.mapEntry, includeOnly: !!L.includeOnly, maskModeChosen: !!L.maskModeChosen,
+          visible: L.visible, blendAdd: L.blendAdd })),
+    paint: paintTree ? paintTree.serialize() : null,
   };
 }
 
 function _undoSnapshotsEqual(a, b) {
   if (a === b) return true;
   if (!a || !b) return false;
-  for (const k of PERSISTED_KEYS) {
-    if (a.settings[k] !== b.settings[k]) return false;
+  if (a.active !== b.active || a.layers.length !== b.layers.length) return false;
+  for (const k of GLOBAL_KEYS) {
+    if (a.global[k] !== b.global[k]) return false;
   }
-  if ((a.settings.activeMapName || null) !== (b.settings.activeMapName || null)) return false;
-  const ma = a.mask, mb = b.mask;
-  if (!ma && !mb) return true;
-  if (!ma || !mb) return false;
-  if (ma.selectionMode !== mb.selectionMode) return false;
-  if (ma.excluded.length !== mb.excluded.length) return false;
-  const sb = new Set(mb.excluded);
-  for (const v of ma.excluded) if (!sb.has(v)) return false;
-  return true;
+  for (let i = 0; i < a.layers.length; i++) {
+    const la = a.layers[i], lb = b.layers[i];
+    if (la.id !== lb.id || la.visible !== lb.visible || la.blendAdd !== lb.blendAdd) return false;
+    if (la.includeOnly !== lb.includeOnly || la.maskModeChosen !== lb.maskModeChosen) return false;
+    if ((la.mapName || null) !== (lb.mapName || null)) return false;
+    if ((la.customId || null) !== (lb.customId || null)) return false;
+    for (const k of LAYER_KEYS) {
+      if (la.settings[k] !== lb.settings[k]) return false;
+    }
+  }
+  return PaintTree.serializedEqual(a.paint, b.paint);
 }
 
 function _commitUndoCapture() {
   _undoCaptureTimer = null;
   if (_undoApplyDepth > 0) return;
+  // A stroke in progress commits on its own mouseup; a debounced capture from
+  // just before it must not cut the stroke into two steps.
+  if (isPainting) { _scheduleUndoCapture(); return; }
   const next = _captureUndoSnapshot();
   if (_baselineSnapshot && _undoSnapshotsEqual(_baselineSnapshot, next)) return;
   if (_baselineSnapshot) {
@@ -5484,11 +7342,23 @@ function _clearUndoStacks() {
 function _applyUndoSnapshot(snap) {
   _undoApplyDepth++;
   try {
-    applySettingsSnapshot(snap.settings);
-    _restoreMask(snap.mask);
-    if (snap.settings && snap.settings.activeMapName) {
-      _selectPresetByName(snap.settings.activeMapName);
+    layers = snap.layers.map(l => ({
+      id: l.id, settings: { ...l.settings }, mapName: l.mapName, customId: l.customId,
+      mapEntry: l.mapEntry, includeOnly: !!l.includeOnly, maskModeChosen: !!l.maskModeChosen,
+      visible: l.visible, blendAdd: l.blendAdd,
+    }));
+    activeLayer = Math.max(0, Math.min(layers.length - 1, snap.active));
+    if (paintTree) {
+      _syncTreeLayers();
+      if (snap.paint) paintTree.deserialize(snap.paint);
+      _syncTreeLayers();
     }
+    // Global settings first: applySettingsSnapshot resets a few per-layer
+    // controls it doesn't find (invert, falloff curve), which the layer
+    // materialisation then sets properly.
+    applySettingsSnapshot(snap.global);
+    _materialiseActiveLayer();
+    _renderLayerStrip();
     updatePreview();
     _autoSaveSettings();
   } finally {

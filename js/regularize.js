@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 CNCKitchen (Stefan Hermann) and contributors
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
 /**
  * Mesh regularization via short-edge collapse.
  *
@@ -41,13 +46,13 @@
  * @param {number}              [opts.maxNormalDeltaCos=cos(15°)]       – min dot of new vs old face normal (base)
  * @param {number}              [opts.aggressiveNormalDeltaCos=cos(25°)] – min dot when BOTH wings are extreme slivers
  * @param {number}              [opts.maxRounds=8]       – iterate until stable, capped at this
- * @param {Uint8Array}          [opts.excludedTris]      – per-triangle skip flag (1 = skip).  When provided,
- *                                                          excluded triangles are marked as deleted before the
- *                                                          regularize loop, so they pass through unchanged.
+ * @param {boolean}             [opts.preserveExcluded=false] – freeze all vertices of
+ *   excludeWeight-marked faces so untextured surfaces are never modified (beta)
  * @returns {{ geometry, faceParentId, collapseCount }}
  */
 
-import * as THREE from 'three';
+import { THREE } from './threeCompat.js';
+import { QuantizedPointMap } from './meshIndex.js';
 
 const QUANTISE = 1e5;
 
@@ -86,6 +91,13 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   // a-larger-fillet-face shape, so fine fillets keep their tight gate.
   const maxNormalDeltaCos        = opts.maxNormalDeltaCos        ?? Math.cos(15 * Math.PI / 180);
   const aggressiveNormalDeltaCos = opts.aggressiveNormalDeltaCos ?? Math.cos(25 * Math.PI / 180);
+  // Geometric-deviation cap (mm): a collapse's merged vertex must stay within
+  // this distance of the ORIGINAL plane of every triangle it ends up in. The
+  // normal-swing gate alone let collapses across narrow CAD fillet strips
+  // drop whole rows of fillet vertices onto the chord — random facets up to
+  // ~0.2 mm deep, the "crystal" look of #85 (it showed even at amplitude 0).
+  // Coplanar slivers deviate 0, so flat-face cleanup is unaffected.
+  const maxPlaneDev = opts.maxPlaneDev ?? 0.03;
   // Vertices on edges with dihedral > sharpEdgeAngle are frozen: they cannot
   // be collapse endpoints, so 45°/90° feature edges keep every original
   // vertex.  Slivers in the interior of a flat face are still collapsible.
@@ -101,15 +113,26 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   const pa = geometry.attributes.position.array;
   const triCount = pa.length / 9;
 
-  const posMap = new Map();
-  const vertX = [], vertY = [], vertZ = [];
+  const posMap = new QuantizedPointMap(QUANTISE, Math.min(triCount * 3, 1 << 22));
+  // Vertex coordinates in growable typed arrays (Float64 — JS-number math
+  // below must match the previous plain-array behaviour exactly).
+  let vcap = Math.min(Math.max(1 << 16, triCount), triCount * 3);
+  let vertX = new Float64Array(vcap), vertY = new Float64Array(vcap), vertZ = new Float64Array(vcap);
   let nextVid = 0;
   const corners = new Int32Array(triCount * 3);
   for (let i = 0; i < triCount * 3; i++) {
     const x = pa[i*3], y = pa[i*3+1], z = pa[i*3+2];
-    const key = `${Math.round(x*QUANTISE)}_${Math.round(y*QUANTISE)}_${Math.round(z*QUANTISE)}`;
-    let id = posMap.get(key);
-    if (id === undefined) { id = nextVid++; posMap.set(key, id); vertX.push(x); vertY.push(y); vertZ.push(z); }
+    const id = posMap.getOrSet(x, y, z, nextVid);
+    if (posMap.inserted) {
+      if (nextVid === vcap) {
+        vcap = Math.min(vcap * 2, triCount * 3);
+        const gx = new Float64Array(vcap); gx.set(vertX); vertX = gx;
+        const gy = new Float64Array(vcap); gy.set(vertY); vertY = gy;
+        const gz = new Float64Array(vcap); gz.set(vertZ); vertZ = gz;
+      }
+      vertX[nextVid] = x; vertY[nextVid] = y; vertZ[nextVid] = z;
+      nextVid++;
+    }
     corners[i] = id;
   }
 
@@ -143,14 +166,40 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   const origNrmX = new Float32Array(triNrmX);
   const origNrmY = new Float32Array(triNrmY);
   const origNrmZ = new Float32Array(triNrmZ);
-
-  // vertex → set of triangle ids
-  const vertTris = Array.from({ length: nextVid }, () => new Set());
+  // Matching original plane offsets (n·p = d), frozen too, for maxPlaneDev.
+  const origD = new Float64Array(triCount);
   for (let t = 0; t < triCount; t++) {
-    vertTris[corners[t*3]].add(t);
-    vertTris[corners[t*3+1]].add(t);
-    vertTris[corners[t*3+2]].add(t);
+    const a = corners[t*3];
+    origD[t] = origNrmX[t]*vertX[a] + origNrmY[t]*vertY[a] + origNrmZ[t]*vertZ[a];
   }
+
+  // vertex → incident triangles, as intrusive doubly-linked lists of corner
+  // slots over typed arrays (replaces one JS Set per vertex — far lighter on
+  // multi-million-vertex meshes and allocation-free per collapse).
+  // Slot s = corner index (t*3+k); the vertex owning slot s is corners[s].
+  // Deleted wings and moved corners are unlinked, so each vertex's list
+  // contains exactly its alive incident corners.
+  const vfHead   = new Int32Array(nextVid).fill(-1);
+  const slotNext = new Int32Array(triCount * 3);
+  const slotPrev = new Int32Array(triCount * 3);
+  function linkSlot(s) {
+    const v = corners[s];
+    const h = vfHead[v];
+    slotPrev[s] = -1; slotNext[s] = h;
+    if (h !== -1) slotPrev[h] = s;
+    vfHead[v] = s;
+  }
+  function unlinkSlot(s) {
+    const p = slotPrev[s], n = slotNext[s];
+    if (p !== -1) slotNext[p] = n; else vfHead[corners[s]] = n;
+    if (n !== -1) slotPrev[n] = p;
+  }
+  for (let s = 0; s < triCount * 3; s++) linkSlot(s);
+
+  // Stamp arrays for O(1) membership tests without per-collapse Set churn.
+  const vertStamp = new Uint32Array(nextVid);
+  const triStamp  = new Uint32Array(triCount);
+  let stampGen = 0;
 
   // Sharp-edge vertex freeze.  Walk every edge, find pairs of triangles that
   // share it, compute their face-normal dot.  If the dot is below sharpEdgeCos
@@ -172,14 +221,17 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   {
     const triThin2 = new Float32Array(triCount);
     for (let t = 0; t < triCount; t++) triThin2[t] = triAspectSq(t);
-    const edgeSeen = new Map(); // numeric key → first triangle index
-    const edgeKey = (a, b) => a < b ? a * nextVid + b : b * nextVid + a;
+    // (vertex,vertex) pair → first triangle index, via the integer-keyed
+    // point map (quant 1 — ids are already integers; z is unused).
+    const edgeSeen = new QuantizedPointMap(1, Math.min(triCount * 3, 1 << 22));
     for (let t = 0; t < triCount; t++) {
       const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
-      for (const [u, v] of [[a,b],[b,c],[c,a]]) {
-        const k = edgeKey(u, v);
-        const other = edgeSeen.get(k);
-        if (other === undefined) { edgeSeen.set(k, t); continue; }
+      for (let e = 0; e < 3; e++) {
+        const u = e === 0 ? a : e === 1 ? b : c;
+        const v = e === 0 ? b : e === 1 ? c : a;
+        const lo = u < v ? u : v, hi = u < v ? v : u;
+        const other = edgeSeen.getOrSet(lo, hi, 0, t);
+        if (edgeSeen.inserted) continue;
         if (triThin2[t] > extremeAspect2 || triThin2[other] > extremeAspect2) continue;
         const dot = triNrmX[t]*triNrmX[other] + triNrmY[t]*triNrmY[other] + triNrmZ[t]*triNrmZ[other];
         if (dot < sharpEdgeCos) { frozenVert[u] = 1; frozenVert[v] = 1; }
@@ -187,29 +239,35 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     }
   }
 
-  // Freeze vertices of excluded triangles (untextured/masked regions) so no
-  // collapse moves them — excluded areas pass through regularize unchanged.
-  const excludedTris = opts.excludedTris;
-  if (excludedTris) {
-    for (let t = 0; t < triCount; t++) {
-      if (excludedTris[t]) {
-        frozenVert[corners[t*3]] = 1;
-        frozenVert[corners[t*3+1]] = 1;
-        frozenVert[corners[t*3+2]] = 1;
+  // Preserve-untextured (beta): freeze every vertex of an excluded face so
+  // collapses can neither move nor remove untextured geometry (fillets, fine
+  // CAD detail). excludeWeight is constant across a face's three vertices
+  // (see subdivision.js toNonIndexed), so testing the first corner suffices.
+  // Rejections land in rejectStats.frozen like sharp-edge freezes.
+  if (opts.preserveExcluded) {
+    const ew = geometry.attributes.excludeWeight;
+    if (ew) {
+      for (let t = 0; t < triCount; t++) {
+        if (ew.getX(t * 3) > 0.99) {
+          frozenVert[corners[t * 3]]     = 1;
+          frozenVert[corners[t * 3 + 1]] = 1;
+          frozenVert[corners[t * 3 + 2]] = 1;
+        }
       }
     }
   }
 
-  // helper: triangles that contain both u and v
+  // helper: triangles that contain both u and v.
+  // Returns a reused scratch array — valid until the next call.
+  const _wingScratch = [];
   function trianglesSharingEdge(u, v) {
-    const out = [];
-    const setV = vertTris[v];
-    for (const t of vertTris[u]) {
+    _wingScratch.length = 0;
+    for (let s = vfHead[u]; s !== -1; s = slotNext[s]) {
+      const t = (s / 3) | 0;
       if (triDeleted[t]) continue;
-      if (excludedTris && excludedTris[t]) continue;
-      if (setV.has(t)) out.push(t);
+      if (corners[t*3] === v || corners[t*3+1] === v || corners[t*3+2] === v) _wingScratch.push(t);
     }
-    return out;
+    return _wingScratch;
   }
 
   // helper: third vertex of a triangle (the one that isn't u or v)
@@ -220,26 +278,27 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     return c;
   }
 
-  // helper: replace vertex `from` with `to` in triangle's corner list
-  function substitute(t, from, to) {
-    if (corners[t*3]   === from) corners[t*3]   = to;
-    if (corners[t*3+1] === from) corners[t*3+1] = to;
-    if (corners[t*3+2] === from) corners[t*3+2] = to;
-  }
-
   let totalCollapses = 0;
   // Per-rejection counters — surfaced in the return value so the caller (and
   // diagnostic harnesses) can see exactly which gate is blocking residual
   // sliver chains.  Useful when the user reports "this region didn't merge."
-  const rejectStats = { frozen: 0, wingCount: 0, linkCondition: 0, edgeCap: 0, normalChange: 0, degenerate: 0, foldedApex: 0 };
+  const rejectStats = { frozen: 0, wingCount: 0, linkCondition: 0, edgeCap: 0, normalChange: 0, planeDev: 0, degenerate: 0, foldedApex: 0 };
+
+  // Scratch buffers for the per-candidate edge ordering (no per-candidate
+  // object allocation; stable 3-element insertion sort preserves the exact
+  // tie order of the previous Array#sort-based code).
+  const _el = new Float64Array(3);
+  const _eu = new Int32Array(3);
+  const _ev = new Int32Array(3);
+  const _affectedScratch = [];
 
   for (let round = 0; round < maxRounds; round++) {
     // Build candidate list (alive slivers) sorted by quality (worst first).
     // We rebuild every round so collapses from earlier rounds inform priorities.
-    const candidates = [];
+    const candT = [];
+    const candA = [];
     for (let t = 0; t < triCount; t++) {
       if (triDeleted[t]) continue;
-      if (excludedTris && excludedTris[t]) continue;
       const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
       const lAB2 = sqDist(a, b), lBC2 = sqDist(b, c), lCA2 = sqDist(c, a);
       const lmin2 = Math.min(lAB2, lBC2, lCA2);
@@ -249,27 +308,34 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
       // misses entirely.  See triAspectSq comment.
       const aspect2 = triAspectSq(t);
       if (aspect2 < aspectThreshold * aspectThreshold) continue;
-      candidates.push({ t, aspect2, lmin2 });
+      candT.push(t); candA.push(aspect2);
     }
-    candidates.sort((a, b) => b.aspect2 - a.aspect2);
+    // Stable index sort (worst aspect first) — ties keep ascending-t order,
+    // matching the previous object-array sort exactly.
+    const order = candT.map((_, i) => i);
+    order.sort((x, y) => candA[y] - candA[x]);
 
     let roundCollapses = 0;
-    for (const { t } of candidates) {
+    for (let ci = 0; ci < order.length; ci++) {
+      const t = candT[order[ci]];
       if (triDeleted[t]) continue;
       const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
-      const lAB2 = sqDist(a, b), lBC2 = sqDist(b, c), lCA2 = sqDist(c, a);
       // Try all three edges — shortest first.  A sliver at a sharp
       // cylinder/flat seam may have its shortest edge crossing the seam (huge
       // normal swing → fails the normal gate) while one of its long edges
       // runs along a single surface and collapses safely.  Picking the
       // shortest only would leave such slivers stuck.
-      const edges = [
-        { l: lAB2, u: a, v: b },
-        { l: lBC2, u: b, v: c },
-        { l: lCA2, u: c, v: a },
-      ].sort((x, y) => x.l - y.l);
-      for (const { u, v } of edges) {
-        if (tryCollapse(u, v)) { roundCollapses++; break; }
+      _el[0] = sqDist(a, b); _eu[0] = a; _ev[0] = b;
+      _el[1] = sqDist(b, c); _eu[1] = b; _ev[1] = c;
+      _el[2] = sqDist(c, a); _eu[2] = c; _ev[2] = a;
+      let o0 = 0, o1 = 1, o2 = 2;
+      if (_el[o1] < _el[o0]) { const sw = o0; o0 = o1; o1 = sw; }
+      if (_el[o2] < _el[o1]) {
+        const sw = o1; o1 = o2; o2 = sw;
+        if (_el[o1] < _el[o0]) { const sw2 = o0; o0 = o1; o1 = sw2; }
+      }
+      if (tryCollapse(_eu[o0], _ev[o0]) || tryCollapse(_eu[o1], _ev[o1]) || tryCollapse(_eu[o2], _ev[o2])) {
+        roundCollapses++;
       }
     }
     totalCollapses += roundCollapses;
@@ -388,11 +454,23 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
 
     // Link condition — vertices that share a triangle with BOTH u and v
     // (other than the wing apexes) would become non-manifold after the merge.
-    const uNeighbours = neighboursOf(u);
-    const vNeighbours = neighboursOf(v);
-    for (const vn of uNeighbours) {
-      if (vn === v || vn === apexW1 || vn === apexW2) continue;
-      if (vNeighbours.has(vn)) { rejectStats.linkCondition++; return false; }
+    // Stamp v's neighbours, then scan u's neighbours against the stamps.
+    stampGen++;
+    for (let s = vfHead[v]; s !== -1; s = slotNext[s]) {
+      const t = (s / 3) | 0;
+      if (triDeleted[t]) continue;
+      const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
+      if (a !== v) vertStamp[a] = stampGen;
+      if (b !== v) vertStamp[b] = stampGen;
+      if (c !== v) vertStamp[c] = stampGen;
+    }
+    for (let s = vfHead[u]; s !== -1; s = slotNext[s]) {
+      const t = (s / 3) | 0;
+      if (triDeleted[t]) continue;
+      const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
+      if (a !== u && a !== v && a !== apexW1 && a !== apexW2 && vertStamp[a] === stampGen) { rejectStats.linkCondition++; return false; }
+      if (b !== u && b !== v && b !== apexW1 && b !== apexW2 && vertStamp[b] === stampGen) { rejectStats.linkCondition++; return false; }
+      if (c !== u && c !== v && c !== apexW1 && c !== apexW2 && vertStamp[c] === stampGen) { rejectStats.linkCondition++; return false; }
     }
 
     // Merged position: midpoint
@@ -401,20 +479,26 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     const mz = (vertZ[u] + vertZ[v]) / 2;
 
     // Affected triangles: all using u or v, excluding wings
-    const affected = [];
-    for (const t of vertTris[u]) {
-      if (triDeleted[t]) continue;
-      if (t === wings[0] || t === wings[1]) continue;
-      affected.push(t);
+    const w0 = wings[0], w1 = wings[1];
+    stampGen++;
+    const affected = _affectedScratch;
+    affected.length = 0;
+    for (let s = vfHead[u]; s !== -1; s = slotNext[s]) {
+      const t = (s / 3) | 0;
+      if (triDeleted[t] || t === w0 || t === w1) continue;
+      if (triStamp[t] !== stampGen) { triStamp[t] = stampGen; affected.push(t); }
     }
-    for (const t of vertTris[v]) {
-      if (triDeleted[t]) continue;
-      if (t === wings[0] || t === wings[1]) continue;
-      if (!affected.includes(t)) affected.push(t);
+    for (let s = vfHead[v]; s !== -1; s = slotNext[s]) {
+      const t = (s / 3) | 0;
+      if (triDeleted[t] || t === w0 || t === w1) continue;
+      if (triStamp[t] !== stampGen) { triStamp[t] = stampGen; affected.push(t); }
     }
 
     // Validate every affected triangle's post-collapse state
     for (const t of affected) {
+      if (Math.abs(origNrmX[t]*mx + origNrmY[t]*my + origNrmZ[t]*mz - origD[t]) > maxPlaneDev) {
+        rejectStats.planeDev++; return false;
+      }
       let a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
       if (a === u || a === v) a = -1;
       if (b === u || b === v) b = -1;
@@ -455,41 +539,29 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     // Move u to merged position; redirect all v references to u.
     vertX[u] = mx; vertY[u] = my; vertZ[u] = mz;
 
-    // Delete wings
-    for (const w of wings) {
-      triDeleted[w] = 1;
-      vertTris[corners[w*3]].delete(w);
-      vertTris[corners[w*3+1]].delete(w);
-      vertTris[corners[w*3+2]].delete(w);
-    }
+    // Delete wings — unlink all three corner slots of each
+    triDeleted[w0] = 1;
+    unlinkSlot(w0*3); unlinkSlot(w0*3+1); unlinkSlot(w0*3+2);
+    triDeleted[w1] = 1;
+    unlinkSlot(w1*3); unlinkSlot(w1*3+1); unlinkSlot(w1*3+2);
 
-    // Substitute v→u in all remaining triangles using v
-    const vList = Array.from(vertTris[v]);
-    for (const t of vList) {
-      substitute(t, v, u);
-      vertTris[v].delete(t);
-      vertTris[u].add(t);
-      recomputeFaceNormal(t);
+    // Substitute v→u in all remaining triangles using v: move each of v's
+    // corner slots into u's list (a non-wing triangle contains v exactly once).
+    let s = vfHead[v];
+    while (s !== -1) {
+      const ns = slotNext[s];
+      unlinkSlot(s);          // owner is still v here
+      corners[s] = u;
+      linkSlot(s);            // now owned by u
+      recomputeFaceNormal((s / 3) | 0);
+      s = ns;
     }
     // Recompute normals of all other affected triangles using u (positions changed)
-    for (const t of vertTris[u]) {
+    for (let s2 = vfHead[u]; s2 !== -1; s2 = slotNext[s2]) {
+      const t = (s2 / 3) | 0;
       if (triDeleted[t]) continue;
       recomputeFaceNormal(t);
     }
     return true;
-  }
-
-  // Set of vertex IDs that share an alive triangle with vid
-  function neighboursOf(vid) {
-    const set = new Set();
-    for (const t of vertTris[vid]) {
-      if (triDeleted[t]) continue;
-      if (excludedTris && excludedTris[t]) continue;
-      const a = corners[t*3], b = corners[t*3+1], c = corners[t*3+2];
-      if (a !== vid) set.add(a);
-      if (b !== vid) set.add(b);
-      if (c !== vid) set.add(c);
-    }
-    return set;
   }
 }

@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 CNCKitchen (Stefan Hermann) and contributors
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { unzipSync } from 'fflate';
@@ -23,10 +28,11 @@ export function loadSTLFile(file) {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
+        assertPlausibleSTL(e.target.result);
         const geometry = stlLoader.parse(e.target.result);
-        const { nanCount, degenerateCount } = setupGeometry(geometry);
+        const { nanCount, degenerateCount, originOffset } = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds, nanCount, degenerateCount });
+        resolve({ geometry, bounds, nanCount, degenerateCount, originOffset });
       } catch (err) {
         reject(err);
       }
@@ -34,6 +40,22 @@ export function loadSTLFile(file) {
     reader.onerror = () => reject(new Error('Could not read file'));
     reader.readAsArrayBuffer(file);
   });
+}
+
+/**
+ * STLLoader treats anything that doesn't start with "solid" as binary and
+ * trusts the face count at byte 80, so a stray PNG or text file dies with
+ * "Array buffer allocation failed" / a DataView range error (#124). Reject
+ * files that are neither a plausible binary nor ASCII STL up front.
+ */
+function assertPlausibleSTL(buf) {
+  if (buf.byteLength >= 84) {
+    const faces = new DataView(buf).getUint32(80, true);
+    if (84 + faces * 50 <= buf.byteLength) return;
+  }
+  const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(buf.byteLength, 16)));
+  if (head.includes('solid')) return;
+  throw new Error('Not a valid STL file');
 }
 
 /**
@@ -103,9 +125,13 @@ function validateAndCleanGeometry(geometry) {
 
 /**
  * Validate, centre, and compute normals for a freshly parsed geometry.
- * Returns { nanCount, degenerateCount } removed-triangle counts for caller warnings.
+ * Returns { nanCount, degenerateCount, originOffset }: removed-triangle counts
+ * for caller warnings, plus the translation that was subtracted to centre the
+ * mesh. The app folds originOffset into its pose transform and undoes it on
+ * export so files keep their original world coordinates and stay aligned with
+ * sibling parts (issue #82).
  */
-function setupGeometry(geometry) {
+export function setupGeometry(geometry) {
   const { nanCount, degenerateCount } = validateAndCleanGeometry(geometry);
   geometry.computeBoundingBox();
   const box = geometry.boundingBox;
@@ -114,7 +140,7 @@ function setupGeometry(geometry) {
   geometry.translate(-centre.x, -centre.y, -centre.z);
   geometry.computeBoundingBox();
   if (!geometry.attributes.normal) geometry.computeVertexNormals();
-  return { nanCount, degenerateCount };
+  return { nanCount, degenerateCount, originOffset: centre };
 }
 
 /**
@@ -199,9 +225,9 @@ export function loadOBJFile(file) {
       try {
         const group = objLoader.parse(e.target.result);
         const geometry = mergeGroupGeometries(group);
-        const { nanCount, degenerateCount } = setupGeometry(geometry);
+        const { nanCount, degenerateCount, originOffset } = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds, nanCount, degenerateCount });
+        resolve({ geometry, bounds, nanCount, degenerateCount, originOffset });
       } catch (err) {
         reject(err);
       }
@@ -229,9 +255,9 @@ export function load3MFFile(file) {
     reader.onload = (e) => {
       try {
         const geometry = parse3MF(new Uint8Array(e.target.result));
-        const { nanCount, degenerateCount } = setupGeometry(geometry);
+        const { nanCount, degenerateCount, originOffset } = setupGeometry(geometry);
         const bounds = computeBounds(geometry);
-        resolve({ geometry, bounds, nanCount, degenerateCount });
+        resolve({ geometry, bounds, nanCount, degenerateCount, originOffset });
       } catch (err) {
         reject(err);
       }
@@ -301,17 +327,18 @@ function parse3MF(data) {
         vertices[i * 3 + 1] = parseFloat(vertEls[i].getAttribute('y'));
         vertices[i * 3 + 2] = parseFloat(vertEls[i].getAttribute('z'));
       }
-      const triangles = new Uint32Array(triEls.length * 3);
+      // Validate raw attrs before storing — Uint32Array coerces on write
+      // (NaN→0, negatives wrap), so post-hoc checks can't catch bad input.
+      const vertCount  = vertEls.length;
+      const triangles  = new Uint32Array(triEls.length * 3);
       for (let i = 0; i < triEls.length; i++) {
-        triangles[i * 3]     = parseInt(triEls[i].getAttribute('v1'), 10);
-        triangles[i * 3 + 1] = parseInt(triEls[i].getAttribute('v2'), 10);
-        triangles[i * 3 + 2] = parseInt(triEls[i].getAttribute('v3'), 10);
-      }
-
-      const vertCount = vertEls.length;
-      for (let i = 0; i < triangles.length; i++) {
-        if (triangles[i] < 0 || triangles[i] >= vertCount || isNaN(triangles[i])) {
-          throw new Error('Invalid triangle index in 3MF file');
+        for (let j = 0; j < 3; j++) {
+          const raw = triEls[i].getAttribute('v' + (j + 1));
+          const idx = (raw !== null && /^[0-9]+$/.test(raw.trim())) ? Number(raw) : NaN;
+          if (!Number.isInteger(idx) || idx >= vertCount) {
+            throw new Error('Invalid triangle index in 3MF file');
+          }
+          triangles[i * 3 + j] = idx;
         }
       }
 
@@ -462,11 +489,17 @@ function parse3MF(data) {
 
 /**
  * Unified loader: dispatches to the right parser based on file extension.
+ * `opts` is only meaningful for STEP files ({ quality, onProgress }); the
+ * STEP loader is imported lazily so its worker code stays off the critical
+ * path for the common STL case.
  */
-export function loadModelFile(file) {
+export function loadModelFile(file, opts) {
   const ext = file.name.split('.').pop().toLowerCase();
   if (ext === 'obj') return loadOBJFile(file);
   if (ext === '3mf') return load3MFFile(file);
+  if (ext === 'step' || ext === 'stp') {
+    return import('./stepLoader.js').then((m) => m.loadSTEPFile(file, opts));
+  }
   return loadSTLFile(file);
 }
 

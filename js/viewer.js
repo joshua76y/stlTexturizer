@@ -1,8 +1,14 @@
+/*
+ * Copyright (c) 2026 CNCKitchen (Stefan Hermann) and contributors
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { LineSegments2 }  from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial }   from 'three/addons/lines/LineMaterial.js';
+import { SectionController } from './section.js';
 
 // Pre-allocated temp objects for hot-path event handlers (avoid GC pressure)
 const _tmpQ1 = new THREE.Quaternion();
@@ -26,6 +32,27 @@ let _hoverMaterial = null;
 let _needsRender = true;
 let _diagEdges = null;       // LineSegments2 for open/non-manifold edges
 let _diagFaces = [];         // Array of THREE.Mesh overlays for face highlights
+let _turntable = null;       // { last, onStop } while the camera auto-orbits the model
+let _section = null;         // SectionController (section.js): clipping plane + cap + gizmo
+let _sectionToolLock = false; // a pick tool owns left clicks: the section handles step aside
+
+// Shared by every material that belongs to the model (mesh, wireframe, mask and
+// diagnostic overlays): empty = no cut, [plane] while the section view is on.
+// three.js swaps shader programs by itself when the plane count changes.
+const _clipPlanes = [];
+function _clip(material) {
+  if (material) material.clippingPlanes = _clipPlanes;
+  return material;
+}
+
+const _TURNTABLE_RAD_PER_S = (2 * Math.PI) / 24;   // one revolution every 24 s
+const _Z_AXIS = new THREE.Vector3(0, 0, 1);
+
+// Turntable pitch clamp: keep the view direction at least this far (radians)
+// away from ±world Z. At the pole itself the up direction is ambiguous and
+// lookAt() flips, which is what used to make the view jump — stopping just
+// short of it makes the pole unreachable, so no flip can ever occur.
+const _POLAR_EPS = 0.01;
 
 // Build a labelled coordinate axes indicator scaled to `size`.
 // X = red, Y = green, Z = blue (up).
@@ -60,9 +87,15 @@ function buildAxesIndicator(size) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(label, 32, 32);
+    // depthWrite OFF + renderOrder above the wireframe overlay (3): label
+    // quads must not stamp their rectangle into the depth buffer, or they
+    // punch line-free holes into the wireframe drawn after them. Rendered
+    // last, the transparent label background lets the wireframe shine
+    // through while the glyph stays readable on top.
     const sprite = new THREE.Sprite(
-      new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c) }),
+      new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false }),
     );
+    sprite.renderOrder = 4;
     sprite.position.copy(dir.clone().multiplyScalar(r * 1.18));
     sprite.scale.set(r * 0.32, r * 0.32, 1);
     group.add(sprite);
@@ -88,10 +121,14 @@ function buildDimensionLabel(text, hex, worldW, worldH) {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(text, 128, 32);
+  // depthWrite OFF + renderOrder above the wireframe overlay (3) — same
+  // reasoning as the axis label sprites: a depth-writing transparent quad
+  // drawn before the wireframe punches a line-free hole into it.
   const mesh = new THREE.Mesh(
     new THREE.PlaneGeometry(worldW, worldH),
-    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, side: THREE.DoubleSide }),
+    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, side: THREE.DoubleSide, depthWrite: false }),
   );
+  mesh.renderOrder = 4;
   return mesh;
 }
 
@@ -150,7 +187,10 @@ function buildDimensions(box, groundZ, scale) {
 
 export function initViewer(canvas) {
   // Renderer
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+  // 'high-performance' asks hybrid-GPU laptops for the discrete GPU (#75).
+  // stencil: the section view's filled cut face (off by default since r163).
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, stencil: true, powerPreference: 'high-performance' });
+  renderer.localClippingEnabled = true;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -204,8 +244,12 @@ export function initViewer(canvas) {
   controls.dampingFactor = 0.08;
   controls.screenSpacePanning = true;
   controls.enableZoom = false; // we handle zoom ourselves for cursor-centric behaviour
+  // Same pole clamp for OrbitControls' own rotation (fallback before a model
+  // is loaded) as for the custom pivot orbit below.
+  controls.minPolarAngle = _POLAR_EPS;
+  controls.maxPolarAngle = Math.PI - _POLAR_EPS;
 
-  // Raycast-based orbit pivot: when left-drag starts on the model, orbit
+  // Raycast-based orbit pivot: when a drag starts on the model, orbit
   // around the surface point under the cursor instead of the default target.
   // We disable OrbitControls' own rotation and handle it manually so that
   // neither the camera view nor the target "snaps" to the clicked point.
@@ -223,25 +267,24 @@ export function initViewer(canvas) {
   _pivotMarker.visible = false;
   scene.add(_pivotMarker);
 
-  renderer.domElement.addEventListener('pointerdown', (e) => {
-    if (e.button !== 0 || !controls.enabled) return;
-    if (!currentMesh) return;
+  // Surface point under the given client coords, else the last pivot, else null.
+  function _pickPivot(clientX, clientY) {
+    if (!currentMesh) return null;
     const rect = renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
-      ((e.clientX - rect.left) / rect.width)  *  2 - 1,
-      ((e.clientY - rect.top)  / rect.height) * -2 + 1,
+      ((clientX - rect.left) / rect.width)  *  2 - 1,
+      ((clientY - rect.top)  / rect.height) * -2 + 1,
     );
     _orbitRaycaster.setFromCamera(ndc, camera);
-    const hits = _orbitRaycaster.intersectObject(currentMesh);
-    if (hits.length) {
-      _customPivot = hits[0].point.clone();
-      _lastKnownPivot = _customPivot.clone();
-    } else if (_lastKnownPivot) {
-      _customPivot = _lastKnownPivot.clone();
-    } else {
-      return; // no pivot available yet, fall back to OrbitControls default
-    }
-    _lastPointer = { x: e.clientX, y: e.clientY };
+    const { hits, onCap } = _sectionHits(_orbitRaycaster.intersectObject(currentMesh), _orbitRaycaster.ray);
+    if (onCap) _lastKnownPivot = _orbitRaycaster.ray.intersectPlane(_section.plane, new THREE.Vector3()) ?? _lastKnownPivot;
+    else if (hits.length) _lastKnownPivot = hits[0].point.clone();
+    return _lastKnownPivot ? _lastKnownPivot.clone() : null;
+  }
+
+  function _beginOrbit(pivot, clientX, clientY) {
+    _customPivot = pivot;
+    _lastPointer = { x: clientX, y: clientY };
     controls.enableRotate = false;   // we'll rotate manually
 
     // Show marker, sized as ~1.5 % of the visible frustum height
@@ -252,25 +295,33 @@ export function initViewer(canvas) {
     _pivotMarker.scale.setScalar(markerScale);
     _pivotMarker.visible = true;
     _needsRender = true;
-  });
+  }
 
-  document.addEventListener('pointermove', (e) => {
-    if (!_customPivot || !_lastPointer || !controls.enabled) return;
-    const dx = e.clientX - _lastPointer.x;
-    const dy = e.clientY - _lastPointer.y;
-    _lastPointer = { x: e.clientX, y: e.clientY };
+  // Orbit camera and target around _customPivot for a pointer move to (clientX, clientY).
+  function _orbitTo(clientX, clientY) {
+    const dx = clientX - _lastPointer.x;
+    const dy = clientY - _lastPointer.y;
+    _lastPointer = { x: clientX, y: clientY };
     if (dx === 0 && dy === 0) return;
 
     const rotSpeed = 0.005;
 
     // Build a pure quaternion rotation: horizontal around world Z,
-    // vertical around camera's right axis.  No polar clamping — the
-    // camera can orbit freely over the poles.
+    // vertical around camera's right axis (clamped turntable).
     camera.updateMatrixWorld();
     _tmpV2.setFromMatrixColumn(camera.matrixWorld, 0).normalize(); // camera right
 
-    _tmpQ1.setFromAxisAngle(_tmpV1.set(0, 0, 1), -dx * rotSpeed);   // yaw
-    _tmpQ2.setFromAxisAngle(_tmpV2, -dy * rotSpeed);                  // pitch
+    // Clamp the pitch so the view direction stops just short of ±world Z.
+    // Pitching by `a` around the (horizontal) right axis changes the view
+    // direction's angle from +Z from alpha to alpha - a, so limit `a` to
+    // whatever keeps that angle inside [eps, PI - eps].
+    camera.getWorldDirection(_tmpV1);
+    const alpha = Math.acos(THREE.MathUtils.clamp(_tmpV1.z, -1, 1));
+    const pitch = alpha - THREE.MathUtils.clamp(
+      alpha + dy * rotSpeed, _POLAR_EPS, Math.PI - _POLAR_EPS);
+
+    _tmpQ1.setFromAxisAngle(_tmpV1.set(0, 0, 1), -dx * rotSpeed); // yaw
+    _tmpQ2.setFromAxisAngle(_tmpV2, pitch);                       // pitch
     _tmpQ1.premultiply(_tmpQ2);
 
     // Rotate camera position around the pivot
@@ -283,55 +334,70 @@ export function initViewer(canvas) {
     _tmpV4.applyQuaternion(_tmpQ1);
     controls.target.copy(_customPivot).add(_tmpV4);
 
-    // Rotate camera orientation directly — avoids lookAt pole singularity
+    // Rotate camera orientation directly — with the pitch clamped away from
+    // the poles this stays consistent with lookAt(target) in controls.update()
     camera.quaternion.premultiply(_tmpQ1);
     camera.updateMatrixWorld();
     _needsRender = true;
+  }
+
+  function _endOrbit() {
+    _customPivot  = null;
+    _lastPointer  = null;
+    controls.enableRotate = true;
+    // Re-orthonormalize against float drift; a no-op visually since the
+    // pitch clamp guarantees we are never at/over a pole.
+    camera.up.set(0, 0, 1);
+    camera.lookAt(controls.target);
+    _pivotMarker.visible = false;
+    _needsRender = true;
+  }
+
+  // Mouse / pen: left-drag orbits from the moment of the press.
+  renderer.domElement.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch' || e.button !== 0 || !controls.enabled) return;
+    const pivot = _pickPivot(e.clientX, e.clientY);
+    if (!pivot) return; // no pivot available yet, fall back to OrbitControls default
+    _beginOrbit(pivot, e.clientX, e.clientY);
   });
 
-  document.addEventListener('pointerup', () => {
-    if (_customPivot) {
-      _customPivot  = null;
-      _lastPointer  = null;
-      controls.enableRotate = true;
-      // Re-sync up vector for OrbitControls
-      camera.up.set(0, 0, 1);
-      camera.lookAt(controls.target);
-      _pivotMarker.visible = false;
-      _needsRender = true;
-    }
+  document.addEventListener('pointermove', (e) => {
+    if (e.pointerType === 'touch' || !_customPivot || !controls.enabled) return;
+    _orbitTo(e.clientX, e.clientY);
   });
 
-  // Pinch-to-zoom + two-finger pan for touch devices
-  let _pinchDist = null;
-  let _pinchMid  = null;  // { x, y } client coords of two-finger midpoint
+  document.addEventListener('pointerup', (e) => {
+    if (e.pointerType !== 'touch' && _customPivot) _endOrbit();
+  });
 
-  renderer.domElement.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 2) {
-      const t0 = e.touches[0], t1 = e.touches[1];
-      _pinchDist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
-      _pinchMid  = { x: (t0.clientX + t1.clientX) / 2, y: (t0.clientY + t1.clientY) / 2 };
-      controls.enabled = false;  // suppress OrbitControls during two-finger gesture
-      e.preventDefault();
-    }
-  }, { passive: false });
+  // ── Touch: one finger orbits, two fingers pan + pinch-zoom ──────────────
+  // All touch input is handled here on pointer events; OrbitControls' own
+  // touch handling is switched off so the two can't fight over the camera.
+  // A gesture only engages once the fingers have moved _TOUCH_SLOP px, so a
+  // resting or tapping finger never nudges the view, and fingers still down
+  // after a pinch stay inert until all are lifted (they never lift at exactly
+  // the same time, and the straggler would otherwise spin the part).
+  controls.touches = { ONE: null, TWO: null };
+  const _TOUCH_SLOP = 10;        // CSS px
+  const _touchPts = new Map();   // pointerId -> { x, y } client coords, in touch order
+  let _touchMode  = null;        // null | 'pending' | 'orbit' | 'pinch' | 'idle'
+  let _touchStart = null;        // { x, y } where the one-finger gesture began
+  let _pinch      = null;        // { dist, x, y, live } of the first two fingers
 
-  renderer.domElement.addEventListener('touchmove', (e) => {
-    if (e.touches.length !== 2 || _pinchDist === null) return;
-    e.preventDefault();
-    const t0 = e.touches[0], t1 = e.touches[1];
+  // Separation and midpoint of the first two fingers down.
+  const _pinchFrame = () => {
+    const [a, b] = _touchPts.values();
+    return { dist: Math.hypot(b.x - a.x, b.y - a.y), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  };
+
+  // Pan so the world point under the previous finger midpoint follows it,
+  // then zoom by the change in finger separation about the new midpoint.
+  function _touchPanZoom(prev, cur) {
     const rect = renderer.domElement.getBoundingClientRect();
-
-    const newDist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
-    const midX    = (t0.clientX + t1.clientX) / 2;
-    const midY    = (t0.clientY + t1.clientY) / 2;
-
-    // ── Pan: shift camera so the world point under the old midpoint
-    //         is now under the new midpoint ──────────────────────────
-    const prevNdcX =  ((_pinchMid.x - rect.left) / rect.width)  * 2 - 1;
-    const prevNdcY = -((_pinchMid.y - rect.top)  / rect.height) * 2 + 1;
-    const curNdcX  =  ((midX - rect.left) / rect.width)  * 2 - 1;
-    const curNdcY  = -((midY - rect.top)  / rect.height) * 2 + 1;
+    const prevNdcX =  ((prev.x - rect.left) / rect.width)  * 2 - 1;
+    const prevNdcY = -((prev.y - rect.top)  / rect.height) * 2 + 1;
+    const curNdcX  =  ((cur.x - rect.left) / rect.width)  * 2 - 1;
+    const curNdcY  = -((cur.y - rect.top)  / rect.height) * 2 + 1;
 
     if (_isPerspective) {
       // Pan on the plane through controls.target perpendicular to the view direction
@@ -357,8 +423,7 @@ export function initViewer(canvas) {
       controls.target.add(_tmpV1);
     }
 
-    // ── Zoom: zoom toward the current midpoint ────────────────────────
-    const factor = newDist / _pinchDist;
+    const factor = cur.dist / prev.dist;
     if (_isPerspective) {
       _tmpV3.set(curNdcX, curNdcY, 0.5).unproject(camera);
       _tmpV3.sub(camera.position).normalize();
@@ -376,23 +441,74 @@ export function initViewer(canvas) {
       controls.target.add(_tmpV3);
     }
 
-    _pinchDist = newDist;
-    _pinchMid  = { x: midX, y: midY };
     controls.update();
     _needsRender = true;
-  }, { passive: false });
+  }
 
-  renderer.domElement.addEventListener('touchend', (e) => {
-    if (e.touches.length < 2) {
-      _pinchDist = null;
-      _pinchMid  = null;
-      controls.enabled = true;
+  renderer.domElement.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' || !controls.enabled) return;
+    if (e.isPrimary) {   // first finger of a new gesture: drop anything stale
+      if (_touchMode === 'orbit') _endOrbit();
+      _touchPts.clear();
+    }
+    _touchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (_touchPts.size === 1) {
+      _touchMode  = 'pending';
+      _touchStart = { x: e.clientX, y: e.clientY };
+    } else if (_touchPts.size === 2) {
+      if (_touchMode === 'orbit') _endOrbit();
+      _touchMode = 'pinch';
+      _pinch = { ..._pinchFrame(), live: false };
     }
   });
+
+  document.addEventListener('pointermove', (e) => {
+    const pt = _touchPts.get(e.pointerId);
+    if (!pt) return;
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    if (!controls.enabled) return;
+
+    if (_touchMode === 'pending') {
+      if (Math.hypot(pt.x - _touchStart.x, pt.y - _touchStart.y) < _TOUCH_SLOP) return;
+      // Pivot on the surface where the finger landed, not where it has slid
+      // to. Orbiting starts from here, so the slop isn't replayed as a jump.
+      _beginOrbit(_pickPivot(_touchStart.x, _touchStart.y) ?? controls.target.clone(), pt.x, pt.y);
+      if (!currentMesh) _pivotMarker.visible = false;
+      _touchMode = 'orbit';
+    } else if (_touchMode === 'orbit') {
+      _orbitTo(pt.x, pt.y);
+    } else if (_touchMode === 'pinch') {
+      const cur = _pinchFrame();
+      if (!_pinch.live &&
+          Math.hypot(cur.x - _pinch.x, cur.y - _pinch.y) < _TOUCH_SLOP &&
+          Math.abs(cur.dist - _pinch.dist) < _TOUCH_SLOP) return;
+      if (_pinch.live) _touchPanZoom(_pinch, cur);
+      _pinch = { ...cur, live: true };
+    }
+  });
+
+  const _touchEnd = (e) => {
+    if (!_touchPts.delete(e.pointerId)) return;
+    if (_touchMode === 'orbit') _endOrbit();
+    _touchMode = _touchPts.size ? 'idle' : null;
+  };
+  document.addEventListener('pointerup', _touchEnd);
+  document.addEventListener('pointercancel', _touchEnd);
+
+  // touch-action: none keeps most browsers from page-zooming on a pinch over
+  // the canvas; this covers the ones that still try.
+  const _blockMultiTouch = (e) => { if (e.touches.length > 1) e.preventDefault(); };
+  renderer.domElement.addEventListener('touchstart', _blockMultiTouch, { passive: false });
+  renderer.domElement.addEventListener('touchmove',  _blockMultiTouch, { passive: false });
 
   // Cursor-centric zoom: zoom toward the mouse pointer instead of screen centre
   renderer.domElement.addEventListener('wheel', (e) => {
     e.preventDefault();
+    // The 3Dconnexion driver can emulate wheel events while the puck is pushed;
+    // zooming toward the idle cursor on top of the puck's own motion makes the
+    // view jump. Never true without a SpaceMouse (the timestamp stays 0).
+    if (performance.now() - _spaceMouse.lastActive < 100) return;
     const rect = renderer.domElement.getBoundingClientRect();
     const ndcX =  ((e.clientX - rect.left) / rect.width)  * 2 - 1;
     const ndcY = -((e.clientY - rect.top)  / rect.height) * 2 + 1;
@@ -432,15 +548,229 @@ export function initViewer(canvas) {
   // Rotation gizmo interaction
   _initGizmoInteraction();
 
+  _section = new SectionController({
+    scene,
+    camera: () => camera,
+    domElement: renderer.domElement,
+    requestRender,
+    onDraggingChanged: (dragging) => { controls.enabled = !dragging; },
+    bounds: () => {
+      if (!currentMesh) return null;
+      const geo = currentMesh.geometry;
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      const box = geo.boundingBox;
+      return { center: box.getCenter(new THREE.Vector3()), diag: box.getSize(new THREE.Vector3()).length() };
+    },
+  });
+  // A mouse press on a hovered plane handle belongs to the gizmo: switch the
+  // orbit off before OrbitControls and the custom pivot orbit see the event
+  // (capture runs first at the target). Touch has no hover; there the drag
+  // start disables the controls before the touch slop lets an orbit begin.
+  renderer.domElement.addEventListener('pointerdown', (e) => {
+    if (e.button === 0 && _section.busy()) controls.enabled = false;
+  }, { capture: true });
+
+  // Any direct manipulation of the view hands control back to the user.
+  const stopTurntable = () => {
+    if (!_turntable) return;
+    const { onStop } = _turntable;
+    _turntable = null;
+    onStop?.();
+  };
+  renderer.domElement.addEventListener('pointerdown', stopTurntable);
+  renderer.domElement.addEventListener('wheel', stopTurntable, { passive: true });
+
+  _initSpaceMouse(stopTurntable);
+
   // Render loop
   (function animate() {
     requestAnimationFrame(animate);
+    if (_turntable) _stepTurntable();
+    if (_spaceMouse.index !== -1) _stepSpaceMouse();
     controls.update();
     if (_needsRender) {
       _needsRender = false;
       renderer.render(scene, camera);
     }
   })();
+}
+
+/** Yaw the camera (and orbit target) around the vertical axis through the model centre, so the
+ *  model spins in place on screen however the view was panned or zoomed. */
+function _stepTurntable() {
+  const now = performance.now();
+  const dt = Math.min((now - _turntable.last) / 1000, 0.1);   // no jump after a background tab
+  _turntable.last = now;
+  if (!currentMesh || dt <= 0) return;
+
+  const geo = currentMesh.geometry;
+  if (!geo.boundingSphere) geo.computeBoundingSphere();
+  const pivot = _tmpV4.copy(geo.boundingSphere.center).applyMatrix4(currentMesh.matrixWorld);
+
+  _tmpQ1.setFromAxisAngle(_Z_AXIS, dt * _TURNTABLE_RAD_PER_S);
+  camera.position.sub(pivot).applyQuaternion(_tmpQ1).add(pivot);
+  controls.target.sub(pivot).applyQuaternion(_tmpQ1).add(pivot);
+  camera.quaternion.premultiply(_tmpQ1);
+  _needsRender = true;
+}
+
+// ── 3Dconnexion SpaceMouse ───────────────────────────────────────────────────
+// Read through the Gamepad API (no driver bridge or permission prompt needed).
+// Nothing is polled until the browser reports a matching device, which it only
+// does after the puck or a button has been touched on this page, so the render
+// loop costs ordinary users a single integer comparison.
+//
+// The browser hands over the puck's raw axes (x right, y towards the user,
+// z down, and the turns about them). Read as they come they would fly the
+// camera; the defaults below move the model with the cap instead, like the
+// 3Dconnexion driver's default and ScanRuler (same axes and signs). The
+// driver's own speed and reversed axes never reach the browser, so
+// setSpaceMouseTuning() takes them from the SpaceMouse panel.
+const _spaceMouse = {
+  index: -1,          // navigator.getGamepads() slot, -1 = none connected
+  name: null,         // the connected device's gamepad id, null = none
+  lastActive: 0,      // performance.now() of the last frame with puck input
+  lastStep: 0,        // performance.now() of the previous _stepSpaceMouse()
+  onInput: null,      // called on puck input (stops the turntable)
+  watchers: new Set(),// told when a puck connects or goes
+};
+const _SM_DEADZONE = 0.08;
+const _SM_ROT_RAD_PER_S = 2.4;   // at full deflection
+const _SM_PAN_PER_S = 1.2;       // view heights per second at full deflection
+const _SM_ZOOM_PER_S = 2.5;      // e-folds of zoom per second at full deflection
+
+/** The puck axes the viewer uses (roll is ignored: the view keeps world Z up). */
+export const SPACE_MOUSE_AXES = ['tx', 'tz', 'ty', 'rx', 'rz'];
+// Default direction of each raw axis: tx and rx are negated so the model, not
+// the camera, follows the cap (issues #139, #141).
+const _SM_SIGN = { tx: -1, ty: 1, tz: 1, rx: -1, rz: 1 };
+let _smGain = { ..._SM_SIGN };
+
+/**
+ * Speed (times the default) and the axes that move the other way from the
+ * default, as set in the SpaceMouse panel.
+ * @param {{ speed?: number, reversed?: string[] }} tuning
+ */
+export function setSpaceMouseTuning({ speed = 1, reversed = [] } = {}) {
+  const g = {};
+  for (const a of Object.keys(_SM_SIGN)) g[a] = _SM_SIGN[a] * speed * (reversed.includes(a) ? -1 : 1);
+  _smGain = g;
+}
+
+/** The connected SpaceMouse's gamepad id, or null. */
+export function spaceMouseName() { return _spaceMouse.name; }
+
+/** Call `fn` whenever a SpaceMouse connects or disconnects. */
+export function watchSpaceMouse(fn) { _spaceMouse.watchers.add(fn); }
+
+const _isSpaceMouse = (gp) => !!gp && /3dconnexion|spacemouse|space ?navigator|space ?pilot|space ?explorer|vendor: (256f|046d) product: c6/i.test(gp.id);
+
+function _initSpaceMouse(onInput) {
+  if (!('getGamepads' in navigator)) return;
+  _spaceMouse.onInput = onInput;
+  const changed = () => { for (const fn of _spaceMouse.watchers) fn(_spaceMouse.name); };
+  const attach = (gp) => {
+    if (_spaceMouse.index !== -1 || !_isSpaceMouse(gp)) return;
+    _spaceMouse.index = gp.index;
+    _spaceMouse.name = gp.id;
+    _spaceMouse.lastStep = performance.now();
+    console.info(`SpaceMouse connected: ${gp.id}`);
+    changed();
+  };
+  window.addEventListener('gamepadconnected', (e) => attach(e.gamepad));
+  for (const gp of navigator.getGamepads()) attach(gp);   // already exposed to this page
+  window.addEventListener('gamepaddisconnected', (e) => {
+    if (e.gamepad.index !== _spaceMouse.index) return;
+    _spaceMouse.index = -1;
+    _spaceMouse.name = null;
+    changed();
+  });
+}
+
+// Remap |v| in [deadzone, 1] to [0, 1] so motion starts smoothly.
+function _smAxis(v = 0) {
+  const a = Math.abs(v);
+  return a < _SM_DEADZONE ? 0 : Math.sign(v) * Math.min(1, (a - _SM_DEADZONE) / (1 - _SM_DEADZONE));
+}
+
+/** Apply one frame of SpaceMouse input: pan (X/Z), zoom (Y push/pull) and a
+ *  Z-up turntable orbit around the orbit target (tilt / spin), each scaled by
+ *  its gain (speed and direction, setSpaceMouseTuning). Roll is ignored since
+ *  the viewer always keeps world Z up. */
+function _stepSpaceMouse() {
+  const now = performance.now();
+  const dt = Math.min((now - _spaceMouse.lastStep) / 1000, 0.1);
+  _spaceMouse.lastStep = now;
+
+  const gp = navigator.getGamepads()[_spaceMouse.index];
+  if (!gp || !gp.connected || !controls.enabled || dt <= 0) return;
+
+  const ax = gp.axes, g = _smGain;
+  const tx = g.tx * _smAxis(ax[0]), ty = g.ty * _smAxis(ax[1]), tz = g.tz * _smAxis(ax[2]);
+  const rx = g.rx * _smAxis(ax[3]), rz = g.rz * _smAxis(ax[5]);
+  if (!tx && !ty && !tz && !rx && !rz) return;
+
+  _spaceMouse.lastActive = now;
+  _spaceMouse.onInput?.();
+
+  const target = controls.target;
+  camera.updateMatrixWorld();
+
+  // Pan in the screen plane, scaled to what is visible so speed feels the
+  // same at any zoom level.
+  if (tx || tz) {
+    const viewH = _isPerspective
+      ? 2 * camera.position.distanceTo(target) * Math.tan(THREE.MathUtils.degToRad(perspCamera.fov / 2))
+      : (orthoCamera.top - orthoCamera.bottom) / orthoCamera.zoom;
+    const step = viewH * _SM_PAN_PER_S * dt;
+    _tmpV1.setFromMatrixColumn(camera.matrixWorld, 0).multiplyScalar(tx * step);
+    _tmpV2.setFromMatrixColumn(camera.matrixWorld, 1).multiplyScalar(tz * step);
+    _tmpV1.add(_tmpV2);
+    camera.position.add(_tmpV1);
+    target.add(_tmpV1);
+  }
+
+  // Push the puck forward (away from you) to zoom in.
+  if (ty) {
+    const factor = Math.exp(-ty * _SM_ZOOM_PER_S * dt);   // < 1 when pushing forward
+    if (_isPerspective) {
+      _tmpV1.copy(camera.position).sub(target).multiplyScalar(factor);
+      camera.position.copy(target).add(_tmpV1);
+    } else {
+      camera.zoom = Math.max(0.05, Math.min(200, camera.zoom / factor));
+      camera.updateProjectionMatrix();
+    }
+  }
+
+  // Tilt around the camera's right axis (clamped short of the poles like the
+  // mouse orbit), spin around world Z.
+  if (rx || rz) {
+    _tmpV2.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    camera.getWorldDirection(_tmpV1);
+    const alpha = Math.acos(THREE.MathUtils.clamp(_tmpV1.z, -1, 1));
+    const pitch = alpha - THREE.MathUtils.clamp(
+      alpha - rx * _SM_ROT_RAD_PER_S * dt, _POLAR_EPS, Math.PI - _POLAR_EPS);
+
+    _tmpQ1.setFromAxisAngle(_Z_AXIS, rz * _SM_ROT_RAD_PER_S * dt);
+    _tmpQ2.setFromAxisAngle(_tmpV2, pitch);
+    _tmpQ1.premultiply(_tmpQ2);
+
+    camera.position.sub(target).applyQuaternion(_tmpQ1).add(target);
+    camera.quaternion.premultiply(_tmpQ1);
+  }
+
+  camera.updateMatrixWorld();
+  _needsRender = true;
+}
+
+/**
+ * Start or stop the turntable. `onStop` fires once when the user grabs, pans or zooms the view,
+ * which ends the spin; it does not fire for setTurntable(false).
+ * @param {boolean} on
+ * @param {() => void} [onStop]
+ */
+export function setTurntable(on, onStop = null) {
+  _turntable = on ? { last: performance.now(), onStop } : null;
 }
 
 function onResize() {
@@ -503,7 +833,7 @@ export function loadGeometry(geometry, material) {
 
   if (!geometry.attributes.normal) geometry.computeVertexNormals();
 
-  currentMesh = new THREE.Mesh(geometry, mat);
+  currentMesh = new THREE.Mesh(geometry, _clip(mat));
   currentMesh.castShadow = true;
   currentMesh.receiveShadow = true;
   meshGroup.add(currentMesh);
@@ -538,6 +868,10 @@ export function loadGeometry(geometry, material) {
   if (dimensionGroup) { disposeGroup(dimensionGroup); scene.remove(dimensionGroup); }
   dimensionGroup = buildDimensions(box, groundZ, sphere.radius);
   scene.add(dimensionGroup);
+
+  // New model or pose: the section plane re-centres through it.
+  _section.setTarget(currentMesh);
+  _section.refit();
   requestRender();
 }
 
@@ -550,12 +884,13 @@ export function setMeshMaterial(material) {
   if (currentMesh.material && currentMesh.material.dispose) {
     currentMesh.material.dispose();
   }
-  currentMesh.material = material || new THREE.MeshStandardMaterial({
+  currentMesh.material = _clip(material || new THREE.MeshStandardMaterial({
     color: 0xaaaacc,
     roughness: 0.6,
     metalness: 0.1,
     side: THREE.DoubleSide,
-  });
+  }));
+  _section.setTarget(currentMesh);
   requestRender();
 }
 
@@ -569,6 +904,7 @@ export function setMeshGeometry(geometry) {
   if (!currentMesh) return;
   if (!geometry.attributes.normal) geometry.computeVertexNormals();
   currentMesh.geometry = geometry;
+  _section.setTarget(currentMesh);
   // Rebuild wireframe overlay to match the new geometry
   if (wireframeLines) {
     meshGroup.remove(wireframeLines);
@@ -625,6 +961,29 @@ function fitCamera(sphere) {
   controls.update();
 }
 
+/**
+ * True when WebGL runs on a CPU rasteriser (SwiftShader, WARP, llvmpipe):
+ * hardware acceleration off, GPU blocklisted, or the GPU process crashed —
+ * the viewer then crawls at a few fps (#75). failIfMajorPerformanceCaveat is
+ * the reliable signal; the renderer string is a fallback and may be masked
+ * by privacy settings (Brave).
+ */
+export function isSoftwareRendering() {
+  try {
+    const probe = document.createElement('canvas');
+    const hw = probe.getContext('webgl2', { failIfMajorPerformanceCaveat: true })
+            || probe.getContext('webgl',  { failIfMajorPerformanceCaveat: true });
+    if (!hw) return true;
+    hw.getExtension('WEBGL_lose_context')?.loseContext();
+    const gl = renderer.getContext();
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const name = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+    return /swiftshader|llvmpipe|softpipe|basic render|\bwarp\b/i.test(name);
+  } catch {
+    return false;
+  }
+}
+
 export function requestRender() { _needsRender = true; }
 
 export function getRenderer()  { return renderer; }
@@ -661,6 +1020,7 @@ export function setProjection(perspective) {
 
   camera = newCam;
   controls.object = camera;
+  _section?.setCamera(camera);
   const sz = renderer.getSize(new THREE.Vector2());
   const aspect = sz.x / sz.y;
   if (perspective) {
@@ -718,7 +1078,7 @@ export function setExclusionOverlay(overlayGeo, color = 0xff6600, opacity = 1.0)
   }
   if (!overlayGeo || overlayGeo.attributes.position.count === 0) { requestRender(); return; }
   if (!_exclMaterial) {
-    _exclMaterial = new THREE.MeshLambertMaterial({
+    _exclMaterial = _clip(new THREE.MeshLambertMaterial({
       color,
       side: THREE.DoubleSide,
       transparent: opacity < 1.0,
@@ -726,7 +1086,7 @@ export function setExclusionOverlay(overlayGeo, color = 0xff6600, opacity = 1.0)
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
-    });
+    }));
   } else {
     _exclMaterial.color.set(color);
     _exclMaterial.opacity = opacity;
@@ -752,7 +1112,7 @@ export function setHoverPreview(overlayGeo, color = 0xffee00) {
   }
   if (!overlayGeo || overlayGeo.attributes.position.count === 0) { requestRender(); return; }
   if (!_hoverMaterial) {
-    _hoverMaterial = new THREE.MeshBasicMaterial({
+    _hoverMaterial = _clip(new THREE.MeshBasicMaterial({
       color,
       side: THREE.DoubleSide,
       transparent: true,
@@ -760,7 +1120,7 @@ export function setHoverPreview(overlayGeo, color = 0xffee00) {
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
-    });
+    }));
   } else {
     _hoverMaterial.color.set(color);
   }
@@ -818,7 +1178,7 @@ function _buildWireframe(geometry) {
     ),
   });
 
-  wireframeLines = new LineSegments2(lsGeo, lsMat);
+  wireframeLines = new LineSegments2(lsGeo, _clip(lsMat));
   wireframeLines.renderOrder = 3;  // draw after base mesh (0), overlays (1-2)
   // Add to meshGroup so it's automatically removed when a new model is loaded
   meshGroup.add(wireframeLines);
@@ -874,7 +1234,7 @@ export function setDiagEdges(positions, color = 0xff0000) {
     ),
   });
 
-  _diagEdges = new LineSegments2(lsGeo, lsMat);
+  _diagEdges = new LineSegments2(lsGeo, _clip(lsMat));
   _diagEdges.renderOrder = 4;
   scene.add(_diagEdges);
   requestRender();
@@ -899,11 +1259,81 @@ export function addDiagFaces(overlayGeo, color, opacity = 0.6, xray = false) {
     polygonOffsetFactor: -1,
     polygonOffsetUnits: -1,
   });
-  const mesh = new THREE.Mesh(overlayGeo, mat);
+  const mesh = new THREE.Mesh(overlayGeo, _clip(mat));
   mesh.renderOrder = 1;
   _diagFaces.push(mesh);
   scene.add(mesh);
   requestRender();
+}
+
+// ── Section view ─────────────────────────────────────────────────────────────
+
+/** Toggle the section view: clipping plane + filled cut face + plane gizmo. */
+export function setSectionView(on) {
+  _clipPlanes.length = 0;
+  if (on) _clipPlanes.push(_section.plane);
+  _section.setEnabled(on);
+  requestRender();
+}
+
+/** Snap the section plane perpendicular to a world axis, the cut opening toward the camera. */
+export function setSectionAxis(axis) { _section.setAxis(axis); }
+
+/** Keep the other half. */
+export function flipSection() { _section.flip(); }
+
+/**
+ * Hide the section handles while a click tool (masking, Place on Face) is
+ * active; the cut stays. Seen along the plane normal (the default: the cut
+ * opens toward the camera) the tilt rings project edge-on right across the
+ * cut face, so they would swallow the clicks meant for the inner walls.
+ */
+export function setSectionHandlesLocked(on) {
+  _sectionToolLock = on;
+  _syncSectionHandles();
+}
+
+// The rotate gizmo also sits on the model centre, so it hides them too.
+function _syncSectionHandles() {
+  _section?.setSuppressed(_rotGizmoVisible || _sectionToolLock);
+}
+
+const _secNormalMatrix = new THREE.Matrix3();
+const _secNormal = new THREE.Vector3();
+
+/** True when the hit face points back along the ray (a front face). */
+function _facesRay(hit, ray) {
+  _secNormalMatrix.getNormalMatrix(hit.object.matrixWorld);
+  return _secNormal.copy(hit.face.normal).applyMatrix3(_secNormalMatrix).dot(ray.direction) < 0;
+}
+
+/** Raycast hits as the section view shows them: `hits` drops the cut-away side,
+ *  `onCap` is true when the ray meets the filled cut face before any surface. */
+function _sectionHits(hits, ray) {
+  if (!_section?.enabled) return { hits, onCap: false };
+  const kept = hits.filter(h => !_section.clips(h.point));
+  const first = kept[0];
+  if (!first || _facesRay(first, ray)) return { hits: kept, onCap: false };
+  // The first visible hit faces away: the ray is inside the solid there, and if
+  // it crossed the plane on the way it entered through the cut, so the cap
+  // hides everything behind. DoubleSide picking can report a back face of an
+  // adjacent triangle marginally ahead of the intended front face (see
+  // getFrontFaceHit in main.js), so a front face right behind it still wins.
+  const tol = 1e-4 * (currentMesh?.geometry.boundingSphere?.radius ?? 1);
+  if (kept.some(h => h.distance - first.distance <= tol && _facesRay(h, ray))) return { hits: kept, onCap: false };
+  const t = ray.distanceToPlane(_section.plane);
+  return { hits: kept, onCap: t !== null && t <= first.distance + tol };
+}
+
+/**
+ * Filter model raycast hits (sorted, from `ray`) for tools that act on the
+ * visible surface: with the section view on, hits on the cut-away side are
+ * dropped and a ray landing on the cut face returns none, so painting reaches
+ * the inner walls exposed by the cut but never surfaces hidden behind the cap.
+ */
+export function sectionVisibleHits(hits, ray) {
+  const r = _sectionHits(hits, ray);
+  return r.onCap ? [] : r.hits;
 }
 
 // ── Rotation Gizmo ───────────────────────────────────────────────────────────
@@ -976,6 +1406,7 @@ function _updateGizmoScale(lock = false) {
 export function setRotationGizmo(visible, onRotate = null) {
   _rotGizmoVisible = visible;
   _rotGizmoCallback = onRotate;
+  _syncSectionHandles();
   if (visible) {
     _buildRotGizmo();
     _rotGizmoLockedScale = null; // reset so it measures fresh
@@ -1002,7 +1433,7 @@ export function updateRotationGizmo() {
  * (so main.js can suppress other mouse handlers).
  */
 export function isGizmoDragging() {
-  return _rotGizmoDragging !== null;
+  return _rotGizmoDragging !== null || !!_section?.dragging;
 }
 
 // Hit-test the gizmo rings. Returns axis string or null.

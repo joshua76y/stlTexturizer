@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 CNCKitchen (Stefan Hermann) and contributors
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
 /**
  * Edge-based adaptive mesh subdivision.
  *
@@ -12,21 +17,60 @@
  * @returns {{ geometry: THREE.BufferGeometry, safetyCapHit: boolean }}
  */
 
-import * as THREE from 'three';
+import { THREE } from './threeCompat.js';
+import { QuantizedPointMap, IntPairMap } from './meshIndex.js';
 
-// 10 µm vertex-dedup cells. Below 1e5 (= 100 µm) small-fillet meshes have
+// 10 nm vertex-dedup cells. Below 1e5 (1e4 = 0.1 µm) small-fillet meshes have
 // distinct fillet vertices that round to the same key and merge incorrectly,
 // producing zero-length edges and non-manifold artifacts after displacement.
 // 1e5 still tolerates float32 round-trip noise (~1e-4 mm worst case at metre
 // scales) so well-formed inputs continue to dedup cleanly.
 const QUANTISE   = 1e5;
-// Absolute OOM guard.  Beyond this size the pipeline downstream of subdivide
-// (apply-displacement copy, QEM decimation working set, V8 Map limit at
-// ~16M edges) starts OOMing the tab.  16M is empirically the highest value
-// that still completes reliably on typical desktop browsers; the Smart
-// recommender targets a conservative ~4M, but power users dragging the
-// resolution slider manually can push subdivision up to this hard cap.
-const SAFETY_CAP = 16_000_000;
+// Absolute OOM guard for the pipeline downstream of subdivide (displacement
+// copy, QEM decimation working set).  Historically fixed at 16M, which was
+// also a hard ceiling from V8's ~16.7M hash-table entry cap in the old
+// edge-marking Set — that structure is gone (integer hash map, no entry cap),
+// so the guard is now purely about memory.
+//
+// Measured pipeline peak (3DBenchy + dots, June 2026): ~145 bytes per
+// subdivided triangle — 16M ≈ 2.9 GB, 32M ≈ 4.3 GB (29M measured at 4.25 GB,
+// completing watertight in ~2 min).  32M therefore fits comfortably on
+// ≥16 GB machines.  navigator.deviceMemory (Chrome/Edge, available on the
+// page and in workers, reports 8 for ANY machine with ≥8 GB) gates the
+// higher cap; browsers without the API (Safari, Firefox) and Node keep the
+// long-proven 16M.  Since the pipeline moved into the export worker, blowing
+// past available memory surfaces as a clean error alert instead of killing
+// the tab, so the worst case at 32M on a marginal machine is a retry at a
+// coarser setting.  The Smart recommender targets a conservative ~4M either
+// way; only manual resolution-slider drags approach these caps.
+const SAFETY_CAP = (typeof navigator !== 'undefined' && navigator.deviceMemory >= 8)
+  ? 32_000_000
+  : 16_000_000;
+
+// ── Growable typed vertex store ──────────────────────────────────────────────
+// Shared by the indexers (which build it) and the subdivision passes (which
+// append midpoint vertices via getMidpoint). pos/nrm hold xyz triples per
+// vertex; wgt (exclusion weights) and canon (canonical position ids, accurate
+// mode only) are optional. Arrays are reallocated on growth, so long-lived
+// references must re-read store fields after any append — cached references
+// remain valid for READS of pre-growth entries (values are copied).
+function makeVertStore(initialCap, hasWeights, hasCanon) {
+  return {
+    cap: initialCap,
+    count: 0,
+    pos: new Float64Array(initialCap * 3),
+    nrm: new Float64Array(initialCap * 3),
+    wgt: hasWeights ? new Float64Array(initialCap) : null,
+    canon: hasCanon ? new Int32Array(initialCap) : null,
+    grow() {
+      this.cap *= 2;
+      const np = new Float64Array(this.cap * 3); np.set(this.pos); this.pos = np;
+      const nn = new Float64Array(this.cap * 3); nn.set(this.nrm); this.nrm = nn;
+      if (this.wgt)   { const nw = new Float64Array(this.cap); nw.set(this.wgt);   this.wgt = nw; }
+      if (this.canon) { const nc = new Int32Array(this.cap);   nc.set(this.canon); this.canon = nc; }
+    },
+  };
+}
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -49,8 +93,7 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
   const indexed = fast
     ? toIndexedFast(geometry, faceWeights)
     : toIndexed(geometry, faceWeights);
-  const { positions, normals, weights, indices } = indexed;
-  const canonIdx    = indexed.canonIdx    || null;
+  const { verts, indices } = indexed;
   const posCanonMap = indexed.posCanonMap || null;
 
   const maxIterations = 12;
@@ -60,7 +103,7 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
 
   // Track which original face each subdivided face descends from.
   const initialTriCount = indices.length / 3;
-  let currentFaceParentId = new Array(initialTriCount);
+  let currentFaceParentId = new Int32Array(initialTriCount);
   for (let i = 0; i < initialTriCount; i++) currentFaceParentId[i] = i;
 
   for (let iter = 0; iter < maxIterations; iter++) {
@@ -71,8 +114,8 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
     }
 
     const { newIndices, newFaceExcluded, newFaceParentId, changed, capped } = subdividePass(
-      positions, normals, weights, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded,
-      canonIdx, posCanonMap, currentFaceParentId
+      verts, currentIndices, maxEdgeLength, SAFETY_CAP, currentFaceExcluded,
+      posCanonMap, currentFaceParentId
     );
     currentIndices = newIndices;
     if (newFaceExcluded) currentFaceExcluded = newFaceExcluded;
@@ -84,6 +127,7 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
     // behind, not what it just refined away.  This way the user sees the
     // edge length actually decrease across iterations instead of seeing
     // each value one step delayed.
+    const positions = verts.pos; // re-read: the pass may have grown the store
     let maxEdgeLenSq = 0;
     for (let t = 0; t < currentIndices.length; t += 3) {
       const a = currentIndices[t], b = currentIndices[t + 1], c = currentIndices[t + 2];
@@ -104,7 +148,7 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
   }
 
   return {
-    geometry: toNonIndexed(positions, normals, weights, currentIndices, currentFaceExcluded),
+    geometry: toNonIndexed(verts, currentIndices, currentFaceExcluded),
     safetyCapHit,
     faceParentId: new Int32Array(currentFaceParentId),
   };
@@ -131,46 +175,70 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
 // long edge still produce chains of thin children (unavoidable without moving
 // vertices off the surface), but the mesh is now crack-free in all cases.
 
-function subdividePass(positions, normals, weights, indices, maxEdgeLength, safetyCap, faceExcluded = null, canonIdx = null, posCanonMap = null, faceParentId = null) {
+function subdividePass(verts, indices, maxEdgeLength, safetyCap, faceExcluded = null, posCanonMap = null, faceParentId = null) {
   const maxSq = maxEdgeLength * maxEdgeLength;
-  const midCache = new Map();
-  midCache._maxV = positions.length / 3; // set before any getMidpoint calls
+  // Midpoint cache keyed by the RAW (unordered) parent-vertex pair — sharp-edge
+  // cluster copies of the same position get their own midpoints (different
+  // normals), exactly as before.
+  // Both tables below are keyed on a pair of vertex ids, so they use the
+  // Int32-keyed IntPairMap (12 B/slot) rather than QuantizedPointMap's
+  // 3 × Float64 layout (28 B/slot) — on dense passes these are the largest
+  // structures in the subdivider after the index buffers themselves.
+  const midCache = new IntPairMap(1 << 16);
+
+  // verts.pos/canon are safe to cache for reads of pre-pass vertices: growth
+  // reallocates but copies, and steps 1/1.5 only touch pre-pass indices.
+  const positions = verts.pos;
+  const canonIdx  = verts.canon;
 
   // When canonIdx is available (accurate/export mode), use position-canonical
   // edge keys so split-vertex faces on both sides of a sharp edge see the same
   // split decision.  Otherwise (fast/preview mode) use simple index-based keys.
-  // NOTE: _maxV is computed once at pass start. During the pass, positions grows
-  // via getMidpoint, but splitEdges and midCache only use indices < _maxV.
-  const _maxV = positions.length / 3;
-  const _edgeKey = canonIdx
-    ? (a, b) => { const ca = canonIdx[a], cb = canonIdx[b]; return ca < cb ? ca * _maxV + cb : cb * _maxV + ca; }
-    : (a, b) => a < b ? a * _maxV + b : b * _maxV + a;
+  // Keys are the (lo, hi) id pair fed to an integer-keyed hash set — no V8
+  // Set/Map entry cap, so very dense passes no longer need a RangeError
+  // bail-out (the predicted-count cap below handles oversized passes).
+  const splitEdges = new IntPairMap(1 << 16);
+  const markEdge = (a, b) => {
+    const u = canonIdx ? canonIdx[a] : a, v = canonIdx ? canonIdx[b] : b;
+    if (u < v) splitEdges.getOrSet(u, v, 1);
+    else       splitEdges.getOrSet(v, u, 1);
+  };
+  const isMarked = (a, b) => {
+    const u = canonIdx ? canonIdx[a] : a, v = canonIdx ? canonIdx[b] : b;
+    return (u < v ? splitEdges.get(u, v) : splitEdges.get(v, u)) !== -1;
+  };
 
   // ── Step 1: globally mark edges that need splitting ─────────────────────
-  // Excluded triangles do NOT proactively mark their own edges – their
-  // interior edges will never be split, saving triangles on untextured
-  // regions.  Boundary edges are still marked by the included neighbour, so
-  // excluded triangles respond to those splits and T-junctions are avoided.
+  // Excluded triangles away from the mask boundary do NOT proactively mark
+  // their own edges – their interior edges will never be split, saving
+  // triangles on untextured regions.  Boundary edges are still marked by the
+  // included neighbour, so excluded triangles respond to those splits and
+  // T-junctions are avoided.
   //
-  // The marking Set can hit V8's hash-table cap (~16.7M entries) on very
-  // dense input meshes (~11M+ triangles) where most edges still need to
-  // split.  When that happens treat the pass as cap-aborted: returning
-  // unchanged keeps the mesh watertight (no partial split, no T-junctions).
-  let splitEdges;
-  try {
-    splitEdges = new Set();
+  // Excluded triangles that touch an included one (share a position with it)
+  // do split their own long edges, so the untextured side of the boundary is
+  // a strip of normal-sized triangles rather than long slivers fanned out to
+  // the boundary's split points. On a sharp edge the displacement moves those
+  // boundary points within the untextured face's plane (displacement.js,
+  // issue #138), which would turn such slivers over.
+  let touchesIncluded = null;
+  if (faceExcluded) {
+    touchesIncluded = new Uint8Array(verts.count);
     for (let t = 0; t < indices.length; t += 3) {
-      if (faceExcluded && faceExcluded[t / 3]) continue; // skip excluded faces
-      const a = indices[t], b = indices[t + 1], c = indices[t + 2];
-      if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(_edgeKey(a, b));
-      if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(_edgeKey(b, c));
-      if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(_edgeKey(c, a));
+      if (faceExcluded[t / 3]) continue;
+      for (let k = 0; k < 3; k++) {
+        const v = indices[t + k];
+        touchesIncluded[canonIdx ? canonIdx[v] : v] = 1;
+      }
     }
-  } catch (err) {
-    if (err instanceof RangeError) {
-      return { newIndices: indices, newFaceExcluded: faceExcluded, newFaceParentId: faceParentId, changed: false, capped: true };
-    }
-    throw err;
+  }
+  const nearBoundary = (v) => touchesIncluded[canonIdx ? canonIdx[v] : v] === 1;
+  for (let t = 0; t < indices.length; t += 3) {
+    const a = indices[t], b = indices[t + 1], c = indices[t + 2];
+    if (faceExcluded && faceExcluded[t / 3] && !(nearBoundary(a) || nearBoundary(b) || nearBoundary(c))) continue;
+    if (edgeLenSq(positions, a, b) > maxSq) markEdge(a, b);
+    if (edgeLenSq(positions, b, c) > maxSq) markEdge(b, c);
+    if (edgeLenSq(positions, c, a) > maxSq) markEdge(c, a);
   }
 
   if (splitEdges.size === 0) return { newIndices: indices, newFaceExcluded: faceExcluded, newFaceParentId: faceParentId, changed: false };
@@ -185,9 +253,9 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
   let predictedTris = 0;
   for (let t = 0; t < indices.length; t += 3) {
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
-    const sAB = splitEdges.has(_edgeKey(a, b));
-    const sBC = splitEdges.has(_edgeKey(b, c));
-    const sCA = splitEdges.has(_edgeKey(c, a));
+    const sAB = isMarked(a, b);
+    const sBC = isMarked(b, c);
+    const sCA = isMarked(c, a);
     const n   = (sAB ? 1 : 0) + (sBC ? 1 : 0) + (sCA ? 1 : 0);
     predictedTris += n === 0 ? 1 : n + 1;   // 0→1, 1→2, 2→3, 3→4
   }
@@ -197,25 +265,30 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
   }
 
   // ── Step 2: rebuild index list ───────────────────────────────────────────
-  const nextIndices = [];
-  const nextFaceExcluded = faceExcluded ? [] : null;
-  const nextFaceParentId = faceParentId ? [] : null;
+  // predictedTris is exact, so the output buffers are allocated once at their
+  // final size (no push-array growth churn).
+  const nextIndices = new Uint32Array(predictedTris * 3);
+  const nextFaceExcluded = faceExcluded ? new Uint8Array(predictedTris) : null;
+  const nextFaceParentId = faceParentId ? new Int32Array(predictedTris) : null;
+  let wi = 0; // index write cursor (vertex slots)
+  let fi = 0; // face write cursor
 
   for (let t = 0; t < indices.length; t += 3) {
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
     const fIdx = t / 3;
     const excl = faceExcluded ? faceExcluded[fIdx] : 0;
     const pid  = faceParentId ? faceParentId[fIdx] : 0;
-    const sAB = splitEdges.has(_edgeKey(a, b));
-    const sBC = splitEdges.has(_edgeKey(b, c));
-    const sCA = splitEdges.has(_edgeKey(c, a));
+    const sAB = isMarked(a, b);
+    const sBC = isMarked(b, c);
+    const sCA = isMarked(c, a);
     const n   = (sAB ? 1 : 0) + (sBC ? 1 : 0) + (sCA ? 1 : 0);
 
     if (n === 0) {
       // ── 0-split: keep triangle ─────────────────────────────────────────
-      nextIndices.push(a, b, c);
-      if (nextFaceExcluded) nextFaceExcluded.push(excl);
-      if (nextFaceParentId) nextFaceParentId.push(pid);
+      nextIndices[wi++] = a; nextIndices[wi++] = b; nextIndices[wi++] = c;
+      if (nextFaceExcluded) nextFaceExcluded[fi] = excl;
+      if (nextFaceParentId) nextFaceParentId[fi] = pid;
+      fi++;
 
     } else if (n === 3) {
       // ── 3-split: 1→4 regular midpoint subdivision ──────────────────────
@@ -226,35 +299,38 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
       //     / \ / \
       //    c─mBC───b
       //
-      const mAB = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
-      const mBC = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
-      const mCA = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
-      nextIndices.push(
-        a,   mAB, mCA,
-        mAB, b,   mBC,
-        mCA, mBC, c,
-        mAB, mBC, mCA,
-      );
-      if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl, excl);
-      if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid, pid);
+      const mAB = getMidpoint(verts, midCache, a, b, posCanonMap);
+      const mBC = getMidpoint(verts, midCache, b, c, posCanonMap);
+      const mCA = getMidpoint(verts, midCache, c, a, posCanonMap);
+      nextIndices[wi++] = a;   nextIndices[wi++] = mAB; nextIndices[wi++] = mCA;
+      nextIndices[wi++] = mAB; nextIndices[wi++] = b;   nextIndices[wi++] = mBC;
+      nextIndices[wi++] = mCA; nextIndices[wi++] = mBC; nextIndices[wi++] = c;
+      nextIndices[wi++] = mAB; nextIndices[wi++] = mBC; nextIndices[wi++] = mCA;
+      for (let k = 0; k < 4; k++) {
+        if (nextFaceExcluded) nextFaceExcluded[fi] = excl;
+        if (nextFaceParentId) nextFaceParentId[fi] = pid;
+        fi++;
+      }
 
     } else if (n === 1) {
       // ── 1-split: bisect the one marked edge → 2 sub-triangles ──────────
       if (sAB) {
-        const m = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
-        nextIndices.push(a, m, c,  m, b, c);
-        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
-        if (nextFaceParentId) nextFaceParentId.push(pid, pid);
+        const m = getMidpoint(verts, midCache, a, b, posCanonMap);
+        nextIndices[wi++] = a; nextIndices[wi++] = m; nextIndices[wi++] = c;
+        nextIndices[wi++] = m; nextIndices[wi++] = b; nextIndices[wi++] = c;
       } else if (sBC) {
-        const m = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
-        nextIndices.push(a, b, m,  a, m, c);
-        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
-        if (nextFaceParentId) nextFaceParentId.push(pid, pid);
+        const m = getMidpoint(verts, midCache, b, c, posCanonMap);
+        nextIndices[wi++] = a; nextIndices[wi++] = b; nextIndices[wi++] = m;
+        nextIndices[wi++] = a; nextIndices[wi++] = m; nextIndices[wi++] = c;
       } else {                           // sCA
-        const m = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
-        nextIndices.push(a, b, m,  m, b, c);
-        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl);
-        if (nextFaceParentId) nextFaceParentId.push(pid, pid);
+        const m = getMidpoint(verts, midCache, c, a, posCanonMap);
+        nextIndices[wi++] = a; nextIndices[wi++] = b; nextIndices[wi++] = m;
+        nextIndices[wi++] = m; nextIndices[wi++] = b; nextIndices[wi++] = c;
+      }
+      for (let k = 0; k < 2; k++) {
+        if (nextFaceExcluded) nextFaceExcluded[fi] = excl;
+        if (nextFaceParentId) nextFaceParentId[fi] = pid;
+        fi++;
       }
 
     } else {
@@ -276,35 +352,28 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
       // mesh before texturing.
 
       if (!sAB) {                        // sBC + sCA: fan from C
-        const mBC = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
-        const mCA = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
-        nextIndices.push(
-          a,   b,   mBC,
-          a,   mBC, mCA,
-          c,   mCA, mBC,
-        );
-        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
-        if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid);
+        const mBC = getMidpoint(verts, midCache, b, c, posCanonMap);
+        const mCA = getMidpoint(verts, midCache, c, a, posCanonMap);
+        nextIndices[wi++] = a;   nextIndices[wi++] = b;   nextIndices[wi++] = mBC;
+        nextIndices[wi++] = a;   nextIndices[wi++] = mBC; nextIndices[wi++] = mCA;
+        nextIndices[wi++] = c;   nextIndices[wi++] = mCA; nextIndices[wi++] = mBC;
       } else if (!sBC) {                 // sAB + sCA: fan from A
-        const mAB = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
-        const mCA = getMidpoint(positions, normals, weights, midCache, c, a, canonIdx, posCanonMap);
-        nextIndices.push(
-          a,   mAB, mCA,
-          mAB, b,   c,
-          mAB, c,   mCA,
-        );
-        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
-        if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid);
+        const mAB = getMidpoint(verts, midCache, a, b, posCanonMap);
+        const mCA = getMidpoint(verts, midCache, c, a, posCanonMap);
+        nextIndices[wi++] = a;   nextIndices[wi++] = mAB; nextIndices[wi++] = mCA;
+        nextIndices[wi++] = mAB; nextIndices[wi++] = b;   nextIndices[wi++] = c;
+        nextIndices[wi++] = mAB; nextIndices[wi++] = c;   nextIndices[wi++] = mCA;
       } else {                           // sAB + sBC: fan from B
-        const mAB = getMidpoint(positions, normals, weights, midCache, a, b, canonIdx, posCanonMap);
-        const mBC = getMidpoint(positions, normals, weights, midCache, b, c, canonIdx, posCanonMap);
-        nextIndices.push(
-          b,   mBC, mAB,
-          a,   mAB, mBC,
-          a,   mBC, c,
-        );
-        if (nextFaceExcluded) nextFaceExcluded.push(excl, excl, excl);
-        if (nextFaceParentId) nextFaceParentId.push(pid, pid, pid);
+        const mAB = getMidpoint(verts, midCache, a, b, posCanonMap);
+        const mBC = getMidpoint(verts, midCache, b, c, posCanonMap);
+        nextIndices[wi++] = b;   nextIndices[wi++] = mBC; nextIndices[wi++] = mAB;
+        nextIndices[wi++] = a;   nextIndices[wi++] = mAB; nextIndices[wi++] = mBC;
+        nextIndices[wi++] = a;   nextIndices[wi++] = mBC; nextIndices[wi++] = c;
+      }
+      for (let k = 0; k < 3; k++) {
+        if (nextFaceExcluded) nextFaceExcluded[fi] = excl;
+        if (nextFaceParentId) nextFaceParentId[fi] = pid;
+        fi++;
       }
     }
   }
@@ -321,41 +390,37 @@ function edgeLenSq(pos, a, b) {
   return dx*dx + dy*dy + dz*dz;
 }
 
-function getMidpoint(positions, normals, weights, cache, a, b, canonIdx, posCanonMap) {
-  // Numeric edge key: uses _maxV set on the cache by subdividePass at pass start.
-  // All lookups use indices < _maxV, so this is safe even as positions grows.
-  const _mv = cache._maxV;
-  const key = a < b ? a * _mv + b : b * _mv + a;
-  if (cache.has(key)) return cache.get(key);
+function getMidpoint(verts, cache, a, b, posCanonMap) {
+  const lo = a < b ? a : b, hi = a < b ? b : a;
+  const cached = cache.get(lo, hi);
+  if (cached !== -1) return cached;
+
+  const pos = verts.pos, nrm = verts.nrm;
 
   // Midpoint position
-  const mx = (positions[a*3]   + positions[b*3])   / 2;
-  const my = (positions[a*3+1] + positions[b*3+1]) / 2;
-  const mz = (positions[a*3+2] + positions[b*3+2]) / 2;
+  const mx = (pos[a*3]   + pos[b*3])   / 2;
+  const my = (pos[a*3+1] + pos[b*3+1]) / 2;
+  const mz = (pos[a*3+2] + pos[b*3+2]) / 2;
 
   // Midpoint normal (average + normalise)
-  const nx = normals[a*3]   + normals[b*3];
-  const ny = normals[a*3+1] + normals[b*3+1];
-  const nz = normals[a*3+2] + normals[b*3+2];
+  const nx = nrm[a*3]   + nrm[b*3];
+  const ny = nrm[a*3+1] + nrm[b*3+1];
+  const nz = nrm[a*3+2] + nrm[b*3+2];
   const nl = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
 
-  const idx = (positions.length / 3) | 0;
-  positions.push(mx, my, mz);
-  normals.push(nx / nl, ny / nl, nz / nl);
-  if (weights) weights.push((weights[a] + weights[b]) / 2);
+  const idx = verts.count;
+  if (idx === verts.cap) verts.grow();
+  verts.pos[idx*3] = mx; verts.pos[idx*3+1] = my; verts.pos[idx*3+2] = mz;
+  verts.nrm[idx*3] = nx / nl; verts.nrm[idx*3+1] = ny / nl; verts.nrm[idx*3+2] = nz / nl;
+  if (verts.wgt) verts.wgt[idx] = (verts.wgt[a] + verts.wgt[b]) / 2;
 
-  // Maintain canonIdx when in accurate (export) mode.
-  if (canonIdx) {
-    const pk = `${Math.round(mx * QUANTISE)}_${Math.round(my * QUANTISE)}_${Math.round(mz * QUANTISE)}`;
-    let cid = posCanonMap.get(pk);
-    if (cid === undefined) {
-      cid = idx;
-      posCanonMap.set(pk, cid);
-    }
-    canonIdx.push(cid);
+  // Maintain canonical position ids when in accurate (export) mode.
+  if (verts.canon) {
+    verts.canon[idx] = posCanonMap.getOrSet(mx, my, mz, idx);
   }
+  verts.count = idx + 1;
 
-  cache.set(key, idx);
+  cache.getOrSet(lo, hi, idx);
   return idx;
 }
 
@@ -366,14 +431,13 @@ function getMidpoint(positions, normals, weights, cache, a, b, canonIdx, posCano
 function toIndexedFast(geometry, nonIndexedWeights = null) {
   const posAttr = geometry.attributes.position;
   const nrmAttr = geometry.attributes.normal;
-  const positions  = [];
-  const normals    = [];
-  const normalSums = [];
-  const weights    = nonIndexedWeights ? [] : null;
-  const indices    = [];
-  const vertMap    = new Map();
-
   const n = posAttr.count;
+  const vertMap = new QuantizedPointMap(QUANTISE, Math.min(n, 1 << 22));
+  const indices = new Uint32Array(n);
+  // nrm accumulates raw normal sums during the merge and is normalised in
+  // place afterwards (the pre-normalisation values are never read).
+  const verts = makeVertStore(Math.max(16, Math.min(1 << 16, n)), !!nonIndexedWeights, false);
+
   for (let i = 0; i < n; i++) {
     const px = posAttr.getX(i);
     const py = posAttr.getY(i);
@@ -382,37 +446,40 @@ function toIndexedFast(geometry, nonIndexedWeights = null) {
     const ny_ = nrmAttr ? nrmAttr.getY(i) : 0;
     const nz_ = nrmAttr ? nrmAttr.getZ(i) : 1;
 
-    const key = `${Math.round(px * QUANTISE)}_${Math.round(py * QUANTISE)}_${Math.round(pz * QUANTISE)}`;
-    let idx = vertMap.get(key);
-    if (idx === undefined) {
-      idx = positions.length / 3;
-      positions.push(px, py, pz);
-      normals.push(nx_, ny_, nz_);
-      normalSums.push(nx_, ny_, nz_);
-      if (weights) weights.push(nonIndexedWeights[i]);
-      vertMap.set(key, idx);
+    const idx = vertMap.getOrSet(px, py, pz, verts.count);
+    if (vertMap.inserted) {
+      if (verts.count === verts.cap) verts.grow();
+      verts.pos[idx*3] = px; verts.pos[idx*3+1] = py; verts.pos[idx*3+2] = pz;
+      verts.nrm[idx*3] = nx_; verts.nrm[idx*3+1] = ny_; verts.nrm[idx*3+2] = nz_;
+      if (verts.wgt) verts.wgt[idx] = nonIndexedWeights[i];
+      verts.count++;
     } else {
-      normalSums[idx * 3]     += nx_;
-      normalSums[idx * 3 + 1] += ny_;
-      normalSums[idx * 3 + 2] += nz_;
-      if (weights && nonIndexedWeights[i] > weights[idx]) {
-        weights[idx] = nonIndexedWeights[i];
+      verts.nrm[idx * 3]     += nx_;
+      verts.nrm[idx * 3 + 1] += ny_;
+      verts.nrm[idx * 3 + 2] += nz_;
+      if (verts.wgt && nonIndexedWeights[i] > verts.wgt[idx]) {
+        verts.wgt[idx] = nonIndexedWeights[i];
       }
     }
-    indices.push(idx);
+    indices[i] = idx;
   }
 
-  for (let i = 0; i < positions.length / 3; i++) {
-    const nx = normalSums[i * 3];
-    const ny = normalSums[i * 3 + 1];
-    const nz = normalSums[i * 3 + 2];
+  normalizeStoreNormals(verts);
+  return { verts, indices };
+}
+
+// Normalise accumulated normal sums in place (shared by both indexers).
+function normalizeStoreNormals(verts) {
+  const nrm = verts.nrm;
+  for (let i = 0; i < verts.count; i++) {
+    const nx = nrm[i * 3];
+    const ny = nrm[i * 3 + 1];
+    const nz = nrm[i * 3 + 2];
     const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-    normals[i * 3]     = nx / len;
-    normals[i * 3 + 1] = ny / len;
-    normals[i * 3 + 2] = nz / len;
+    nrm[i * 3]     = nx / len;
+    nrm[i * 3 + 1] = ny / len;
+    nrm[i * 3 + 2] = nz / len;
   }
-
-  return { positions, normals, weights, indices };
 }
 
 // ── Non-indexed → indexed conversion (export path) ──────────────────────────
@@ -457,14 +524,14 @@ function toIndexed(geometry, nonIndexedWeights = null) {
   // interiors during subdivision (cube, box).
   const SHARP_COS = Math.cos(30 * Math.PI / 180);
 
-  const positions  = [];
-  const normals    = [];
-  const normalSums = [];
-  const weights    = nonIndexedWeights ? [] : null;
-  const indices    = [];
-  const canonIdx   = [];            // vertex idx → canonical position ID
-  const posCanonMap = new Map();    // posKey → first vertex idx at that position
-  const vertMap    = new Map();     // posKey → [{idx, fnU: [x,y,z]}]
+  const indices = new Uint32Array(n);
+  // nrm accumulates raw (area-weighted) normal sums during the merge and is
+  // normalised in place afterwards; canon holds the canonical position ids.
+  const verts = makeVertStore(Math.max(16, Math.min(1 << 16, n)), !!nonIndexedWeights, true);
+  // position → first vertex idx at that position (canonical ID)
+  const posCanonMap = new QuantizedPointMap(QUANTISE, Math.min(n, 1 << 22));
+  // canonical ID → [{idx, fnU: [x,y,z]}] smooth-group clusters at that position
+  const clustersByCanon = new Map();
 
   for (let i = 0; i < n; i++) {
     const px = posAttr.getX(i);
@@ -473,9 +540,9 @@ function toIndexed(geometry, nonIndexedWeights = null) {
     const fnUx = faceNrmUnit[i*3], fnUy = faceNrmUnit[i*3+1], fnUz = faceNrmUnit[i*3+2];
     const fnRx = faceNrmRaw[i*3],  fnRy = faceNrmRaw[i*3+1],  fnRz = faceNrmRaw[i*3+2];
 
-    const key = `${Math.round(px * QUANTISE)}_${Math.round(py * QUANTISE)}_${Math.round(pz * QUANTISE)}`;
-    let canonId = posCanonMap.get(key);
-    const clusters = vertMap.get(key);
+    // The first vertex at a new position becomes its canonical ID.
+    const canonId = posCanonMap.getOrSet(px, py, pz, verts.count);
+    const clusters = posCanonMap.inserted ? undefined : clustersByCanon.get(canonId);
     if (clusters) {
       let matched = false;
       for (const cl of clusters) {
@@ -483,11 +550,11 @@ function toIndexed(geometry, nonIndexedWeights = null) {
         if (dot >= SHARP_COS) {
           // Same smooth group – accumulate area-weighted face normal
           const idx = cl.idx;
-          normalSums[idx*3]   += fnRx;
-          normalSums[idx*3+1] += fnRy;
-          normalSums[idx*3+2] += fnRz;
-          if (weights && nonIndexedWeights[i] > weights[idx]) {
-            weights[idx] = nonIndexedWeights[i];
+          verts.nrm[idx*3]   += fnRx;
+          verts.nrm[idx*3+1] += fnRy;
+          verts.nrm[idx*3+2] += fnRz;
+          if (verts.wgt && nonIndexedWeights[i] > verts.wgt[idx]) {
+            verts.wgt[idx] = nonIndexedWeights[i];
           }
           // Update the cluster representative to the running average direction
           // so gradual curvature on smooth surfaces (benchy hull, cylinders)
@@ -498,52 +565,44 @@ function toIndexed(geometry, nonIndexedWeights = null) {
           cl.fnU[2] += fnUz;
           const rl = Math.sqrt(cl.fnU[0]*cl.fnU[0] + cl.fnU[1]*cl.fnU[1] + cl.fnU[2]*cl.fnU[2]) || 1;
           cl.fnU[0] /= rl; cl.fnU[1] /= rl; cl.fnU[2] /= rl;
-          indices.push(idx);
+          indices[i] = idx;
           matched = true;
           break;
         }
       }
       if (!matched) {
         // New cluster at this position (sharp-edge split)
-        const idx = positions.length / 3;
-        positions.push(px, py, pz);
-        normals.push(fnRx, fnRy, fnRz);
-        normalSums.push(fnRx, fnRy, fnRz);
-        if (weights) weights.push(nonIndexedWeights[i]);
-        canonIdx.push(canonId);  // same canonical position ID
+        const idx = verts.count;
+        if (idx === verts.cap) verts.grow();
+        verts.pos[idx*3] = px;   verts.pos[idx*3+1] = py;   verts.pos[idx*3+2] = pz;
+        verts.nrm[idx*3] = fnRx; verts.nrm[idx*3+1] = fnRy; verts.nrm[idx*3+2] = fnRz;
+        if (verts.wgt) verts.wgt[idx] = nonIndexedWeights[i];
+        verts.canon[idx] = canonId;  // same canonical position ID
+        verts.count++;
         clusters.push({idx, fnU: [fnUx, fnUy, fnUz]});
-        indices.push(idx);
+        indices[i] = idx;
       }
     } else {
-      const idx = positions.length / 3;
-      positions.push(px, py, pz);
-      normals.push(fnRx, fnRy, fnRz);
-      normalSums.push(fnRx, fnRy, fnRz);
-      if (weights) weights.push(nonIndexedWeights[i]);
-      canonId = idx;                  // first vertex at this position is canonical
-      posCanonMap.set(key, canonId);
-      canonIdx.push(canonId);
-      vertMap.set(key, [{idx, fnU: [fnUx, fnUy, fnUz]}]);
-      indices.push(idx);
+      const idx = verts.count;   // === canonId (just inserted above)
+      if (idx === verts.cap) verts.grow();
+      verts.pos[idx*3] = px;   verts.pos[idx*3+1] = py;   verts.pos[idx*3+2] = pz;
+      verts.nrm[idx*3] = fnRx; verts.nrm[idx*3+1] = fnRy; verts.nrm[idx*3+2] = fnRz;
+      if (verts.wgt) verts.wgt[idx] = nonIndexedWeights[i];
+      verts.canon[idx] = canonId;
+      verts.count++;
+      clustersByCanon.set(canonId, [{idx, fnU: [fnUx, fnUy, fnUz]}]);
+      indices[i] = idx;
     }
   }
 
-  for (let i = 0; i < positions.length / 3; i++) {
-    const nx = normalSums[i * 3];
-    const ny = normalSums[i * 3 + 1];
-    const nz = normalSums[i * 3 + 2];
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-    normals[i * 3]     = nx / len;
-    normals[i * 3 + 1] = ny / len;
-    normals[i * 3 + 2] = nz / len;
-  }
-
-  return { positions, normals, weights, indices, canonIdx, posCanonMap };
+  normalizeStoreNormals(verts);
+  return { verts, indices, posCanonMap };
 }
 
 // ── Indexed → non-indexed ────────────────────────────────────────────────────
 
-function toNonIndexed(positions, normals, weights, indices, faceExcluded = null) {
+function toNonIndexed(verts, indices, faceExcluded = null) {
+  const positions = verts.pos, normals = verts.nrm, weights = verts.wgt;
   const triCount  = indices.length / 3;
   const posArray  = new Float32Array(triCount * 9);
   const nrmArray  = new Float32Array(triCount * 9);
